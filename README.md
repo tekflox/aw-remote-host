@@ -40,10 +40,11 @@ ever run it. That is the whole transparency contract:
 Card 4 of 6 (BYOD onboarding chain): `bootstrap-workspace` is real —
 idempotent detect→install→verify over every manifest module, a dial-back
 to the control plane's `/link` over WebSocket that redeems the one-time
-`awbs_` token for a durable `awlk_` credential, a persistent reconnect
-loop (exponential backoff), and a generated systemd user unit so the link
-survives reboots. `--plan` still previews everything without touching your
-system. See [Roadmap](#roadmap).
+`awbs_` token for a durable `awlk_` credential, and a persistent reconnect
+loop (exponential backoff). Cross-platform: Linux (systemd user unit) and
+macOS (launchd LaunchAgent — the e2e test box, macbook-fred, is a Mac with
+no systemd) via `internal/servicemgr`. `--plan` still previews everything
+without touching your system. See [Roadmap](#roadmap).
 
 ## Installing
 
@@ -56,10 +57,13 @@ This pins an exact release version, downloads the matching
 [GitHub Releases](https://github.com/tekflox/aw-remote-host/releases),
 verifies its SHA-256 checksum, and installs it to `~/.local/bin`.
 
+macOS binaries aren't published by the release workflow yet — build from
+source there for now (`go build ./cmd/aw-remote-host`, Go 1.23+).
+
 ## Usage
 
 ```sh
-aw-remote-host bootstrap-workspace --token <token> [--plan] [--yes] [--control-plane https://api.aw.tekflox.com]
+aw-remote-host bootstrap-workspace --token <token> [--plan] [--yes] [--foreground|--background] [--control-plane https://api.aw.tekflox.com]
 aw-remote-host status [--plan]
 aw-remote-host unlink [--plan] [--stop-containers]
 aw-remote-host version
@@ -69,8 +73,21 @@ aw-remote-host version
 anything — use it to see exactly what would happen before running for
 real. `--yes` skips the confirmation prompt `bootstrap-workspace` shows
 before touching your system. Once linked, `--token` is no longer needed —
-`bootstrap-workspace` reuses the stored `awlk_` credential, which is also
-what the generated systemd unit runs on boot.
+`bootstrap-workspace` reuses the stored `awlk_` credential.
+
+### `--foreground` vs `--background`
+
+`bootstrap-workspace` defaults to **`--foreground`** (`--fg`) when neither
+flag is given — first-run transparency: it stays attached, prints
+everything to stdout, and holds the `/link` connection itself. Nothing is
+installed as a service.
+
+Pass **`--background`** (`--detach`) to install and start the platform
+service instead — **launchd** on macOS, **systemd** on Linux (see
+`internal/servicemgr`) — then detach; the service re-invokes
+`bootstrap-workspace --foreground` on your behalf so the connection
+survives this terminal closing. `unlink` stops and uninstalls whichever
+service is present.
 
 ### Credentials
 
@@ -82,20 +99,30 @@ itself out of the existing data volume.
 
 ### Running persistently
 
-A successful `bootstrap-workspace` run writes
-`~/.config/systemd/user/aw-remote-host.service`. Enable it with:
+`bootstrap-workspace --background` writes and starts:
 
-```sh
-systemctl --user daemon-reload && systemctl --user enable --now aw-remote-host
-loginctl enable-linger $USER   # so it keeps running after you log out / reboot
-```
+- **Linux:** `~/.config/systemd/user/aw-remote-host.service`. Pair with
+  `loginctl enable-linger $USER` so it survives logout/reboot.
+- **macOS:** `~/Library/LaunchAgents/com.tekflox.aw-remote-host.<slug>.plist`
+  — a LaunchAgent, so it starts automatically at login with no extra
+  linger step needed. Logs go to `~/Library/Logs/aw-remote-host.<slug>.log`.
+
+### macOS container runtime
+
+macOS has no native podman daemon — `podman` runs everything against a
+Linux VM. `bootstrap/podman/install.sh`/`verify.sh` detect whichever of
+**podman machine**, **colima**, or **Docker Desktop** is already running
+and use it; if none is, they start a podman machine. If none is found and
+none can be started, they fail with a clear message naming all three
+options — see `bootstrap/podman/README.md`.
 
 ## Repository layout
 
 ```
-cmd/aw-remote-host/     Go CLI entrypoint (bootstrap-workspace, status, unlink, version, systemd unit gen)
+cmd/aw-remote-host/     Go CLI entrypoint (bootstrap-workspace, status, unlink, version)
 internal/link/          WS client that dials wss://<control-plane>/link, credential persistence, reconnect loop
 internal/bootstrap/     Manifest loader + embedded-script extraction + detect/install/verify orchestration
+internal/servicemgr/    Per-OS background service manager (systemd on Linux, launchd on macOS)
 internal/state/         Local state (generated Postgres password, last-known workspace slug)
 bootstrap/embed.go      go:embed of manifest.json + every module's scripts into the binary
 bootstrap/manifest.json Pinned module list (name, version, image digest or package, verify command)

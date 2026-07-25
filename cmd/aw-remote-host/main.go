@@ -67,6 +67,18 @@ Flags (bootstrap-workspace, status, unlink):
   --plan            Print planned actions without executing them
   --control-plane   Control plane base URL (default %s)
   --yes             (bootstrap-workspace) skip the confirmation prompt
+  --foreground/--fg (bootstrap-workspace) run attached, holding the /link
+                    connection; installs no background service. This is
+                    the DEFAULT when neither --foreground nor --background
+                    is given — so a first run is always visible before you
+                    decide to background it.
+  --background/--detach
+                    (bootstrap-workspace) install and start a background
+                    service — launchd on macOS, systemd on Linux — then
+                    detach; the service itself runs with --foreground.
   --stop-containers (unlink) also stop the podman containers this host started
+
+unlink also stops and uninstalls the background service (launchd/systemd),
+if one was installed.
 `, defaultControlPlane)
 }

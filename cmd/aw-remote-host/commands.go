@@ -16,6 +16,7 @@ import (
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
 	"github.com/tekflox/aw-remote-host/internal/link"
+	"github.com/tekflox/aw-remote-host/internal/servicemgr"
 	"github.com/tekflox/aw-remote-host/internal/state"
 )
 
@@ -59,9 +60,20 @@ func runBootstrapWorkspace(args []string) error {
 	fs := flag.NewFlagSet("bootstrap-workspace", flag.ContinueOnError)
 	token, plan, controlPlane := commonFlags(fs)
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	foreground := fs.Bool("foreground", false, "run attached, holding the /link connection; installs no service (default when neither flag is given)")
+	fg := fs.Bool("fg", false, "alias for --foreground")
+	background := fs.Bool("background", false, "install and start a background service (launchd on macOS, systemd on Linux), then detach")
+	detach := fs.Bool("detach", false, "alias for --background")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+
+	fgMode := *foreground || *fg
+	bgMode := *background || *detach
+	if fgMode && bgMode {
+		return fmt.Errorf("--foreground and --background are mutually exclusive")
+	}
+	runInBackground := bgMode // default (neither flag given) is foreground
 
 	m, err := bootstrap.LoadEmbeddedManifest()
 	if err != nil {
@@ -205,13 +217,20 @@ func runBootstrapWorkspace(args []string) error {
 		return err
 	}
 
-	if err := writeSystemdUnit(*controlPlane); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not write systemd user unit: %v\n", err)
-	} else {
-		unitPath, _ := systemdUnitPath()
-		fmt.Printf("systemd user unit written to %s\n", unitPath)
-		fmt.Println("Run: systemctl --user daemon-reload && systemctl --user enable --now aw-remote-host")
-		fmt.Println("Then: loginctl enable-linger $USER   # so it survives logout/reboot")
+	if runInBackground {
+		svcCfg := servicemgr.Config{Slug: reg.slug, ExePath: resolveExePath(), ControlPlane: *controlPlane}
+		if err := installAndStartService(svcCfg); err != nil {
+			return err
+		}
+		fmt.Println("Detaching — the background service now holds the /link connection.")
+		if runtime.GOOS == "darwin" {
+			fmt.Println("(loginctl-equivalent not needed on macOS: LaunchAgents start automatically at login)")
+		} else {
+			fmt.Println("Run: loginctl enable-linger $USER   # so it survives logout/reboot")
+		}
+		stop() // cancel our own /link connection — the service owns it now
+		<-runDone
+		return nil
 	}
 
 	fmt.Printf("workspace %q running — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
@@ -256,6 +275,19 @@ func runStatus(args []string) error {
 		fmt.Printf("workspace: %s\n", st.WorkspaceSlug)
 	}
 
+	if mgr, mgrErr := servicemgr.Default(); mgrErr != nil {
+		fmt.Printf("service: no supported service manager (%v)\n", mgrErr)
+	} else {
+		svcPath, pathErr := mgr.Path(servicemgr.Config{Slug: st.WorkspaceSlug})
+		if pathErr != nil {
+			fmt.Printf("service (%s): could not resolve path: %v\n", mgr.Name(), pathErr)
+		} else if _, statErr := os.Stat(svcPath); statErr == nil {
+			fmt.Printf("service (%s): installed at %s\n", mgr.Name(), svcPath)
+		} else {
+			fmt.Printf("service (%s): not installed (run bootstrap-workspace --background to install)\n", mgr.Name())
+		}
+	}
+
 	m, err := bootstrap.LoadEmbeddedManifest()
 	if err != nil {
 		return err
@@ -292,10 +324,28 @@ func runUnlink(args []string) error {
 	}
 	if *plan {
 		fmt.Printf("[plan] would remove ~/.aw-remote-host/credentials.json and unlink from %s\n", *controlPlane)
+		fmt.Println("[plan] would also stop and uninstall the background service, if installed")
 		if *stopContainers {
 			fmt.Println("[plan] would also stop: aw-remote-host-postgres, aw-remote-host-redis, aw-remote-host-workspace")
 		}
 		return nil
+	}
+
+	if statePath, err := state.DefaultPath(); err == nil {
+		if st, stErr := state.Load(statePath); stErr == nil && st != nil {
+			if mgr, mgrErr := servicemgr.Default(); mgrErr == nil {
+				svcCfg := servicemgr.Config{Slug: st.WorkspaceSlug}
+				if svcPath, pathErr := mgr.Path(svcCfg); pathErr == nil {
+					if _, statErr := os.Stat(svcPath); statErr == nil {
+						if path, err := mgr.Uninstall(svcCfg); err != nil {
+							fmt.Fprintf(os.Stderr, "unlink: could not uninstall %s service: %v\n", mgr.Name(), err)
+						} else {
+							fmt.Printf("unlink: uninstalled %s service (%s)\n", mgr.Name(), path)
+						}
+					}
+				}
+			}
+		}
 	}
 
 	if *stopContainers {
