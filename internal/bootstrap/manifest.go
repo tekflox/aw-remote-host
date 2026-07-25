@@ -1,12 +1,18 @@
-// Package bootstrap loads the module manifest and orchestrates module
-// install/verify. Real install/verify execution lands in card 4 — this
-// skeleton wires the data model and the --plan dry-run path only.
+// Package bootstrap loads the module manifest, extracts the embedded
+// install/verify scripts to disk, and orchestrates idempotent
+// detect->install->verify over each module. Real execution lives in
+// runner.go; this file is the data model + --plan dry-run path.
 package bootstrap
 
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
+
+	assets "github.com/tekflox/aw-remote-host/bootstrap"
 )
 
 // Module describes one installable component from bootstrap/manifest.json.
@@ -24,17 +30,75 @@ type Manifest struct {
 	Modules []Module `json:"modules"`
 }
 
-// LoadManifest reads and parses a manifest.json file from path.
+// LoadManifest reads and parses a manifest.json file from an arbitrary
+// path — used by tests against the repo checkout.
 func LoadManifest(path string) (*Manifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
 	}
+	return parseManifest(data)
+}
+
+// LoadEmbeddedManifest reads bootstrap/manifest.json embedded in the binary
+// itself — what the compiled CLI actually uses at runtime, since
+// install.sh only ships the binary, not a repo checkout (see the root
+// README's transparency contract).
+func LoadEmbeddedManifest() (*Manifest, error) {
+	data, err := assets.FS.ReadFile("manifest.json")
+	if err != nil {
+		return nil, fmt.Errorf("read embedded manifest: %w", err)
+	}
+	return parseManifest(data)
+}
+
+func parseManifest(data []byte) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parse manifest: %w", err)
 	}
 	return &m, nil
+}
+
+// ExtractScripts writes every embedded module file (install.sh, verify.sh,
+// README.md) to destDir, preserving the module subdirectory layout, and
+// marks .sh files executable. Safe to call on every run — always
+// overwrites, so a script fixed in a newer release replaces a stale copy
+// left by an older one.
+func ExtractScripts(destDir string) error {
+	return fs.WalkDir(assets.FS, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || path == "manifest.json" {
+			return nil
+		}
+		data, err := assets.FS.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read embedded %s: %w", path, err)
+		}
+		outPath := filepath.Join(destDir, path)
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", filepath.Dir(outPath), err)
+		}
+		mode := os.FileMode(0o644)
+		if strings.HasSuffix(path, ".sh") {
+			mode = 0o755
+		}
+		if err := os.WriteFile(outPath, data, mode); err != nil {
+			return fmt.Errorf("write %s: %w", outPath, err)
+		}
+		return nil
+	})
+}
+
+// moduleScriptPath resolves a manifest verify_command (e.g.
+// "bootstrap/redis/verify.sh", relative to the repo root) against the
+// directory scripts were extracted to, and swaps in the sibling script
+// name (verify.sh or install.sh) in that same module directory.
+func moduleScriptPath(extractDir, verifyCommand, script string) string {
+	rel := strings.TrimPrefix(verifyCommand, "bootstrap/")
+	return filepath.Join(extractDir, filepath.Dir(rel), script)
 }
 
 // Action is a single planned or executed step against a module.
@@ -66,17 +130,4 @@ func installDetail(mod Module) string {
 		return fmt.Sprintf("install package %s", mod.Package)
 	}
 	return fmt.Sprintf("install %s %s", mod.Name, mod.Version)
-}
-
-// Run executes install+verify for every module in the manifest. Stub for
-// card 1 — real orchestration (idempotent detect/install/verify against the
-// host) is implemented in card 4.
-func Run(m *Manifest, plan bool) error {
-	if plan {
-		for _, a := range Plan(m) {
-			fmt.Printf("[plan] %s: %s — %s\n", a.Module, a.Step, a.Detail)
-		}
-		return nil
-	}
-	return fmt.Errorf("bootstrap execution not implemented yet (see card 4); use --plan to preview")
 }

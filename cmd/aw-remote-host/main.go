@@ -66,5 +66,7 @@ Flags (bootstrap-workspace, status, unlink):
   --token           Bearer token identifying this machine to the control plane
   --plan            Print planned actions without executing them
   --control-plane   Control plane base URL (default %s)
+  --yes             (bootstrap-workspace) skip the confirmation prompt
+  --stop-containers (unlink) also stop the podman containers this host started
 `, defaultControlPlane)
 }

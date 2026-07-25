@@ -37,11 +37,13 @@ ever run it. That is the whole transparency contract:
 
 ## Status
 
-This is the **skeleton** (first card of the BYOD onboarding chain, "1/6").
-The CLI subcommands exist and support a `--plan` dry-run mode that prints
-what would happen without touching your system, but the real
-`bootstrap-workspace` implementation — actually installing and linking
-things — lands in a later card. See [Roadmap](#roadmap).
+Card 4 of 6 (BYOD onboarding chain): `bootstrap-workspace` is real —
+idempotent detect→install→verify over every manifest module, a dial-back
+to the control plane's `/link` over WebSocket that redeems the one-time
+`awbs_` token for a durable `awlk_` credential, a persistent reconnect
+loop (exponential backoff), and a generated systemd user unit so the link
+survives reboots. `--plan` still previews everything without touching your
+system. See [Roadmap](#roadmap).
 
 ## Installing
 
@@ -57,27 +59,45 @@ verifies its SHA-256 checksum, and installs it to `~/.local/bin`.
 ## Usage
 
 ```sh
-aw-remote-host bootstrap-workspace --token <token> [--plan] [--control-plane https://api.aw.tekflox.com]
-aw-remote-host status [--token <token>]
-aw-remote-host unlink [--token <token>]
+aw-remote-host bootstrap-workspace --token <token> [--plan] [--yes] [--control-plane https://api.aw.tekflox.com]
+aw-remote-host status [--plan]
+aw-remote-host unlink [--plan] [--stop-containers]
 aw-remote-host version
 ```
 
 `--plan` prints the actions each command would take without executing
 anything — use it to see exactly what would happen before running for
-real.
+real. `--yes` skips the confirmation prompt `bootstrap-workspace` shows
+before touching your system. Once linked, `--token` is no longer needed —
+`bootstrap-workspace` reuses the stored `awlk_` credential, which is also
+what the generated systemd unit runs on boot.
 
 ### Credentials
 
 Once linked, credentials are written to `~/.aw-remote-host/credentials.json`
-with file mode `0600` (card 4).
+with file mode `0600`. The generated Postgres password and last-known
+workspace slug live alongside it in `~/.aw-remote-host/state.json` (also
+`0600`) — the password is stable across re-runs so a restart never locks
+itself out of the existing data volume.
+
+### Running persistently
+
+A successful `bootstrap-workspace` run writes
+`~/.config/systemd/user/aw-remote-host.service`. Enable it with:
+
+```sh
+systemctl --user daemon-reload && systemctl --user enable --now aw-remote-host
+loginctl enable-linger $USER   # so it keeps running after you log out / reboot
+```
 
 ## Repository layout
 
 ```
-cmd/aw-remote-host/     Go CLI entrypoint (bootstrap-workspace, status, unlink, version)
-internal/link/          WS client stub that dials wss://<control-plane>/link
-internal/bootstrap/     Manifest loader + module install/verify orchestration
+cmd/aw-remote-host/     Go CLI entrypoint (bootstrap-workspace, status, unlink, version, systemd unit gen)
+internal/link/          WS client that dials wss://<control-plane>/link, credential persistence, reconnect loop
+internal/bootstrap/     Manifest loader + embedded-script extraction + detect/install/verify orchestration
+internal/state/         Local state (generated Postgres password, last-known workspace slug)
+bootstrap/embed.go      go:embed of manifest.json + every module's scripts into the binary
 bootstrap/manifest.json Pinned module list (name, version, image digest or package, verify command)
 bootstrap/<module>/     One dir per module: README.md, install.sh, verify.sh
 install.sh              Root installer: pinned binary download + checksum verify
@@ -85,11 +105,9 @@ install.sh              Root installer: pinned binary download + checksum verify
 
 ## Roadmap (BYOD onboarding chain)
 
-This is card 1 of 6. Later cards build on this skeleton:
-
-- Card 3 — the control plane's `/link` server this CLI dials.
-- Card 4 — real `bootstrap-workspace` implementation: actual
-  detect/install/verify execution, credential file writing.
+Card 4 of 6, built on cards 1–3 (repo scaffold + the control plane's
+bootstrap-token/`/link` endpoints). Remaining work in later cards: the
+console-side pairing UI polish and the end-to-end BYOD test (card 6).
 
 ## Development
 
@@ -99,6 +117,7 @@ go vet ./...
 go test ./...
 ```
 
-Go 1.23+. No external dependencies — the CLI skeleton is stdlib-only by
-design, to keep the audit surface of this transparency-critical repo as
-small as possible.
+Go 1.23+. One dependency, `github.com/gorilla/websocket` (pinned in
+`go.sum`) — needed for the real `/link` WebSocket client; everything else
+is stdlib, keeping the audit surface of this transparency-critical repo
+small.
