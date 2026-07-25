@@ -1,0 +1,30 @@
+{
+  "modules": [
+    {
+      "name": "podman",
+      "version": "4.x (distro-packaged)",
+      "package": "podman",
+      "verify_command": "bootstrap/podman/verify.sh"
+    },
+    {
+      "name": "postgres",
+      "version": "16",
+      "image": "docker.io/pgvector/pgvector:pg16",
+      "digest": "sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb",
+      "verify_command": "bootstrap/postgres/verify.sh"
+    },
+    {
+      "name": "redis",
+      "version": "7",
+      "image": "docker.io/library/redis:7",
+      "digest": "sha256:a8f08480e1f88f2647fed492d1178c06abb0d0c1fbf02c682a61e2f483fb3954",
+      "verify_command": "bootstrap/redis/verify.sh"
+    },
+    {
+      "name": "workspace",
+      "version": "latest",
+      "image": "ghcr.io/tekflox/aw-workspace",
+      "verify_command": "bootstrap/workspace/verify.sh"
+    }
+  ]
+}
