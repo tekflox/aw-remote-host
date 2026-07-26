@@ -112,9 +112,23 @@ itself out of the existing data volume.
 macOS has no native podman daemon — `podman` runs everything against a
 Linux VM. `bootstrap/podman/install.sh`/`verify.sh` detect whichever of
 **podman machine**, **colima**, or **Docker Desktop** is already running
-and use it; if none is, they start a podman machine. If none is found and
-none can be started, they fail with a clear message naming all three
-options — see `bootstrap/podman/README.md`.
+and use it; if none is, they install podman (via Homebrew, or a vendored
+download if Homebrew isn't available either — see below) and start a
+podman machine. See `bootstrap/podman/README.md`.
+
+### Dependency resolution (no package manager required)
+
+Each bootstrap module is responsible for resolving its own prerequisites —
+the control plane never assumes you have Homebrew, apt, or any other
+package manager. `bootstrap/lib/deps.sh` is the shared helper library for
+this (`ensure_cmd`, `fetch_and_extract_pkg`); see `bootstrap/lib/README.md`
+for the extension contract. The first concrete case: a clean, brew-less
+macOS machine gets a **vendored podman** (official `.pkg` release,
+extracted with `pkgutil --expand-full`, no sudo/admin) instead of failing
+outright — see `bootstrap/podman/README.md`'s "No Homebrew" section.
+`internal/bootstrap/runner.go` propagates the vendored `podman` onto
+`$PATH` for every module that runs after it, in the same process and
+across separate `bootstrap.Run()` calls.
 
 ## Repository layout
 
@@ -124,8 +138,9 @@ internal/link/          WS client that dials wss://<control-plane>/link, credent
 internal/bootstrap/     Manifest loader + embedded-script extraction + detect/install/verify orchestration
 internal/servicemgr/    Per-OS background service manager (systemd on Linux, launchd on macOS)
 internal/state/         Local state (generated Postgres password, last-known workspace slug)
-bootstrap/embed.go      go:embed of manifest.json + every module's scripts into the binary
+bootstrap/embed.go      go:embed of manifest.json + lib/ + every module's scripts into the binary
 bootstrap/manifest.json Pinned module list (name, version, image digest or package, verify command)
+bootstrap/lib/          Shared dependency-resolution helpers (deps.sh) sourced by module install.sh scripts
 bootstrap/<module>/     One dir per module: README.md, install.sh, verify.sh
 install.sh              Root installer: pinned binary download + checksum verify
 ```

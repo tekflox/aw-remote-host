@@ -7,5 +7,5 @@ package assets
 
 import "embed"
 
-//go:embed manifest.json podman postgres redis workspace
+//go:embed manifest.json lib podman postgres redis workspace
 var FS embed.FS

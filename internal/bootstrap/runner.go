@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 )
 
 // ModuleStatus is the detect->install->verify outcome for one module.
@@ -45,12 +46,41 @@ func runScript(ctx context.Context, path string, opts RunOptions) (string, error
 		return "", fmt.Errorf("script not found: %s: %w", path, err)
 	}
 	cmd := exec.CommandContext(ctx, "bash", path)
-	cmd.Env = append(os.Environ(), opts.Env...)
+	env := append(os.Environ(), opts.Env...)
+	if dir, ok := podmanVendoredBinDir(); ok {
+		// exec.Cmd keeps only the last value for a duplicate env key, so
+		// appending PATH last here overrides the inherited os.Environ()
+		// one — this is how a vendored podman (bootstrap/podman/install.sh's
+		// brew-less macOS path) becomes visible to every module that runs
+		// after it (postgres/redis/workspace call `podman` directly), across
+		// both the same Run() call and separate ones (e.g. cmd/aw-remote-
+		// host/commands.go runs infra and workspace as two Run() calls).
+		// A no-op when podman is already on PATH normally.
+		env = append(env, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	cmd.Env = env
 	var buf bytes.Buffer
 	cmd.Stdout = io.MultiWriter(&buf, opts.stdout())
 	cmd.Stderr = io.MultiWriter(&buf, opts.stderr())
 	err := cmd.Run()
 	return buf.String(), err
+}
+
+// podmanVendoredBinDir reports the vendored podman bin directory written by
+// bootstrap/podman/install.sh's install_vendored_podman() (macOS, no brew),
+// if it exists on this machine — the runner's half of the dependency
+// propagation contract documented in bootstrap/lib/README.md.
+func podmanVendoredBinDir() (string, bool) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", false
+	}
+	dir := filepath.Join(home, "podman-dist", "podman", "bin")
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return "", false
+	}
+	return dir, true
 }
 
 // Detect runs a module's verify.sh and reports whether it's already

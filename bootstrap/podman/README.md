@@ -26,8 +26,39 @@ up working regardless of which backend you use:
 - If none is running, `install.sh` installs `podman` via Homebrew (if
   available) and starts a podman machine (`podman machine init && podman
   machine start`).
+- **If Homebrew isn't available either** (a clean BYOD Mac — no brew, no
+  colima, no Docker Desktop), `install.sh` vendors podman itself instead of
+  giving up — see "No Homebrew" below.
 - If colima or Docker Desktop is already running, both scripts detect it
   and treat it as OK — but if `podman info` still fails against it, the
   fix is the same: `podman machine init && podman machine start`.
-- If nothing is found and Homebrew isn't available either, both scripts
-  exit non-zero with a clear message naming all three options.
+
+### No Homebrew — vendored install
+
+Validated end-to-end on a real brew-less Mac (2026-07-26). `install.sh`
+downloads the official podman macOS installer, pinned at **v6.0.2**, from
+`github.com/containers/podman/releases`, and extracts it with `pkgutil
+--expand-full` (no sudo, no admin rights) into `~/podman-dist/podman/`
+using `bootstrap/lib/deps.sh`'s `fetch_and_extract_pkg` helper — see that
+file's README for the general dependency-resolution pattern this is the
+first case of.
+
+It also writes `~/podman-dist/env.sh` (exports `PATH`,
+`CONTAINERS_HELPER_BINARY_DIR`, `CONTAINERS_MACHINE_PROVIDER=applehv`) for
+a human to `source` in their own shell later, and pins
+`~/.config/containers/containers.conf`'s `[machine]` provider to
+**`applehv`** — the default **libkrun**/krunkit provider is known to abort
+(SIGABRT) on some Mac models; Apple Virtualization + vfkit (`applehv`) is
+the one that actually works there. `install.sh` only writes that file if no
+provider is configured yet, so it never clobbers an existing config.
+
+**PATH propagation to later modules:** postgres/redis/workspace's
+`install.sh`/`verify.sh` all call `podman` directly and run as separate
+`bash` invocations from `internal/bootstrap/runner.go`, so a vendored
+install (never on the system `$PATH`) would otherwise be invisible to
+them. The runner's `runScript()` checks for `~/podman-dist/podman/bin` on
+every script it runs (any module, not just podman) and prepends it onto
+that script's `$PATH` when present — see `podmanVendoredBinDir()` in
+`internal/bootstrap/runner.go`. This is a no-op whenever podman is already
+on `$PATH` normally (brew install, or already vendored in a prior run), so
+the happy path is unaffected.
