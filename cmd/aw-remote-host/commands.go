@@ -20,6 +20,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/servicemgr"
 	"github.com/tekflox/aw-remote-host/internal/shell"
 	"github.com/tekflox/aw-remote-host/internal/state"
+	"github.com/tekflox/aw-remote-host/internal/tunnelproxy"
 )
 
 // registerTimeout bounds how long bootstrap-workspace waits for the first
@@ -200,6 +201,9 @@ func runBootstrapWorkspace(args []string) error {
 			},
 			OnShell: func(emit func(id, dataB64 string)) link.ShellManager {
 				return shell.NewManager(nil, shell.EmitFunc(emit))
+			},
+			OnTunnelProxy: func() link.TunnelProxy {
+				return tunnelproxy.NewHandler()
 			},
 		})
 	}()

@@ -19,6 +19,23 @@
 // internal/shell for the Manager that spawns/pumps the actual PTYs; pump()
 // below just dispatches frames to whatever ShellManager RunCallbacks.OnShell
 // builds for the live connection.
+//
+// Phase 4 HTTP/WS tunnel-proxy channel: on top of the above, six more frame
+// types forward browser HTTP/WS traffic to the local aw-workspace HTTP
+// server this host bootstrapped (see internal/tunnelproxy and aw-backend's
+// src/api/routes/workspace_tunnel_proxy.py, the control-plane consumer),
+// keyed by a request/session id the control plane picks:
+//
+//   - control-plane -> host: {"op":"http_req","id","method","path","headers","body"?} (b64)
+//   - host -> control-plane: {"op":"http_resp_head","id","status","headers"}, then
+//     zero or more {"op":"http_resp_chunk","id","data"} (b64), then {"op":"http_resp_end","id"}
+//   - control-plane -> host: {"op":"ws_open","id","path","headers"}
+//   - either direction:      {"op":"ws_msg","id","data","dir":"text"|"binary"} (data b64)
+//   - either direction:      {"op":"ws_close","id","reason"?}
+//
+// pump() dispatches these to whatever TunnelProxy RunCallbacks.OnTunnelProxy
+// builds for the live connection, same "one instance per connection, torn
+// down on disconnect" shape as ShellManager.
 package link
 
 import (
@@ -210,13 +227,35 @@ type ShellManager interface {
 // wired to emit pty_output frames (dataB64) via the given callback.
 type NewShellManagerFunc func(emit func(id, dataB64 string)) ShellManager
 
+// TunnelProxy abstracts internal/tunnelproxy's Handler so this package
+// doesn't need to import it directly — just the shape pump()'s Phase 4
+// http_req/ws_* dispatch needs. One instance is scoped to a single live
+// /link connection (built fresh per connection by NewTunnelProxyFunc, torn
+// down via CloseAllWS when the connection drops — mirrors ShellManager).
+type TunnelProxy interface {
+	ServeHTTP(
+		ctx context.Context, id, method, path string, headers map[string]string, body []byte,
+		head func(id string, status int, headers map[string]string),
+		chunk func(id string, data []byte),
+		end func(id string),
+	)
+	OpenWS(ctx context.Context, id, path string, headers map[string]string, sendMsg func(id string, data []byte, isText bool)) error
+	WSMessage(id string, data []byte, isText bool) error
+	CloseWS(id string) error
+	CloseAllWS()
+}
+
+// NewTunnelProxyFunc builds a fresh TunnelProxy for one live connection.
+type NewTunnelProxyFunc func() TunnelProxy
+
 // RunCallbacks lets the CLI react to state changes in the reconnect loop
 // without Run needing to know about logging/UI concerns.
 type RunCallbacks struct {
-	OnRegistered func(reply *RegisteredReply)
-	OnDisconnect func(err error) // err is nil on a clean ctx cancellation
-	OnCommand    CommandHandler  // nil = every "cmd" frame gets an error cmd_result
-	OnShell      NewShellManagerFunc // nil = every "pty_open" frame gets a pty_close error reply
+	OnRegistered  func(reply *RegisteredReply)
+	OnDisconnect  func(err error)     // err is nil on a clean ctx cancellation
+	OnCommand     CommandHandler      // nil = every "cmd" frame gets an error cmd_result
+	OnShell       NewShellManagerFunc // nil = every "pty_open" frame gets a pty_close error reply
+	OnTunnelProxy NewTunnelProxyFunc  // nil = every "http_req"/"ws_open" frame is dropped with an error reply
 }
 
 // Run keeps a /link session alive for as long as ctx is not cancelled:
@@ -256,7 +295,7 @@ func (c *Client) Run(ctx context.Context, credentialsPath string, cb RunCallback
 			cb.OnRegistered(result.Reply)
 		}
 
-		pumpErr := pump(ctx, result.Conn, cb.OnCommand, cb.OnShell)
+		pumpErr := pump(ctx, result.Conn, cb.OnCommand, cb.OnShell, cb.OnTunnelProxy)
 		result.Conn.Close()
 		if cb.OnDisconnect != nil {
 			cb.OnDisconnect(pumpErr)
@@ -289,11 +328,13 @@ func (w *frameWriter) WriteJSON(v any) error {
 // pump reads frames until the connection closes or ctx is cancelled,
 // replying to server-initiated liveness pings ({"op":"ping"}) with a pong
 // frame (any client frame refreshes the server's last_seen_at), dispatching
-// {"op":"cmd"} frames to handler, and — via newShell — bridging the Phase 3
-// pty_* frames to a per-connection ShellManager. Every open PTY session is
-// torn down (CloseAll) when the connection drops, since a dead tunnel can
-// never deliver another pty_input for it.
-func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler, newShell NewShellManagerFunc) error {
+// {"op":"cmd"} frames to handler, — via newShell — bridging the Phase 3
+// pty_* frames to a per-connection ShellManager, and — via newTunnelProxy —
+// bridging the Phase 4 http_req/ws_* frames to a per-connection TunnelProxy.
+// Every open PTY session / ws proxy session is torn down (CloseAll/
+// CloseAllWS) when the connection drops, since a dead tunnel can never
+// deliver another pty_input/ws_msg for any of them.
+func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler, newShell NewShellManagerFunc, newTunnelProxy NewTunnelProxyFunc) error {
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -312,6 +353,12 @@ func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler, new
 			_ = fw.WriteJSON(map[string]any{"op": "pty_output", "id": id, "data": dataB64})
 		})
 		defer shellMgr.CloseAll()
+	}
+
+	var proxy TunnelProxy
+	if newTunnelProxy != nil {
+		proxy = newTunnelProxy()
+		defer proxy.CloseAllWS()
 	}
 
 	for {
@@ -338,6 +385,14 @@ func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler, new
 			handlePTYResize(msg, shellMgr)
 		case "pty_close":
 			handlePTYClose(msg, shellMgr)
+		case "http_req":
+			handleHTTPReq(ctx, fw, msg, proxy)
+		case "ws_open":
+			handleWSOpen(ctx, fw, msg, proxy)
+		case "ws_msg":
+			handleWSMsg(msg, proxy)
+		case "ws_close":
+			handleWSClose(msg, proxy)
 		}
 	}
 }
@@ -435,6 +490,116 @@ func handleCmd(ctx context.Context, fw *frameWriter, msg map[string]any, handler
 		}
 		_ = fw.WriteJSON(out)
 	}()
+}
+
+func stringMap(v any) map[string]string {
+	out := map[string]string{}
+	m, _ := v.(map[string]any)
+	for k, val := range m {
+		if s, ok := val.(string); ok {
+			out[k] = s
+		}
+	}
+	return out
+}
+
+// handleHTTPReq forwards one http_req frame to proxy.ServeHTTP in its own
+// goroutine (the local workspace server's response could take a while —
+// must not block the read loop, same rationale as handleCmd) and streams
+// the reply back as http_resp_head/chunk/end frames.
+func handleHTTPReq(ctx context.Context, fw *frameWriter, msg map[string]any, proxy TunnelProxy) {
+	id, _ := msg["id"].(string)
+	method, _ := msg["method"].(string)
+	path, _ := msg["path"].(string)
+	headers := stringMap(msg["headers"])
+
+	var body []byte
+	if b64, ok := msg["body"].(string); ok && b64 != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(b64); err == nil {
+			body = decoded
+		}
+	}
+
+	if proxy == nil {
+		_ = fw.WriteJSON(map[string]any{
+			"op": "http_resp_head", "id": id, "status": 502,
+			"headers": map[string]string{"content-type": "text/plain"},
+		})
+		_ = fw.WriteJSON(map[string]any{
+			"op": "http_resp_chunk", "id": id,
+			"data": base64.StdEncoding.EncodeToString([]byte("no tunnel proxy registered on this host")),
+		})
+		_ = fw.WriteJSON(map[string]any{"op": "http_resp_end", "id": id})
+		return
+	}
+
+	go func() {
+		proxy.ServeHTTP(ctx, id, method, path, headers, body,
+			func(id string, status int, headers map[string]string) {
+				_ = fw.WriteJSON(map[string]any{"op": "http_resp_head", "id": id, "status": status, "headers": headers})
+			},
+			func(id string, data []byte) {
+				_ = fw.WriteJSON(map[string]any{
+					"op": "http_resp_chunk", "id": id, "data": base64.StdEncoding.EncodeToString(data),
+				})
+			},
+			func(id string) {
+				_ = fw.WriteJSON(map[string]any{"op": "http_resp_end", "id": id})
+			},
+		)
+	}()
+}
+
+// handleWSOpen dials the local workspace server's WS endpoint in its own
+// goroutine (dial can block briefly) — a dial failure is reported as a
+// ws_close with a reason rather than silently dropping the session,
+// mirroring handlePTYOpen.
+func handleWSOpen(ctx context.Context, fw *frameWriter, msg map[string]any, proxy TunnelProxy) {
+	id, _ := msg["id"].(string)
+	path, _ := msg["path"].(string)
+	headers := stringMap(msg["headers"])
+
+	if proxy == nil {
+		_ = fw.WriteJSON(map[string]any{"op": "ws_close", "id": id, "reason": "no tunnel proxy registered on this host"})
+		return
+	}
+
+	go func() {
+		err := proxy.OpenWS(ctx, id, path, headers, func(id string, data []byte, isText bool) {
+			dir := "binary"
+			if isText {
+				dir = "text"
+			}
+			_ = fw.WriteJSON(map[string]any{
+				"op": "ws_msg", "id": id, "data": base64.StdEncoding.EncodeToString(data), "dir": dir,
+			})
+		})
+		if err != nil {
+			_ = fw.WriteJSON(map[string]any{"op": "ws_close", "id": id, "reason": err.Error()})
+		}
+	}()
+}
+
+func handleWSMsg(msg map[string]any, proxy TunnelProxy) {
+	if proxy == nil {
+		return
+	}
+	id, _ := msg["id"].(string)
+	dataB64, _ := msg["data"].(string)
+	data, err := base64.StdEncoding.DecodeString(dataB64)
+	if err != nil {
+		return
+	}
+	isText := msg["dir"] == "text"
+	_ = proxy.WSMessage(id, data, isText)
+}
+
+func handleWSClose(msg map[string]any, proxy TunnelProxy) {
+	if proxy == nil {
+		return
+	}
+	id, _ := msg["id"].(string)
+	_ = proxy.CloseWS(id)
 }
 
 func sleepBackoff(ctx context.Context, d time.Duration) bool {
