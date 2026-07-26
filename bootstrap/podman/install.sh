@@ -17,7 +17,7 @@ install_vendored_podman() {
   local arch pkg_arch url
   arch="$(uname -m)"
   case "$arch" in
-    arm64) pkg_arch="aarch64" ;;
+    arm64) pkg_arch="arm64" ;;
     x86_64) pkg_arch="amd64" ;;
     *)
       echo "podman: unsupported macOS arch '$arch' for vendored install — install podman manually: https://podman.io/docs/installation#macos" >&2
