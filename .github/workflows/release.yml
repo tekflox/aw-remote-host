@@ -25,17 +25,19 @@ jobs:
         id: version
         run: echo "version=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
-      - name: Build linux/amd64 + linux/arm64
+      - name: Build linux/amd64 + linux/arm64 + darwin/amd64 + darwin/arm64
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p dist
-          for arch in amd64 arm64; do
-            GOOS=linux GOARCH=$arch go build \
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${platform%/*}"
+            arch="${platform#*/}"
+            GOOS=$os GOARCH=$arch go build \
               -ldflags "-X main.version=${VERSION}" \
               -o "dist/aw-remote-host" \
               ./cmd/aw-remote-host
-            tar -czf "dist/aw-remote-host_${VERSION}_linux_${arch}.tar.gz" -C dist aw-remote-host
+            tar -czf "dist/aw-remote-host_${VERSION}_${os}_${arch}.tar.gz" -C dist aw-remote-host
             rm dist/aw-remote-host
           done
 
