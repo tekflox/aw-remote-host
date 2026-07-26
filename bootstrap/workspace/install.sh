@@ -10,7 +10,7 @@ set -euo pipefail
 : "${AW_POSTGRES_PASSWORD:?AW_POSTGRES_PASSWORD must be set}"
 : "${AW_BACKEND_URL:?AW_BACKEND_URL must be set}"
 
-IMAGE="ghcr.io/tekflox/aw-workspace:latest"
+IMAGE="ghcr.io/fredericowu/aw-workspace:latest"
 CONTAINER_NAME="aw-remote-host-workspace"
 SCHEMA="workspace_${AW_WORKSPACE_SLUG}"
 DB_URL="postgresql+psycopg://postgres:${AW_POSTGRES_PASSWORD}@127.0.0.1:5432/aw_workspace"

@@ -23,7 +23,7 @@
     {
       "name": "workspace",
       "version": "latest",
-      "image": "ghcr.io/tekflox/aw-workspace",
+      "image": "ghcr.io/fredericowu/aw-workspace",
       "verify_command": "bootstrap/workspace/verify.sh"
     }
   ]
