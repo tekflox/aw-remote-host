@@ -1,8 +1,10 @@
 name: Release
 
+# NOTE: auto tag-push trigger disabled on 2026-07-26 to save GitHub Actions
+# minutes while the Remote Host is still being certified. Release manually
+# via workflow_dispatch (pass the existing tag). Re-enable the tags push
+# trigger once things are stable.
 on:
-  push:
-    tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
       tag:

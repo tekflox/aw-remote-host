@@ -1,9 +1,11 @@
 name: CI
 
+# NOTE: auto-triggers (push/pull_request) disabled on 2026-07-26 to save
+# GitHub Actions minutes while the Remote Host is still being certified.
+# Run manually from the Actions tab (workflow_dispatch). Re-enable the
+# push/pull_request block once the build is proven stable.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   build-test:
