@@ -16,6 +16,7 @@ import (
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
 	"github.com/tekflox/aw-remote-host/internal/link"
+	"github.com/tekflox/aw-remote-host/internal/ops"
 	"github.com/tekflox/aw-remote-host/internal/servicemgr"
 	"github.com/tekflox/aw-remote-host/internal/state"
 )
@@ -163,12 +164,24 @@ func runBootstrapWorkspace(args []string) error {
 	registered := make(chan registration, 1)
 	runDone := make(chan error, 1)
 
+	// opsHandler dispatches lifecycle/health "cmd" frames the control plane
+	// sends over this same /link connection (see internal/ops). Its Opts
+	// (workspace slug) are only known once OnRegistered fires, which the
+	// Run loop guarantees happens before pump() can see any cmd frame.
+	opsHandler := &ops.Handler{}
+
 	go func() {
 		runDone <- c.Run(ctx, credPath, link.RunCallbacks{
 			OnRegistered: func(reply *link.RegisteredReply) {
 				if reply.WorkspaceSlug != "" {
 					st.WorkspaceSlug = reply.WorkspaceSlug
 					_ = state.Save(statePath, st)
+				}
+				opsHandler.Opts = ops.BootstrapOpts{
+					ExtractDir:       extractDir,
+					WorkspaceSlug:    reply.WorkspaceSlug,
+					PostgresPassword: st.PostgresPassword,
+					ControlPlane:     *controlPlane,
 				}
 				fmt.Printf("link: registered (remote_host_id=%s, workspace=%s)\n", reply.RemoteHostID, reply.WorkspaceSlug)
 				select {
@@ -180,6 +193,9 @@ func runBootstrapWorkspace(args []string) error {
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "link: disconnected: %v\n", err)
 				}
+			},
+			OnCommand: func(ctx context.Context, verb string, args map[string]any, emit link.Emit) (any, error) {
+				return opsHandler.Dispatch(ctx, verb, args, ops.Emit(emit))
 			},
 		})
 	}()

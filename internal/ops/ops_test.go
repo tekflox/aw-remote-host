@@ -1,0 +1,298 @@
+package ops
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+// fakeRunner is an injectable Runner — records every invocation and returns
+// scripted output/errors per command name, so tests never touch a real
+// podman/curl/df binary.
+type fakeRunner struct {
+	calls   [][]string
+	outputs map[string]string // "name arg1 arg2" -> output
+	errs    map[string]error  // "name arg1 arg2" -> error
+}
+
+func newFakeRunner() *fakeRunner {
+	return &fakeRunner{outputs: map[string]string{}, errs: map[string]error{}}
+}
+
+func (f *fakeRunner) key(name string, args ...string) string {
+	return strings.TrimSpace(name + " " + strings.Join(args, " "))
+}
+
+func (f *fakeRunner) on(output string, name string, args ...string) {
+	f.outputs[f.key(name, args...)] = output
+}
+
+func (f *fakeRunner) fail(err error, name string, args ...string) {
+	f.errs[f.key(name, args...)] = err
+}
+
+func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+	call := append([]string{name}, args...)
+	f.calls = append(f.calls, call)
+	k := f.key(name, args...)
+	if err, ok := f.errs[k]; ok {
+		return f.outputs[k], err
+	}
+	return f.outputs[k], nil
+}
+
+func collectEmits() (Emit, *[]string) {
+	var lines []string
+	return func(level, phase, message string) {
+		lines = append(lines, fmt.Sprintf("%s/%s: %s", level, phase, message))
+	}, &lines
+}
+
+func TestStopOK(t *testing.T) {
+	r := newFakeRunner()
+	h := &Handler{Runner: r}
+	emit, lines := collectEmits()
+
+	data, err := h.Stop(context.Background(), emit)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if data["stopped"] != true {
+		t.Errorf("expected stopped=true, got %v", data)
+	}
+	if len(r.calls) != 1 || r.calls[0][0] != "podman" || r.calls[0][1] != "stop" || r.calls[0][2] != WorkspaceContainer {
+		t.Errorf("unexpected podman call: %v", r.calls)
+	}
+	if len(*lines) == 0 {
+		t.Error("expected at least one activity emit")
+	}
+}
+
+func TestStopFailurePropagatesError(t *testing.T) {
+	r := newFakeRunner()
+	r.fail(fmt.Errorf("no such container"), "podman", "stop", WorkspaceContainer)
+	h := &Handler{Runner: r}
+	emit, lines := collectEmits()
+
+	_, err := h.Stop(context.Background(), emit)
+	if err == nil {
+		t.Fatal("expected an error when podman stop fails")
+	}
+	found := false
+	for _, l := range *lines {
+		if strings.HasPrefix(l, "error/stop:") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an error-level activity emit, got %v", *lines)
+	}
+}
+
+func TestRestartOK(t *testing.T) {
+	r := newFakeRunner()
+	h := &Handler{Runner: r}
+	data, err := h.Restart(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if data["restarted"] != true {
+		t.Errorf("expected restarted=true, got %v", data)
+	}
+}
+
+func TestUninstallRemovesAllContainersAndVolumes(t *testing.T) {
+	r := newFakeRunner()
+	h := &Handler{Runner: r}
+
+	data, err := h.Uninstall(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if data["uninstalled"] != true {
+		t.Errorf("expected uninstalled=true, got %v", data)
+	}
+
+	wantRemoved := map[string]bool{
+		WorkspaceContainer: false, PostgresContainer: false, RedisContainer: false,
+	}
+	wantVolRemoved := map[string]bool{PostgresVolume: false, RedisVolume: false}
+	for _, call := range r.calls {
+		if len(call) >= 3 && call[0] == "podman" && call[1] == "rm" {
+			wantRemoved[call[3]] = true
+		}
+		if len(call) >= 5 && call[0] == "podman" && call[1] == "volume" && call[2] == "rm" {
+			wantVolRemoved[call[4]] = true
+		}
+	}
+	for name, seen := range wantRemoved {
+		if !seen {
+			t.Errorf("expected podman rm -f %s to have been called", name)
+		}
+	}
+	for name, seen := range wantVolRemoved {
+		if !seen {
+			t.Errorf("expected podman volume rm -f %s to have been called", name)
+		}
+	}
+}
+
+func TestUninstallReportsPartialFailure(t *testing.T) {
+	r := newFakeRunner()
+	r.fail(fmt.Errorf("boom"), "podman", "rm", "-f", PostgresContainer)
+	h := &Handler{Runner: r}
+
+	_, err := h.Uninstall(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected an error when one container removal fails")
+	}
+	if !strings.Contains(err.Error(), PostgresContainer) {
+		t.Errorf("expected error to mention %s, got %v", PostgresContainer, err)
+	}
+}
+
+func TestHealthOfflineWhenContainerNotRunning(t *testing.T) {
+	r := newFakeRunner()
+	r.fail(fmt.Errorf("no such container"), "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	h := &Handler{Runner: r}
+
+	got := h.Health(context.Background())
+	if got["offline"] != true || got["healthy"] != false {
+		t.Errorf("expected offline result, got %v", got)
+	}
+	for _, key := range []string{"uptime_s", "disk", "cpu_pct", "mem"} {
+		if got[key] != nil {
+			t.Errorf("expected %s to be nil when offline, got %v", key, got[key])
+		}
+	}
+}
+
+func TestHealthOfflineWhenContainerStopped(t *testing.T) {
+	r := newFakeRunner()
+	r.on("false\t2026-07-20T10:00:00.000000000Z", "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	h := &Handler{Runner: r}
+
+	got := h.Health(context.Background())
+	if got["offline"] != true {
+		t.Errorf("expected offline=true for a stopped container, got %v", got)
+	}
+}
+
+func TestHealthRunningAndHTTPHealthy(t *testing.T) {
+	r := newFakeRunner()
+	r.on("true\t2020-01-01T00:00:00.000000000Z", "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	r.on("", "curl", "-fsS", "--max-time", probeTimeout, HealthURL)
+	r.on("12.5%\t123.4MiB / 987.6MiB", "podman", "stats", "--no-stream", "--format",
+		"{{.CPUPerc}}\t{{.MemUsage}}", WorkspaceContainer)
+	r.on("Filesystem 1024-blocks Used Available Capacity Mounted\n"+
+		"/dev/disk1 1000000 400000 600000 40% /", "df", "-Pk", "/")
+	h := &Handler{Runner: r}
+
+	got := h.Health(context.Background())
+	if got["offline"] != false || got["healthy"] != true {
+		t.Errorf("expected online+healthy, got %v", got)
+	}
+	uptime, ok := got["uptime_s"].(int64)
+	if !ok || uptime <= 0 {
+		t.Errorf("expected a positive uptime_s, got %v", got["uptime_s"])
+	}
+	cpu, ok := got["cpu_pct"].(float64)
+	if !ok || cpu != 12.5 {
+		t.Errorf("expected cpu_pct=12.5, got %v", got["cpu_pct"])
+	}
+	mem, ok := got["mem"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected mem map, got %v", got["mem"])
+	}
+	wantUsedF := 123.4 * 1024 * 1024
+	wantUsed := int64(wantUsedF)
+	if mem["used"] != wantUsed {
+		t.Errorf("expected mem.used=%d, got %v", wantUsed, mem["used"])
+	}
+	disk, ok := got["disk"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected disk map, got %v", got["disk"])
+	}
+	if disk["total"] != int64(1000000*1024) || disk["used"] != int64(400000*1024) {
+		t.Errorf("unexpected disk usage: %v", disk)
+	}
+}
+
+func TestHealthWhenHTTPProbeFails(t *testing.T) {
+	r := newFakeRunner()
+	r.on("true\t2020-01-01T00:00:00.000000000Z", "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	r.fail(fmt.Errorf("connection refused"), "curl", "-fsS", "--max-time", probeTimeout, HealthURL)
+	h := &Handler{Runner: r}
+
+	got := h.Health(context.Background())
+	if got["offline"] != false {
+		t.Errorf("expected offline=false (container is running, just unhealthy), got %v", got)
+	}
+	if got["healthy"] != false {
+		t.Errorf("expected healthy=false when the HTTP probe fails, got %v", got)
+	}
+}
+
+func TestParseBytes(t *testing.T) {
+	mib := 123.4 * 1024 * 1024
+	cases := map[string]int64{
+		"123.4MiB": int64(mib),
+		"1GiB":     1024 * 1024 * 1024,
+		"512KiB":   512 * 1024,
+		"10B":      10,
+	}
+	for raw, want := range cases {
+		got, ok := parseBytes(raw)
+		if !ok {
+			t.Errorf("parseBytes(%q): expected ok=true", raw)
+			continue
+		}
+		if got != want {
+			t.Errorf("parseBytes(%q) = %d, want %d", raw, got, want)
+		}
+	}
+	if _, ok := parseBytes("garbage"); ok {
+		t.Error("expected parseBytes to fail on an unrecognized unit")
+	}
+}
+
+func TestDispatchUnknownVerb(t *testing.T) {
+	h := &Handler{Runner: newFakeRunner()}
+	_, err := h.Dispatch(context.Background(), "frobnicate", nil, nil)
+	if err == nil {
+		t.Fatal("expected an error for an unknown verb")
+	}
+}
+
+func TestDispatchRoutesToStop(t *testing.T) {
+	r := newFakeRunner()
+	h := &Handler{Runner: r}
+	data, err := h.Dispatch(context.Background(), "stop", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m, ok := data.(map[string]any)
+	if !ok || m["stopped"] != true {
+		t.Errorf("expected {stopped:true}, got %v", data)
+	}
+}
+
+func TestDispatchRoutesToHealth(t *testing.T) {
+	r := newFakeRunner()
+	r.fail(fmt.Errorf("no such container"), "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	h := &Handler{Runner: r}
+	data, err := h.Dispatch(context.Background(), "health", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m, ok := data.(map[string]any)
+	if !ok || m["offline"] != true {
+		t.Errorf("expected offline health result, got %v", data)
+	}
+}

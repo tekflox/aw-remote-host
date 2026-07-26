@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -162,11 +163,25 @@ func (c *Client) Connect(ctx context.Context, token, credentialsPath string) (*C
 	return &ConnectResult{Conn: conn, Reply: reply}, nil
 }
 
+// Emit sends an unsolicited activity event ({"op":"activity", ...}) back
+// over the live /link connection — the tunnel-protocol counterpart of
+// aw-backend's activity_log.record(). Passed to CommandHandler so a verb
+// (e.g. bootstrap) can stream progress while it runs.
+type Emit func(level, phase, message string)
+
+// CommandHandler processes one inbound {"op":"cmd", "id", "verb", "args"}
+// frame and returns the verb-specific result data (or an error) for the
+// {"op":"cmd_result"} reply. Runs in its own goroutine per command (see
+// handleCmd) so a slow verb (bootstrap) never blocks the read loop that
+// keeps the liveness ping/pong alive.
+type CommandHandler func(ctx context.Context, verb string, args map[string]any, emit Emit) (data any, err error)
+
 // RunCallbacks lets the CLI react to state changes in the reconnect loop
 // without Run needing to know about logging/UI concerns.
 type RunCallbacks struct {
 	OnRegistered func(reply *RegisteredReply)
 	OnDisconnect func(err error) // err is nil on a clean ctx cancellation
+	OnCommand    CommandHandler  // nil = every "cmd" frame gets an error cmd_result
 }
 
 // Run keeps a /link session alive for as long as ctx is not cancelled:
@@ -206,7 +221,7 @@ func (c *Client) Run(ctx context.Context, credentialsPath string, cb RunCallback
 			cb.OnRegistered(result.Reply)
 		}
 
-		pumpErr := pump(ctx, result.Conn)
+		pumpErr := pump(ctx, result.Conn, cb.OnCommand)
 		result.Conn.Close()
 		if cb.OnDisconnect != nil {
 			cb.OnDisconnect(pumpErr)
@@ -221,10 +236,26 @@ func (c *Client) Run(ctx context.Context, credentialsPath string, cb RunCallback
 	}
 }
 
+// frameWriter serializes writes to conn — pump's own ping/pong replies and
+// the per-command goroutines spawned by handleCmd (cmd_result + any
+// activity frames a slow verb emits along the way) all write through this,
+// since gorilla/websocket connections aren't safe for concurrent writers.
+type frameWriter struct {
+	mu   sync.Mutex
+	conn *websocket.Conn
+}
+
+func (w *frameWriter) WriteJSON(v any) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.conn.WriteJSON(v)
+}
+
 // pump reads frames until the connection closes or ctx is cancelled,
 // replying to server-initiated liveness pings ({"op":"ping"}) with a pong
-// frame — any client frame refreshes the server's last_seen_at.
-func pump(ctx context.Context, conn *websocket.Conn) error {
+// frame (any client frame refreshes the server's last_seen_at) and
+// dispatching {"op":"cmd"} frames to handler.
+func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler) error {
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -235,18 +266,62 @@ func pump(ctx context.Context, conn *websocket.Conn) error {
 		}
 	}()
 
+	fw := &frameWriter{conn: conn}
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			return err
 		}
 		var msg map[string]any
-		if json.Unmarshal(data, &msg) == nil && msg["op"] == "ping" {
-			if err := conn.WriteJSON(map[string]string{"op": "pong"}); err != nil {
+		if json.Unmarshal(data, &msg) != nil {
+			continue
+		}
+		switch msg["op"] {
+		case "ping":
+			if err := fw.WriteJSON(map[string]string{"op": "pong"}); err != nil {
 				return err
 			}
+		case "cmd":
+			handleCmd(ctx, fw, msg, handler)
 		}
 	}
+}
+
+// handleCmd runs handler in its own goroutine (a verb like bootstrap can
+// take minutes — it must not block pump's read loop, or the connection
+// would look dead and the server's liveness ping would go unanswered) and
+// writes the {"op":"cmd_result"} reply when it finishes. Any activity
+// events the handler emits along the way are written as they happen, not
+// buffered until completion.
+func handleCmd(ctx context.Context, fw *frameWriter, msg map[string]any, handler CommandHandler) {
+	id, _ := msg["id"].(string)
+	verb, _ := msg["verb"].(string)
+	args, _ := msg["args"].(map[string]any)
+
+	if handler == nil {
+		_ = fw.WriteJSON(map[string]any{
+			"op": "cmd_result", "id": id, "ok": false,
+			"error": "no command handler registered on this host",
+		})
+		return
+	}
+
+	go func() {
+		emit := func(level, phase, message string) {
+			_ = fw.WriteJSON(map[string]any{
+				"op": "activity", "ts": float64(time.Now().UnixNano()) / 1e9,
+				"level": level, "phase": phase, "message": message,
+			})
+		}
+		result, err := handler(ctx, verb, args, emit)
+		out := map[string]any{"op": "cmd_result", "id": id, "ok": err == nil}
+		if err != nil {
+			out["error"] = err.Error()
+		} else {
+			out["data"] = result
+		}
+		_ = fw.WriteJSON(out)
+	}()
 }
 
 func sleepBackoff(ctx context.Context, d time.Duration) bool {
