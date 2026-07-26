@@ -35,6 +35,16 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
+# Postgres only applies POSTGRES_PASSWORD on the volume's FIRST init. If
+# state.json (which holds AW_POSTGRES_PASSWORD) was lost while the data
+# volume survived, a re-bootstrap generates a new password that won't match
+# what's baked into the volume, and auth fails silently downstream. Re-apply
+# the current password unconditionally so the pair self-corrects regardless
+# of whether this run created a fresh volume or reused an existing one.
+podman exec "$CONTAINER_NAME" psql -U postgres -c \
+  "ALTER USER postgres WITH PASSWORD '${POSTGRES_PASSWORD}';" >/dev/null
+echo "postgres: password re-applied (idempotent)"
+
 # Create the workspace database (the aw-workspace runtime connects to
 # .../aw_workspace) and enable pgvector inside it. Idempotent.
 if ! podman exec "$CONTAINER_NAME" psql -U postgres -tAc \

@@ -57,4 +57,6 @@ for _ in $(seq 1 30); do
 done
 
 echo "workspace: did not become healthy in time" >&2
+echo "workspace: last container logs (probable cause below):" >&2
+podman logs --tail 20 "$CONTAINER_NAME" >&2 2>&1 || true
 exit 1
