@@ -18,6 +18,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/link"
 	"github.com/tekflox/aw-remote-host/internal/ops"
 	"github.com/tekflox/aw-remote-host/internal/servicemgr"
+	"github.com/tekflox/aw-remote-host/internal/shell"
 	"github.com/tekflox/aw-remote-host/internal/state"
 )
 
@@ -196,6 +197,9 @@ func runBootstrapWorkspace(args []string) error {
 			},
 			OnCommand: func(ctx context.Context, verb string, args map[string]any, emit link.Emit) (any, error) {
 				return opsHandler.Dispatch(ctx, verb, args, ops.Emit(emit))
+			},
+			OnShell: func(emit func(id, dataB64 string)) link.ShellManager {
+				return shell.NewManager(nil, shell.EmitFunc(emit))
 			},
 		})
 	}()

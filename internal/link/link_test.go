@@ -58,6 +58,9 @@ type fakeLinkServer struct {
 	registerCount   int32
 	forceCloseAfter int32 // close the Nth connection right after registering (0 = never)
 	connCount       int32
+
+	framesToSend  []map[string]any // sent right after "registered", in order (Phase 3 pty tests)
+	receivedFrames []map[string]any // every non-register frame the client sends back
 }
 
 func newFakeLinkServer() *fakeLinkServer {
@@ -113,11 +116,27 @@ func (s *fakeLinkServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return // close immediately, forcing the client to reconnect
 	}
 
-	// Hold the connection open, replying to whatever the client sends
-	// (pong replies to our pings, or just idle) until it disconnects.
-	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
+	s.mu.Lock()
+	toSend := append([]map[string]any(nil), s.framesToSend...)
+	s.mu.Unlock()
+	for _, f := range toSend {
+		if err := conn.WriteJSON(f); err != nil {
 			return
+		}
+	}
+
+	// Hold the connection open, recording whatever the client sends back
+	// (pty_output, cmd_result, pong, ...) until it disconnects.
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var frame map[string]any
+		if json.Unmarshal(data, &frame) == nil {
+			s.mu.Lock()
+			s.receivedFrames = append(s.receivedFrames, frame)
+			s.mu.Unlock()
 		}
 	}
 }
@@ -217,6 +236,160 @@ func TestRunReconnectsWithStoredCredentialAfterDrop(t *testing.T) {
 	lastToken = creds.HostCredential
 	if lastToken != "awlk_minted" {
 		t.Errorf("expected stored credential awlk_minted, got %q", lastToken)
+	}
+}
+
+// fakeShellManager records every call so tests can assert dispatch without
+// touching a real pty/podman.
+type fakeShellManager struct {
+	mu       sync.Mutex
+	opened   []string
+	input    map[string][]byte
+	resized  map[string][2]uint16
+	closed   []string
+	openErr  error
+	emit     func(id, dataB64 string)
+}
+
+func newFakeShellManager(emit func(id, dataB64 string)) *fakeShellManager {
+	return &fakeShellManager{input: map[string][]byte{}, resized: map[string][2]uint16{}, emit: emit}
+}
+
+func (f *fakeShellManager) Open(_ context.Context, id string, cols, rows uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.openErr != nil {
+		return f.openErr
+	}
+	f.opened = append(f.opened, id)
+	if f.emit != nil {
+		f.emit(id, "aGVsbG8=") // "hello", proves the emit path is wired end to end
+	}
+	return nil
+}
+
+func (f *fakeShellManager) Input(id string, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.input[id] = append([]byte(nil), data...)
+	return nil
+}
+
+func (f *fakeShellManager) Resize(id string, cols, rows uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resized[id] = [2]uint16{cols, rows}
+	return nil
+}
+
+func (f *fakeShellManager) Close(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = append(f.closed, id)
+	return nil
+}
+
+func (f *fakeShellManager) CloseAll() {}
+
+func TestRunDispatchesPTYFrames(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.framesToSend = []map[string]any{
+		{"op": "pty_open", "id": "s1", "cols": float64(80), "rows": float64(24)},
+		{"op": "pty_input", "id": "s1", "data": "aGk="},
+		{"op": "pty_resize", "id": "s1", "cols": float64(100), "rows": float64(40)},
+		{"op": "pty_close", "id": "s1"},
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var mgr *fakeShellManager
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnShell: func(emit func(id, dataB64 string)) ShellManager {
+				mgr = newFakeShellManager(emit)
+				return mgr
+			},
+		})
+	}()
+
+	// Give the pump loop time to process the scripted frames, then cancel.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	if mgr == nil {
+		t.Fatal("OnShell was never called")
+	}
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if len(mgr.opened) != 1 || mgr.opened[0] != "s1" {
+		t.Errorf("opened = %v, want [s1]", mgr.opened)
+	}
+	if string(mgr.input["s1"]) != "hi" {
+		t.Errorf("input[s1] = %q, want \"hi\"", mgr.input["s1"])
+	}
+	if mgr.resized["s1"] != [2]uint16{100, 40} {
+		t.Errorf("resized[s1] = %v, want [100 40]", mgr.resized["s1"])
+	}
+	if len(mgr.closed) != 1 || mgr.closed[0] != "s1" {
+		t.Errorf("closed = %v, want [s1]", mgr.closed)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	found := false
+	for _, f := range srv.receivedFrames {
+		if f["op"] == "pty_output" && f["id"] == "s1" && f["data"] == "aGVsbG8=" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a pty_output frame for s1, got %+v", srv.receivedFrames)
+	}
+}
+
+func TestPumpRepliesPTYCloseWhenNoShellManager(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.framesToSend = []map[string]any{
+		{"op": "pty_open", "id": "s1", "cols": float64(80), "rows": float64(24)},
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{})
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	found := false
+	for _, f := range srv.receivedFrames {
+		if f["op"] == "pty_close" && f["id"] == "s1" && f["reason"] != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a pty_close-with-reason frame for s1, got %+v", srv.receivedFrames)
 	}
 }
 

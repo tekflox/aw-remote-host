@@ -3,10 +3,27 @@
 // redeems an awbs_ bootstrap token for a durable awlk_ host credential on
 // first connect, and keeps a persistent reconnecting session alive
 // afterwards using that stored credential.
+//
+// Phase 3 PTY channel: on top of the Phase 2 cmd/cmd_result/activity
+// frames, five more frame types bridge an interactive shell inside the
+// workspace container, keyed by a session id the control plane picks —
+// multiple concurrent sessions are supported:
+//
+//   - control-plane -> host: {"op":"pty_open","id","cols","rows"}
+//   - control-plane -> host: {"op":"pty_input","id","data"} (base64)
+//   - host -> control-plane: {"op":"pty_output","id","data"} (base64)
+//   - control-plane -> host: {"op":"pty_resize","id","cols","rows"}
+//   - either direction:      {"op":"pty_close","id","reason"?}
+//
+// data is always base64 — PTY output isn't guaranteed valid UTF-8. See
+// internal/shell for the Manager that spawns/pumps the actual PTYs; pump()
+// below just dispatches frames to whatever ShellManager RunCallbacks.OnShell
+// builds for the live connection.
 package link
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -176,12 +193,30 @@ type Emit func(level, phase, message string)
 // keeps the liveness ping/pong alive.
 type CommandHandler func(ctx context.Context, verb string, args map[string]any, emit Emit) (data any, err error)
 
+// ShellManager abstracts internal/shell's Manager so this package doesn't
+// need to import it directly — just the shape pump()'s pty_* dispatch
+// needs. One instance is scoped to a single live /link connection (built
+// fresh per connection by NewShellManagerFunc, torn down via CloseAll when
+// the connection drops).
+type ShellManager interface {
+	Open(ctx context.Context, id string, cols, rows uint16) error
+	Input(id string, data []byte) error
+	Resize(id string, cols, rows uint16) error
+	Close(id string) error
+	CloseAll()
+}
+
+// NewShellManagerFunc builds a fresh ShellManager for one live connection,
+// wired to emit pty_output frames (dataB64) via the given callback.
+type NewShellManagerFunc func(emit func(id, dataB64 string)) ShellManager
+
 // RunCallbacks lets the CLI react to state changes in the reconnect loop
 // without Run needing to know about logging/UI concerns.
 type RunCallbacks struct {
 	OnRegistered func(reply *RegisteredReply)
 	OnDisconnect func(err error) // err is nil on a clean ctx cancellation
 	OnCommand    CommandHandler  // nil = every "cmd" frame gets an error cmd_result
+	OnShell      NewShellManagerFunc // nil = every "pty_open" frame gets a pty_close error reply
 }
 
 // Run keeps a /link session alive for as long as ctx is not cancelled:
@@ -221,7 +256,7 @@ func (c *Client) Run(ctx context.Context, credentialsPath string, cb RunCallback
 			cb.OnRegistered(result.Reply)
 		}
 
-		pumpErr := pump(ctx, result.Conn, cb.OnCommand)
+		pumpErr := pump(ctx, result.Conn, cb.OnCommand, cb.OnShell)
 		result.Conn.Close()
 		if cb.OnDisconnect != nil {
 			cb.OnDisconnect(pumpErr)
@@ -253,9 +288,12 @@ func (w *frameWriter) WriteJSON(v any) error {
 
 // pump reads frames until the connection closes or ctx is cancelled,
 // replying to server-initiated liveness pings ({"op":"ping"}) with a pong
-// frame (any client frame refreshes the server's last_seen_at) and
-// dispatching {"op":"cmd"} frames to handler.
-func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler) error {
+// frame (any client frame refreshes the server's last_seen_at), dispatching
+// {"op":"cmd"} frames to handler, and — via newShell — bridging the Phase 3
+// pty_* frames to a per-connection ShellManager. Every open PTY session is
+// torn down (CloseAll) when the connection drops, since a dead tunnel can
+// never deliver another pty_input for it.
+func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler, newShell NewShellManagerFunc) error {
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -267,6 +305,15 @@ func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler) err
 	}()
 
 	fw := &frameWriter{conn: conn}
+
+	var shellMgr ShellManager
+	if newShell != nil {
+		shellMgr = newShell(func(id, dataB64 string) {
+			_ = fw.WriteJSON(map[string]any{"op": "pty_output", "id": id, "data": dataB64})
+		})
+		defer shellMgr.CloseAll()
+	}
+
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -283,8 +330,74 @@ func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler) err
 			}
 		case "cmd":
 			handleCmd(ctx, fw, msg, handler)
+		case "pty_open":
+			handlePTYOpen(ctx, fw, msg, shellMgr)
+		case "pty_input":
+			handlePTYInput(msg, shellMgr)
+		case "pty_resize":
+			handlePTYResize(msg, shellMgr)
+		case "pty_close":
+			handlePTYClose(msg, shellMgr)
 		}
 	}
+}
+
+func ptyDims(msg map[string]any) (id string, cols, rows uint16) {
+	id, _ = msg["id"].(string)
+	if c, ok := msg["cols"].(float64); ok {
+		cols = uint16(c)
+	}
+	if r, ok := msg["rows"].(float64); ok {
+		rows = uint16(r)
+	}
+	return
+}
+
+// handlePTYOpen spawns the session in its own goroutine — podman-exec
+// startup can take a noticeable moment and must not block the read loop
+// (same rationale as handleCmd). A spawn failure is reported as a
+// pty_close with a reason rather than silently dropping the session, so
+// the browser doesn't hang on a black terminal.
+func handlePTYOpen(ctx context.Context, fw *frameWriter, msg map[string]any, mgr ShellManager) {
+	id, cols, rows := ptyDims(msg)
+	if mgr == nil {
+		_ = fw.WriteJSON(map[string]any{"op": "pty_close", "id": id, "reason": "no shell manager registered on this host"})
+		return
+	}
+	go func() {
+		if err := mgr.Open(ctx, id, cols, rows); err != nil {
+			_ = fw.WriteJSON(map[string]any{"op": "pty_close", "id": id, "reason": err.Error()})
+		}
+	}()
+}
+
+func handlePTYInput(msg map[string]any, mgr ShellManager) {
+	if mgr == nil {
+		return
+	}
+	id, _ := msg["id"].(string)
+	dataB64, _ := msg["data"].(string)
+	data, err := base64.StdEncoding.DecodeString(dataB64)
+	if err != nil {
+		return
+	}
+	_ = mgr.Input(id, data)
+}
+
+func handlePTYResize(msg map[string]any, mgr ShellManager) {
+	if mgr == nil {
+		return
+	}
+	id, cols, rows := ptyDims(msg)
+	_ = mgr.Resize(id, cols, rows)
+}
+
+func handlePTYClose(msg map[string]any, mgr ShellManager) {
+	if mgr == nil {
+		return
+	}
+	id, _ := msg["id"].(string)
+	_ = mgr.Close(id)
 }
 
 // handleCmd runs handler in its own goroutine (a verb like bootstrap can
