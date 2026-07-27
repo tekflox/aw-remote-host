@@ -10,11 +10,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
+	"github.com/tekflox/aw-remote-host/internal/lanfastpath"
 	"github.com/tekflox/aw-remote-host/internal/link"
 	"github.com/tekflox/aw-remote-host/internal/ops"
 	"github.com/tekflox/aw-remote-host/internal/servicemgr"
@@ -165,6 +168,7 @@ func runBootstrapWorkspace(args []string) error {
 	}
 	registered := make(chan registration, 1)
 	runDone := make(chan error, 1)
+	var lanOnce sync.Once
 
 	// opsHandler dispatches lifecycle/health "cmd" frames the control plane
 	// sends over this same /link connection (see internal/ops). Its Opts
@@ -186,6 +190,9 @@ func runBootstrapWorkspace(args []string) error {
 					ControlPlane:     *controlPlane,
 				}
 				fmt.Printf("link: registered (remote_host_id=%s, workspace=%s)\n", reply.RemoteHostID, reply.WorkspaceSlug)
+				if reply.WorkspaceSlug != "" {
+					lanOnce.Do(func() { startLANFastPath(ctx, reply.WorkspaceSlug) })
+				}
 				select {
 				case registered <- registration{slug: reply.WorkspaceSlug, remoteHostID: reply.RemoteHostID}:
 				default:
@@ -260,6 +267,40 @@ func runBootstrapWorkspace(args []string) error {
 	fmt.Printf("workspace %q running — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
 	<-ctx.Done()
 	return <-runDone
+}
+
+// startLANFastPath boots the LAN fast-path TLS terminator (case a) in the
+// background if the per-workspace cert+key have been delivered. Absent cert
+// (control-plane hasn't pushed it yet) is not an error — the workspace stays
+// reachable via the /link tunnel; the terminator just doesn't offer the
+// local bypass until the cert lands. Honors AW_LAN_FASTPATH_PORT (default
+// 8443) and AW_LAN_FASTPATH_DISABLE=1 to opt out entirely.
+func startLANFastPath(ctx context.Context, slug string) {
+	if os.Getenv("AW_LAN_FASTPATH_DISABLE") == "1" {
+		return
+	}
+	certFile, keyFile, ok := lanfastpath.LocateCert(slug)
+	if !ok {
+		fmt.Printf("lan-fastpath: no cert at %s yet — local bypass off, tunnel path unaffected\n", certFile)
+		return
+	}
+	port := lanfastpath.DefaultPort
+	if v := os.Getenv("AW_LAN_FASTPATH_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			port = p
+		}
+	}
+	if addrs := lanfastpath.LANAddrs(); len(addrs) > 0 {
+		fmt.Printf("lan-fastpath: LAN addrs %s — serving https :%d -> %s\n", strings.Join(addrs, ","), port, lanfastpath.DefaultTarget)
+	} else {
+		fmt.Printf("lan-fastpath: no private LAN addr found — serving https :%d anyway (localhost only)\n", port)
+	}
+	go func() {
+		cfg := lanfastpath.Config{Port: port, CertFile: certFile, KeyFile: keyFile}
+		if err := lanfastpath.Serve(ctx, cfg); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "lan-fastpath: terminator stopped: %v\n", err)
+		}
+	}()
 }
 
 func runStatus(args []string) error {
