@@ -60,14 +60,16 @@ func (e *execPTY) Close() error {
 type Spawner func(ctx context.Context) (PTY, error)
 
 // DefaultSpawner runs an interactive shell inside the workspace container.
-// The bash-then-sh fallback happens INSIDE the container (via `sh -c`)
-// rather than by inspecting the podman-exec exit code here, since a missing
-// `bash` only surfaces as the shell exiting immediately with "not found" —
-// by the time creack/pty.Start returns, podman exec has already succeeded
-// at the process-spawn level regardless of whether bash exists.
+// The bash-then-sh fallback happens INSIDE the container (via `sh -c`): detect
+// bash with `command -v` (redirecting only the *probe's* output), then exec it
+// WITHOUT redirecting the shell's own stderr — an interactive bash writes its
+// prompt (PS1) and readline UI to stderr, so the old `exec bash 2>/dev/null`
+// silently discarded the prompt and the session looked dead until you typed a
+// command whose stdout happened to show. `exec` replaces the process but keeps
+// fd redirections, which is exactly why that redirection leaked into the shell.
 func DefaultSpawner(ctx context.Context) (PTY, error) {
 	cmd := exec.CommandContext(ctx, "podman", "exec", "-it", ops.WorkspaceContainer,
-		"sh", "-c", "exec bash 2>/dev/null || exec sh")
+		"sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh")
 	f, err := pty.Start(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("start pty: %w", err)
