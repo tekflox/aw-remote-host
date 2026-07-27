@@ -14,7 +14,21 @@ import (
 // relative os.Args[0] wouldn't resolve once launchd/systemd invoke it
 // from a different working directory.
 func resolveExePath() string {
+	// os.Executable() is the canonical, already-absolute path to the
+	// running binary on macOS/Linux — preferred over LookPath, which for a
+	// slash-containing arg like "./aw-remote-host" returns it verbatim
+	// (still relative), producing a launchd/systemd unit that fails to
+	// start once invoked from cwd=/ (exit 78).
+	if p, err := os.Executable(); err == nil {
+		if abs, err2 := filepath.Abs(p); err2 == nil {
+			return abs
+		}
+		return p
+	}
 	if p, err := exec.LookPath(os.Args[0]); err == nil {
+		if abs, err2 := filepath.Abs(p); err2 == nil {
+			return abs
+		}
 		return p
 	}
 	if p, err := filepath.Abs(os.Args[0]); err == nil {

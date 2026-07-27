@@ -68,6 +68,12 @@ func TestGenerateLaunchdPlist(t *testing.T) {
 	if !strings.Contains(plist, "<key>KeepAlive</key>") || !strings.Contains(plist, "<true/>") {
 		t.Error("plist should KeepAlive so a crash gets relaunched")
 	}
+	// launchd runs services with cwd=/ — a WorkingDirectory (dir of the
+	// binary) is required so a relative ExePath/cwd doesn't fail (exit 78).
+	if !strings.Contains(plist, "<key>WorkingDirectory</key>") ||
+		!strings.Contains(plist, "<string>/usr/local/bin</string>") {
+		t.Error("plist missing WorkingDirectory set to the binary's dir")
+	}
 }
 
 func TestLaunchdPathIsSlugScoped(t *testing.T) {

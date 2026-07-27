@@ -21,6 +21,8 @@ const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 		<string>--yes</string>
 		<string>--foreground</string>
 	</array>
+	<key>WorkingDirectory</key>
+	<string>%s</string>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
@@ -59,7 +61,12 @@ func GenerateLaunchdPlist(cfg Config) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf(launchdPlistTemplate, launchdLabel(cfg.Slug), cfg.ExePath, cfg.ControlPlane, logPath, logPath), nil
+	// WorkingDirectory guards against launchd invoking a relative ExePath
+	// (or the binary resolving relative paths) from an unexpected cwd —
+	// launchd starts services with cwd=/ , which used to make a relative
+	// binary path fail to launch (exit 78).
+	workDir := filepath.Dir(cfg.ExePath)
+	return fmt.Sprintf(launchdPlistTemplate, launchdLabel(cfg.Slug), cfg.ExePath, cfg.ControlPlane, workDir, logPath, logPath), nil
 }
 
 func launchdLogPath(slug string) (string, error) {
