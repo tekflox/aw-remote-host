@@ -25,8 +25,36 @@ SCHEMA="workspace_${AW_WORKSPACE_SLUG}"
 DB_URL="postgresql+psycopg://postgres:${AW_POSTGRES_PASSWORD}@${PG_HOST}:5432/aw_workspace"
 REDIS_URL="redis://${REDIS_HOST}:6379/0"
 
+# Host directory bind-mounted into the container at /opt/agentic-workspace so
+# the whole workspace fs is visible/editable from the host AND survives
+# container recreation (apps install into it — decoupled-apps framework).
+# Defaults to ~/agentic-workspace (no root needed; under $HOME so podman
+# machine already shares it into the VM on macOS). Ties to
+# feature:aw-remote-host-configurable-install-path.
+CONTAINER_WORKDIR="/opt/agentic-workspace"
+HOST_DIR="${AW_WORKSPACE_HOST_DIR:-${HOME}/agentic-workspace}"
+mkdir -p "$HOST_DIR"
+
 # Ensure the shared network exists (postgres/redis create it too — idempotent).
 podman network exists "$NETWORK_NAME" >/dev/null 2>&1 || podman network create "$NETWORK_NAME" >/dev/null
+
+# First-run seed: the repo is baked into the image at $CONTAINER_WORKDIR, but a
+# bind-mount over that path would MASK it with an empty host dir. So if the host
+# dir is empty, populate it from the image first. Re-bootstrap with an existing
+# (non-empty) host dir is left untouched — never clobber the user's files/apps.
+if [ -z "$(ls -A "$HOST_DIR" 2>/dev/null)" ]; then
+  echo "workspace: seeding $HOST_DIR from image $IMAGE (first run)"
+  podman pull "$IMAGE" >/dev/null 2>&1 || true
+  SEED_CONTAINER="${CONTAINER_NAME}-seed"
+  podman rm -f "$SEED_CONTAINER" >/dev/null 2>&1 || true
+  podman create --name "$SEED_CONTAINER" "$IMAGE" >/dev/null
+  # trailing /. copies the directory *contents* into HOST_DIR.
+  podman cp "${SEED_CONTAINER}:${CONTAINER_WORKDIR}/." "$HOST_DIR"
+  podman rm -f "$SEED_CONTAINER" >/dev/null 2>&1 || true
+  echo "workspace: seeded $(ls -A "$HOST_DIR" | wc -l | tr -d ' ') entries into $HOST_DIR"
+else
+  echo "workspace: $HOST_DIR already populated — leaving host files untouched"
+fi
 
 if podman container exists "$CONTAINER_NAME"; then
   echo "workspace: container already exists, ensuring it's running"
@@ -38,6 +66,7 @@ else
     --network "$NETWORK_NAME" \
     --restart=always \
     -p 127.0.0.1:9030:9030 \
+    -v "${HOST_DIR}:${CONTAINER_WORKDIR}" \
     -e AW_WORKSPACE="$AW_WORKSPACE_SLUG" \
     -e AW_WORKSPACE_SCHEMA="$SCHEMA" \
     -e AWSERV_DB_URL="$DB_URL" \
