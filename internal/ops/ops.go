@@ -331,17 +331,24 @@ func parseFloatPercent(raw string) (float64, bool) {
 	return v, true
 }
 
-// unitMultipliers mirrors docker_driver.py's _UNIT_MULTIPLIERS — podman
-// (like docker) reports MemUsage with IEC suffixes (KiB/MiB/GiB/TiB).
+// unitMultipliers covers both IEC binary suffixes (KiB/MiB/GiB/TiB, as
+// docker emits) and SI decimal suffixes (kB/MB/GB/TB) — podman reports
+// MemUsage in SI units (e.g. "45.2MB / 7.657GB"), so both must parse.
 var unitMultipliers = map[string]float64{
 	"TIB": 1024 * 1024 * 1024 * 1024,
 	"GIB": 1024 * 1024 * 1024,
 	"MIB": 1024 * 1024,
 	"KIB": 1024,
+	"TB":  1e12,
+	"GB":  1e9,
+	"MB":  1e6,
+	"KB":  1e3,
 	"B":   1,
 }
 
-var unitSuffixesLongestFirst = []string{"TIB", "GIB", "MIB", "KIB", "B"}
+// Longest-first so GB/MB/KB match before the bare "B" suffix (e.g.
+// "7.657GB" must strip "GB", not greedily match "B" leaving "7.657G").
+var unitSuffixesLongestFirst = []string{"TIB", "GIB", "MIB", "KIB", "TB", "GB", "MB", "KB", "B"}
 
 func parseBytes(raw string) (int64, bool) {
 	raw = strings.TrimSpace(raw)

@@ -241,10 +241,16 @@ func TestHealthWhenHTTPProbeFails(t *testing.T) {
 func TestParseBytes(t *testing.T) {
 	mib := 123.4 * 1024 * 1024
 	cases := map[string]int64{
+		// IEC binary suffixes (docker)
 		"123.4MiB": int64(mib),
 		"1GiB":     1024 * 1024 * 1024,
 		"512KiB":   512 * 1024,
 		"10B":      10,
+		// SI decimal suffixes (podman) — "GB"/"MB" must match before bare "B"
+		"45.2MB":  int64(45.2 * 1e6),
+		"7.657GB": int64(7.657 * 1e9),
+		"512KB":   512 * 1e3,
+		"1TB":     1e12,
 	}
 	for raw, want := range cases {
 		got, ok := parseBytes(raw)
@@ -258,6 +264,28 @@ func TestParseBytes(t *testing.T) {
 	}
 	if _, ok := parseBytes("garbage"); ok {
 		t.Error("expected parseBytes to fail on an unrecognized unit")
+	}
+}
+
+func TestParseMemUsage(t *testing.T) {
+	mib := func(v float64) int64 { return int64(v * 1024 * 1024) }
+	gib := func(v float64) int64 { return int64(v * 1024 * 1024 * 1024) }
+	cases := []struct {
+		raw               string
+		wantUsed, wantTot int64
+	}{
+		{"45.2MB / 7.657GB", int64(45.2 * 1e6), int64(7.657 * 1e9)}, // podman/SI
+		{"45.2MiB / 7.5GiB", mib(45.2), gib(7.5)},                   // docker/IEC
+	}
+	for _, c := range cases {
+		used, total, ok := parseMemUsage(c.raw)
+		if !ok {
+			t.Errorf("parseMemUsage(%q): expected ok=true", c.raw)
+			continue
+		}
+		if used != c.wantUsed || total != c.wantTot {
+			t.Errorf("parseMemUsage(%q) = (%d, %d), want (%d, %d)", c.raw, used, total, c.wantUsed, c.wantTot)
+		}
 	}
 }
 
