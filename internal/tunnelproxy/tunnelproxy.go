@@ -152,9 +152,16 @@ func (h *Handler) OpenWS(ctx context.Context, id, path string, headers map[strin
 
 	header := http.Header{}
 	for k, v := range headers {
+		// Strip the reserved handshake headers gorilla's dialer sets itself —
+		// forwarding the browser's verbatim (relayed through the /link tunnel)
+		// makes DialContext fail "duplicate header not allowed" (notably
+		// Sec-Websocket-Extensions: permessage-deflate). Must cover every name
+		// in gorilla's forbidden list, not just the key/version subset.
 		if strings.EqualFold(k, "host") || strings.EqualFold(k, "connection") ||
 			strings.EqualFold(k, "upgrade") || strings.EqualFold(k, "sec-websocket-key") ||
-			strings.EqualFold(k, "sec-websocket-version") {
+			strings.EqualFold(k, "sec-websocket-version") ||
+			strings.EqualFold(k, "sec-websocket-extensions") ||
+			strings.EqualFold(k, "sec-websocket-protocol") {
 			continue
 		}
 		header.Set(k, v)

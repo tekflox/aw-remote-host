@@ -164,6 +164,61 @@ func TestOpenWSBridgesMessagesBothWays(t *testing.T) {
 	}
 }
 
+// The browser's original WS handshake headers are relayed verbatim through
+// the /link tunnel, so OpenWS receives reserved names (Sec-Websocket-Key,
+// Sec-Websocket-Version, Sec-Websocket-Extensions, Sec-Websocket-Protocol,
+// Connection, Upgrade). gorilla's DialContext manages those itself and errors
+// "duplicate header not allowed" if any are passed in requestHeader — OpenWS
+// must strip them all. Regression for the BYOD PTY-over-tunnel bug where
+// Sec-Websocket-Extensions: permessage-deflate broke the local dial.
+func TestOpenWSStripsReservedHandshakeHeaders(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			mt, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			_ = conn.WriteMessage(mt, append([]byte("echo:"), data...))
+		}
+	}))
+	defer srv.Close()
+
+	h := &Handler{Target: srv.URL}
+	reserved := map[string]string{
+		"Sec-Websocket-Key":        "dGhlIHNhbXBsZSBub25jZQ==",
+		"Sec-Websocket-Version":    "13",
+		"Sec-Websocket-Extensions": "permessage-deflate; client_max_window_bits",
+		"Sec-Websocket-Protocol":   "chat",
+		"Connection":               "Upgrade",
+		"Upgrade":                  "websocket",
+		"Host":                     "browser.example",
+		"Cookie":                   "aw_id_jwt=abc", // a NON-reserved header must still pass through
+	}
+	done := make(chan struct{})
+	err := h.OpenWS(context.Background(), "sess-x", "/ws", reserved, func(id string, data []byte, isText bool) {
+		close(done)
+	})
+	if err != nil {
+		t.Fatalf("OpenWS with reserved headers failed (regression): %v", err)
+	}
+	defer h.CloseAllWS()
+
+	if err := h.WSMessage("sess-x", []byte("ping"), true); err != nil {
+		t.Fatalf("WSMessage: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for echoed message")
+	}
+}
+
 func TestWSMessageUnknownSessionErrors(t *testing.T) {
 	h := &Handler{}
 	if err := h.WSMessage("no-such-session", []byte("x"), true); err == nil {
