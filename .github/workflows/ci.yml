@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-test:
-    runs-on: [self-hosted, aw-sandbox]
+    runs-on: [self-hosted, aw-baremetal]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

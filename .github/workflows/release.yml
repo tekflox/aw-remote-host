@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: [self-hosted, aw-sandbox]
+    runs-on: [self-hosted, aw-baremetal]
     steps:
       - uses: actions/checkout@v4
         with:
