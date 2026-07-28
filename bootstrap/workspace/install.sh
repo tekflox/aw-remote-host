@@ -56,6 +56,28 @@ else
   echo "workspace: $HOST_DIR already populated — leaving host files untouched"
 fi
 
+# Tier-2 (container-per-app) support: mount the host's ROOTLESS podman socket
+# into the workspace so the decoupled-apps ContainerSupervisor can spawn app
+# containers over the Docker API (podman is Docker-API-compatible). TRUST NOTE:
+# this is the *rootless* socket — scoped to the unprivileged `aw` user, NOT root
+# — so an app container can only do what user `aw` already can (no host root).
+# Frederico approved mounting it (Telegram 2026-07-28). App containers join the
+# same podman network so the workspace reaches them by name (AW_CONTAINER_NETWORK),
+# exactly like it reaches postgres/redis.
+HOST_PODMAN_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+CONTAINER_SOCK="/run/podman.sock"
+SOCKET_ARGS=()
+if [ -S "$HOST_PODMAN_SOCK" ]; then
+  echo "workspace: mounting rootless podman socket $HOST_PODMAN_SOCK (Tier-2 apps enabled)"
+  SOCKET_ARGS=(
+    -v "${HOST_PODMAN_SOCK}:${CONTAINER_SOCK}"
+    -e "AW_CONTAINER_SOCKET=${CONTAINER_SOCK}"
+    -e "AW_CONTAINER_NETWORK=${NETWORK_NAME}"
+  )
+else
+  echo "workspace: no rootless podman socket at $HOST_PODMAN_SOCK — Tier-2 apps disabled" >&2
+fi
+
 if podman container exists "$CONTAINER_NAME"; then
   echo "workspace: container already exists, ensuring it's running"
   podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -67,6 +89,7 @@ else
     --restart=always \
     -p 127.0.0.1:9030:9030 \
     -v "${HOST_DIR}:${CONTAINER_WORKDIR}" \
+    ${SOCKET_ARGS[@]+"${SOCKET_ARGS[@]}"} \
     -e AW_WORKSPACE="$AW_WORKSPACE_SLUG" \
     -e AW_WORKSPACE_SCHEMA="$SCHEMA" \
     -e AWSERV_DB_URL="$DB_URL" \
