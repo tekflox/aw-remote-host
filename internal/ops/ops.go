@@ -60,6 +60,7 @@ type BootstrapOpts struct {
 	WorkspaceSlug    string
 	PostgresPassword string
 	ControlPlane     string
+	HostCredential   string
 }
 
 // Handler executes lifecycle/health verbs against the local podman runtime.
@@ -211,6 +212,7 @@ func (h *Handler) runModules(ctx context.Context, opts BootstrapOpts, full bool,
 			"AW_WORKSPACE_SLUG=" + opts.WorkspaceSlug,
 			"AW_POSTGRES_PASSWORD=" + opts.PostgresPassword,
 			"AW_BACKEND_URL=" + opts.ControlPlane,
+			"AW_WORKSPACE_HOST_TOKEN=" + opts.HostCredential,
 		},
 	}
 	for _, mod := range manifest.Modules {

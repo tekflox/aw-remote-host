@@ -11,8 +11,9 @@ and on the workspace slug — which only exists once the CLI has dialed
 `/link` and redeemed its token (see the root README and
 `internal/link`). `aw-remote-host`'s CLI runs the podman/postgres/redis
 modules first, dials `/link`, then runs this module with
-`AW_WORKSPACE_SLUG`/`AW_POSTGRES_PASSWORD`/`AW_BACKEND_URL` set in its
-environment — the user never types a slug.
+`AW_WORKSPACE_SLUG`/`AW_POSTGRES_PASSWORD`/`AW_BACKEND_URL` and the durable
+`AW_WORKSPACE_HOST_TOKEN` (`awlk_...`) set in its environment — the user never
+types a slug.
 
 ## Install
 

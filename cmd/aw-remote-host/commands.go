@@ -163,8 +163,9 @@ func runBootstrapWorkspace(args []string) error {
 	}
 
 	type registration struct {
-		slug         string
+		slug           string
 		remoteHostID string
+		hostCredential string
 	}
 	registered := make(chan registration, 1)
 	runDone := make(chan error, 1)
@@ -183,18 +184,31 @@ func runBootstrapWorkspace(args []string) error {
 					st.WorkspaceSlug = reply.WorkspaceSlug
 					_ = state.Save(statePath, st)
 				}
+				hostCredential := reply.HostCredential
+				if hostCredential == "" && existingCreds != nil {
+					hostCredential = existingCreds.HostCredential
+				}
+				if hostCredential == "" {
+					if creds, _ := link.LoadCredentials(credPath); creds != nil {
+						hostCredential = creds.HostCredential
+					}
+				}
 				opsHandler.Opts = ops.BootstrapOpts{
 					ExtractDir:       extractDir,
 					WorkspaceSlug:    reply.WorkspaceSlug,
 					PostgresPassword: st.PostgresPassword,
 					ControlPlane:     *controlPlane,
+					HostCredential:   hostCredential,
 				}
 				fmt.Printf("link: registered (remote_host_id=%s, workspace=%s)\n", reply.RemoteHostID, reply.WorkspaceSlug)
 				if reply.WorkspaceSlug != "" {
 					lanOnce.Do(func() { startLANFastPath(ctx, reply.WorkspaceSlug) })
 				}
 				select {
-				case registered <- registration{slug: reply.WorkspaceSlug, remoteHostID: reply.RemoteHostID}:
+				case registered <- registration{
+					slug: reply.WorkspaceSlug, remoteHostID: reply.RemoteHostID,
+					hostCredential: hostCredential,
+				}:
 				default:
 				}
 			},
@@ -240,6 +254,7 @@ func runBootstrapWorkspace(args []string) error {
 			"AW_WORKSPACE_SLUG=" + reg.slug,
 			"AW_POSTGRES_PASSWORD=" + st.PostgresPassword,
 			"AW_BACKEND_URL=" + *controlPlane,
+			"AW_WORKSPACE_HOST_TOKEN=" + reg.hostCredential,
 		},
 	}
 	wsStatuses, err := bootstrap.Run(ctx, m.Only("workspace"), wsOpts)

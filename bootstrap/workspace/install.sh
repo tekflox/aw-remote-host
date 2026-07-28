@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Install (or reuse) the aw-workspace runtime container. Idempotent.
-# Requires AW_WORKSPACE_SLUG / AW_POSTGRES_PASSWORD / AW_BACKEND_URL in the
-# environment — aw-remote-host sets these after the /link registration
-# reply tells it which workspace slug this token is scoped to (the user
-# never types a slug).
+# Requires AW_WORKSPACE_SLUG / AW_POSTGRES_PASSWORD / AW_BACKEND_URL /
+# AW_WORKSPACE_HOST_TOKEN in the environment — aw-remote-host sets these after
+# the /link registration reply tells it which workspace slug this token is
+# scoped to (the user never types a slug).
 #
 # Networking: in a BYOD host there is no shared aw-sandbox netns, so the
 # workspace, postgres and redis are separate containers. They are joined on
@@ -15,6 +15,7 @@ set -euo pipefail
 : "${AW_WORKSPACE_SLUG:?AW_WORKSPACE_SLUG must be set (comes from the /link registered reply)}"
 : "${AW_POSTGRES_PASSWORD:?AW_POSTGRES_PASSWORD must be set}"
 : "${AW_BACKEND_URL:?AW_BACKEND_URL must be set}"
+: "${AW_WORKSPACE_HOST_TOKEN:?AW_WORKSPACE_HOST_TOKEN must be set (durable awlk_ host credential)}"
 
 IMAGE="ghcr.io/fredericowu/aw-workspace:latest"
 CONTAINER_NAME="aw-remote-host-workspace"
@@ -88,6 +89,14 @@ else
 fi
 
 if podman container exists "$CONTAINER_NAME"; then
+  if ! podman inspect "$CONTAINER_NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      | grep -q '^AW_WORKSPACE_HOST_TOKEN='; then
+    echo "workspace: existing container is missing AW_WORKSPACE_HOST_TOKEN — recreating"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+fi
+
+if podman container exists "$CONTAINER_NAME"; then
   echo "workspace: container already exists, ensuring it's running"
   podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true
   podman start "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -105,6 +114,7 @@ else
     -e AW_WORKSPACE_DB_URL="$DB_URL" \
     -e AW_REDIS_URL="$REDIS_URL" \
     -e AW_BACKEND_URL="$AW_BACKEND_URL" \
+    -e AW_WORKSPACE_HOST_TOKEN="$AW_WORKSPACE_HOST_TOKEN" \
     "$IMAGE"
 fi
 
