@@ -53,12 +53,39 @@ curl -fsSL https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install
 ```
 
 This pins an exact release version, downloads the matching
-`linux_amd64`/`linux_arm64` binary from
+`linux_amd64`/`linux_arm64`/`darwin_amd64`/`darwin_arm64` binary from
 [GitHub Releases](https://github.com/tekflox/aw-remote-host/releases),
 verifies its SHA-256 checksum, and installs it to `~/.local/bin`.
 
-macOS binaries aren't published by the release workflow yet — build from
-source there for now (`go build ./cmd/aw-remote-host`, Go 1.23+).
+### Upgrading an already-installed binary (e.g. macbook-fred)
+
+`install.sh`'s embedded bootstrap scripts (`bootstrap.ExtractScripts`) are
+baked into the Go binary at build time — editing the on-disk copy under
+`~/.aw-remote-host/bootstrap-scripts/` does nothing (see the gotcha in the
+`aw-workspace-base-dir-host-mount` KB doc). A fix to `bootstrap/workspace/install.sh`
+(e.g. the Tier-2 podman-socket mount + `--security-opt label=disable`,
+commit `753214a`) only takes effect on the target machine once the
+**binary itself** is rebuilt/released and re-installed there:
+
+1. A new tag is cut and `release.yml` (`workflow_dispatch`) is run against it
+   — produces `dist/aw-remote-host_<version>_<os>_<arch>.tar.gz` +
+   `checksums.txt` on the GitHub Release.
+2. On the target machine, re-run the installer to pull the new pinned
+   version and replace the binary in place:
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.sh | sh
+   ```
+   (or set `AW_REMOTE_HOST_VERSION=<tag>` to pin explicitly instead of the
+   script's built-in default).
+3. Restart whichever service is running it so the new binary's embedded
+   scripts take effect on the **next** `bootstrap-workspace` re-provision —
+   the running process itself doesn't hot-swap:
+   - **macOS (launchd):** `launchctl kickstart -k gui/$(id -u)/com.tekflox.aw-remote-host.<slug>`
+     (or unload/reload the plist under `~/Library/LaunchAgents/`).
+   - **Linux (systemd user):** `systemctl --user restart aw-remote-host.service`
+4. Trigger (or wait for) a workspace re-provision to confirm the new
+   `install.sh` logic actually ran — e.g. check that the podman socket is
+   mounted with `--security-opt label=disable` on the recreated container.
 
 ## Usage
 
