@@ -69,8 +69,17 @@ CONTAINER_SOCK="/run/podman.sock"
 SOCKET_ARGS=()
 if [ -S "$HOST_PODMAN_SOCK" ]; then
   echo "workspace: mounting rootless podman socket $HOST_PODMAN_SOCK (Tier-2 apps enabled)"
+  # --security-opt label=disable: on an SELinux host (e.g. the Fedora CoreOS
+  # podman-machine VM on macOS) the bind-mounted rootless socket carries an
+  # `unconfined_t` context the nested container's confined domain can't reach —
+  # the ContainerSupervisor's docker-SDK call gets EACCES ("Permission denied")
+  # even though DAC ownership matches. Disabling SELinux labelling for the
+  # workspace container lets it reach the socket. Verified live on macbook-fred
+  # 2026-07-28 (without it, `curl --unix-socket /run/podman.sock` = EACCES; with
+  # it, the podman API + the aw-app-browser Tier-2 container + CDP all work).
   SOCKET_ARGS=(
     -v "${HOST_PODMAN_SOCK}:${CONTAINER_SOCK}"
+    --security-opt label=disable
     -e "AW_CONTAINER_SOCKET=${CONTAINER_SOCK}"
     -e "AW_CONTAINER_NETWORK=${NETWORK_NAME}"
   )
