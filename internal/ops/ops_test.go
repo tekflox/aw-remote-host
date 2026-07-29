@@ -3,6 +3,8 @@ package ops
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -99,6 +101,44 @@ func TestRestartOK(t *testing.T) {
 	}
 	if data["restarted"] != true {
 		t.Errorf("expected restarted=true, got %v", data)
+	}
+}
+
+func TestSyncWorkspaceSourcePreservesRuntimeDataAndRemovesStaleFiles(t *testing.T) {
+	dst := t.TempDir()
+	src := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(dst, ".aw-workspace", "apps"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, ".aw-workspace", "apps", "keep.txt"), []byte("runtime"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "stale.py"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "src", "api"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "src", "api", "app.py"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := syncWorkspaceSource(src, dst); err != nil {
+		t.Fatalf("syncWorkspaceSource failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, ".aw-workspace", "apps", "keep.txt")); err != nil {
+		t.Fatalf("expected runtime data to survive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "stale.py")); !os.IsNotExist(err) {
+		t.Fatalf("expected stale source file to be removed, got err=%v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "src", "api", "app.py"))
+	if err != nil {
+		t.Fatalf("expected new source file: %v", err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("unexpected copied source content: %q", got)
 	}
 }
 

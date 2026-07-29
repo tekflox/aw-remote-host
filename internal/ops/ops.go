@@ -9,8 +9,12 @@ package ops
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +24,8 @@ import (
 
 const (
 	WorkspaceContainer = "aw-remote-host-workspace"
+	WorkspaceImage     = "ghcr.io/fredericowu/aw-workspace:latest"
+	ContainerWorkdir   = "/opt/agentic-workspace"
 	PostgresContainer  = "aw-remote-host-postgres"
 	RedisContainer     = "aw-remote-host-redis"
 	PostgresVolume     = "aw-remote-host-postgres-data"
@@ -72,7 +78,7 @@ type Handler struct {
 	Opts    BootstrapOpts // used by the reinstall/bootstrap verbs — see Dispatch
 }
 
-// Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|
+// Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|"update"|
 // "uninstall"|"health") — the switchboard link.go's cmd-frame handling
 // calls into. args is accepted (and currently unused) for forward
 // compatibility with the tunnel protocol; every verb here is
@@ -89,6 +95,8 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.Reinstall(ctx, h.Opts, emit)
 	case "bootstrap":
 		return h.Bootstrap(ctx, h.Opts, emit)
+	case "update":
+		return h.Update(ctx, h.Opts, emit)
 	case "health":
 		return h.Health(ctx), nil
 	default:
@@ -183,12 +191,160 @@ func (h *Handler) Reinstall(ctx context.Context, opts BootstrapOpts, emit Emit) 
 	return h.runModules(ctx, opts, false, emit)
 }
 
+// Update pulls the latest aw-workspace image, syncs the baked source tree into
+// the host bind-mount, and recreates the workspace container. Mutable runtime
+// state under .aw-workspace is preserved; source files are replaced so deletes
+// in the image actually take effect on already-installed hosts.
+func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, emit Emit) (map[string]any, error) {
+	if emit == nil {
+		emit = noopEmit
+	}
+	hostDir, err := workspaceHostDir()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(hostDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create workspace host dir %s: %w", hostDir, err)
+	}
+
+	emit("info", "update", "pulling latest aw-workspace image")
+	if _, err := h.runner().Run(ctx, "podman", "pull", WorkspaceImage); err != nil {
+		emit("error", "update", "image pull failed: "+err.Error())
+		return nil, fmt.Errorf("podman pull %s: %w", WorkspaceImage, err)
+	}
+
+	staging := filepath.Join(hostDir, fmt.Sprintf(".aw-workspace-update-%d", time.Now().UnixNano()))
+	if err := os.RemoveAll(staging); err != nil {
+		return nil, fmt.Errorf("remove stale staging dir: %w", err)
+	}
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		return nil, fmt.Errorf("create staging dir: %w", err)
+	}
+	defer os.RemoveAll(staging)
+
+	seedContainer := WorkspaceContainer + "-update"
+	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", seedContainer)
+	if _, err := h.runner().Run(ctx, "podman", "create", "--name", seedContainer, WorkspaceImage); err != nil {
+		return nil, fmt.Errorf("podman create update seed: %w", err)
+	}
+	defer h.runner().Run(ctx, "podman", "rm", "-f", seedContainer)
+
+	emit("info", "update", "copying workspace source from image")
+	if _, err := h.runner().Run(ctx, "podman", "cp", seedContainer+":"+ContainerWorkdir+"/.", staging); err != nil {
+		return nil, fmt.Errorf("podman cp workspace source: %w", err)
+	}
+	if err := syncWorkspaceSource(staging, hostDir); err != nil {
+		return nil, err
+	}
+
+	emit("info", "update", "recreating workspace container")
+	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", WorkspaceContainer)
+	if _, err := h.runModules(ctx, opts, false, emit); err != nil {
+		return nil, err
+	}
+	emit("info", "update", "workspace code updated")
+	return map[string]any{"updated": true}, nil
+}
+
 // Bootstrap brings the runtime up from nothing (idempotent — safe to call
 // on an already-running workspace): the full manifest (podman, postgres,
 // redis, workspace), each module skipped if its own verify.sh already
 // passes.
 func (h *Handler) Bootstrap(ctx context.Context, opts BootstrapOpts, emit Emit) (map[string]any, error) {
 	return h.runModules(ctx, opts, true, emit)
+}
+
+func workspaceHostDir() (string, error) {
+	if dir := strings.TrimSpace(os.Getenv("AW_WORKSPACE_HOST_DIR")); dir != "" {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	return filepath.Join(home, "agentic-workspace"), nil
+}
+
+func syncWorkspaceSource(srcDir, dstDir string) error {
+	entries, err := os.ReadDir(dstDir)
+	if err != nil {
+		return fmt.Errorf("read workspace host dir: %w", err)
+	}
+	stagingName := filepath.Base(srcDir)
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == ".aw-workspace" || name == stagingName {
+			continue
+		}
+		if strings.HasPrefix(name, ".aw-workspace-update-") {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dstDir, name)); err != nil {
+			return fmt.Errorf("remove old workspace entry %s: %w", name, err)
+		}
+	}
+	srcEntries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return fmt.Errorf("read staged workspace source: %w", err)
+	}
+	for _, entry := range srcEntries {
+		if entry.Name() == ".aw-workspace" {
+			continue
+		}
+		if err := copyPath(filepath.Join(srcDir, entry.Name()), filepath.Join(dstDir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyPath(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", src, err)
+	}
+	if info.IsDir() {
+		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dst, err)
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return fmt.Errorf("read dir %s: %w", src, err)
+		}
+		for _, entry := range entries {
+			if err := copyPath(filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name())); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(src)
+		if err != nil {
+			return fmt.Errorf("readlink %s: %w", src, err)
+		}
+		if err := os.Symlink(target, dst); err != nil {
+			return fmt.Errorf("symlink %s: %w", dst, err)
+		}
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return fmt.Errorf("copy %s to %s: %w", src, dst, err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", dst, err)
+	}
+	return nil
 }
 
 func (h *Handler) runModules(ctx context.Context, opts BootstrapOpts, full bool, emit Emit) (map[string]any, error) {
@@ -255,20 +411,36 @@ func (h *Handler) Health(ctx context.Context) map[string]any {
 		uptimeS = started
 	}
 
+	healthy, workspaceVersion := h.probeHealth(ctx)
 	cpuPct, mem := h.containerStats(ctx)
 	return map[string]any{
-		"healthy":  h.probeHealth(ctx),
-		"uptime_s": uptimeS,
-		"disk":     h.diskUsage(ctx),
-		"cpu_pct":  cpuPct,
-		"mem":      mem,
-		"offline":  false,
+		"healthy":           healthy,
+		"uptime_s":          uptimeS,
+		"disk":              h.diskUsage(ctx),
+		"cpu_pct":           cpuPct,
+		"mem":               mem,
+		"offline":           false,
+		"workspace_version": workspaceVersion,
 	}
 }
 
-func (h *Handler) probeHealth(ctx context.Context) bool {
-	_, err := h.runner().Run(ctx, "curl", "-fsS", "--max-time", probeTimeout, HealthURL)
-	return err == nil
+func (h *Handler) probeHealth(ctx context.Context) (bool, any) {
+	out, err := h.runner().Run(ctx, "curl", "-fsS", "--max-time", probeTimeout, HealthURL)
+	if err != nil {
+		return false, nil
+	}
+	var data map[string]any
+	if json.Unmarshal([]byte(out), &data) != nil {
+		return true, nil
+	}
+	version, _ := data["version"].(string)
+	if version == "" {
+		return true, nil
+	}
+	if len(version) > 7 {
+		version = version[:7]
+	}
+	return true, version
 }
 
 func (h *Handler) containerStats(ctx context.Context) (any, any) {
