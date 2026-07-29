@@ -52,11 +52,11 @@ jobs:
           sha256sum *.tar.gz > checksums.txt
 
       - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          gh release create "${VERSION}" dist/*.tar.gz dist/checksums.txt \
-            --title "${VERSION}" \
-            --generate-notes \
-            --repo "${{ github.repository }}"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
