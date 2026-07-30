@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -79,7 +80,7 @@ type Handler struct {
 }
 
 // Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|"update"|
-// "uninstall"|"health") — the switchboard link.go's cmd-frame handling
+// "self-update"|"uninstall"|"health") — the switchboard link.go's cmd-frame handling
 // calls into. args is accepted (and currently unused) for forward
 // compatibility with the tunnel protocol; every verb here is
 // workspace-scoped and needs no per-call parameters today.
@@ -97,6 +98,8 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.Bootstrap(ctx, h.Opts, emit)
 	case "update":
 		return h.Update(ctx, h.Opts, emit)
+	case "self-update":
+		return h.SelfUpdate(ctx, args, emit)
 	case "health":
 		return h.Health(ctx), nil
 	default:
@@ -263,6 +266,63 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, emit Emit) (ma
 	}
 	emit("info", "update", "workspace code updated")
 	return map[string]any{"updated": true}, nil
+}
+
+// SelfUpdate installs the requested aw-remote-host release through the public
+// installer, then asks the platform service manager to restart this process.
+// The restart is started after the command reply has been written back to the
+// control plane so the caller gets a deterministic result instead of losing
+// the tunnel mid-frame.
+func (h *Handler) SelfUpdate(ctx context.Context, args map[string]any, emit Emit) (map[string]any, error) {
+	if emit == nil {
+		emit = noopEmit
+	}
+	version, _ := args["version"].(string)
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return nil, fmt.Errorf("version is required")
+	}
+
+	emit("info", "self-update", "installing aw-remote-host "+version)
+	installCmd := fmt.Sprintf(
+		"curl -fsSL https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.sh | AW_REMOTE_HOST_VERSION=%s sh",
+		shellQuote(version),
+	)
+	if out, err := h.runner().Run(ctx, "sh", "-c", installCmd); err != nil {
+		emit("error", "self-update", "install failed: "+err.Error())
+		return nil, fmt.Errorf("install aw-remote-host %s: %w: %s", version, err, strings.TrimSpace(out))
+	}
+
+	if err := restartHostServiceSoon(h.Opts.WorkspaceSlug); err != nil {
+		emit("warning", "self-update", "installed but service restart was not scheduled: "+err.Error())
+		return map[string]any{"updated": true, "version": version, "restart_scheduled": false}, nil
+	}
+	emit("info", "self-update", "aw-remote-host installed; restarting service")
+	return map[string]any{"updated": true, "version": version, "restart_scheduled": true}, nil
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func restartHostServiceSoon(slug string) error {
+	if os.Getenv("AW_REMOTE_HOST_SKIP_SERVICE_RESTART") == "1" {
+		return nil
+	}
+	var cmd string
+	switch runtime.GOOS {
+	case "darwin":
+		label := "com.tekflox.aw-remote-host"
+		if strings.TrimSpace(slug) != "" {
+			label += "." + strings.TrimSpace(slug)
+		}
+		cmd = fmt.Sprintf("sleep 1; launchctl kickstart -k gui/$(id -u)/%s", shellQuote(label))
+	case "linux":
+		cmd = "sleep 1; systemctl --user restart aw-remote-host"
+	default:
+		return fmt.Errorf("unsupported OS %s", runtime.GOOS)
+	}
+	return exec.Command("sh", "-c", cmd).Start()
 }
 
 // Bootstrap brings the runtime up from nothing (idempotent — safe to call

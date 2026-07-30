@@ -1,2 +1,16 @@
 /dist/
 *.tar.gz
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# coverage
+.coverage
+coverage.out
+coverage.xml
+coverage/
+htmlcov/

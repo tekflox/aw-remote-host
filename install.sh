@@ -9,8 +9,20 @@
 set -eu
 
 REPO="tekflox/aw-remote-host"
-VERSION="${AW_REMOTE_HOST_VERSION:-v0.1.0}"
+VERSION="${AW_REMOTE_HOST_VERSION:-latest}"
 INSTALL_DIR="${AW_REMOTE_HOST_INSTALL_DIR:-$HOME/.local/bin}"
+
+if [ "$VERSION" = "latest" ]; then
+  VERSION="$(
+    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |
+      sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+      head -n 1
+  )"
+  if [ -z "$VERSION" ]; then
+    echo "aw-remote-host: could not resolve latest release" >&2
+    exit 1
+  fi
+fi
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 arch=$(uname -m)
@@ -20,10 +32,10 @@ case "$arch" in
   *) echo "aw-remote-host: unsupported architecture $arch" >&2; exit 1 ;;
 esac
 
-if [ "$os" != "linux" ]; then
-  echo "aw-remote-host: unsupported OS $os (only linux binaries are published)" >&2
-  exit 1
-fi
+case "$os" in
+  linux|darwin) ;;
+  *) echo "aw-remote-host: unsupported OS $os" >&2; exit 1 ;;
+esac
 
 asset="aw-remote-host_${VERSION}_${os}_${arch}.tar.gz"
 base_url="https://github.com/${REPO}/releases/download/${VERSION}"

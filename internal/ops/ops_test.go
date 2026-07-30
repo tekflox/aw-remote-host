@@ -390,6 +390,41 @@ func TestDispatchRoutesToStop(t *testing.T) {
 	}
 }
 
+func TestSelfUpdateInstallsRequestedVersion(t *testing.T) {
+	t.Setenv("AW_REMOTE_HOST_SKIP_SERVICE_RESTART", "1")
+	r := newFakeRunner()
+	h := &Handler{Runner: r, Opts: BootstrapOpts{WorkspaceSlug: "demo"}}
+
+	data, err := h.SelfUpdate(context.Background(), map[string]any{"version": "build-abc1234"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if data["updated"] != true || data["version"] != "build-abc1234" {
+		t.Fatalf("unexpected self-update result: %v", data)
+	}
+	if len(r.calls) != 1 || r.calls[0][0] != "sh" || r.calls[0][1] != "-c" {
+		t.Fatalf("unexpected install command: %v", r.calls)
+	}
+	cmd := r.calls[0][2]
+	if !strings.Contains(cmd, "AW_REMOTE_HOST_VERSION='build-abc1234'") {
+		t.Fatalf("install command does not pin requested version: %s", cmd)
+	}
+}
+
+func TestDispatchRoutesToSelfUpdate(t *testing.T) {
+	t.Setenv("AW_REMOTE_HOST_SKIP_SERVICE_RESTART", "1")
+	r := newFakeRunner()
+	h := &Handler{Runner: r}
+	data, err := h.Dispatch(context.Background(), "self-update", map[string]any{"version": "build-def5678"}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	m, ok := data.(map[string]any)
+	if !ok || m["version"] != "build-def5678" {
+		t.Errorf("expected self-update result, got %v", data)
+	}
+}
+
 func TestDispatchRoutesToHealth(t *testing.T) {
 	r := newFakeRunner()
 	r.fail(fmt.Errorf("no such container"), "podman", "inspect", "--format",
