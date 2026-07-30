@@ -67,9 +67,12 @@ baked into the Go binary at build time — editing the on-disk copy under
 commit `753214a`) only takes effect on the target machine once the
 **binary itself** is rebuilt/released and re-installed there:
 
-1. A new tag is cut and `release.yml` (`workflow_dispatch`) is run against it
-   — produces `dist/aw-remote-host_<version>_<os>_<arch>.tar.gz` +
-   `checksums.txt` on the GitHub Release.
+1. A push to `main` that changes the remote-host runtime, bootstrap scripts,
+   installer, or release workflow runs `release.yml`, bumps the latest
+   `vX.Y.Z` patch tag, and publishes
+   `dist/aw-remote-host_<version>_<os>_<arch>.tar.gz` + `checksums.txt` on the
+   GitHub Release. `workflow_dispatch` can still be used with an explicit
+   `tag` input when a release needs to be pinned manually.
 2. On the target machine, re-run the installer to pull the new pinned
    version and replace the binary in place:
    ```sh

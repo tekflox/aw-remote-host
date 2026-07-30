@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (defaults to build-<sha>)"
+        description: "Tag to release (defaults to next vX.Y.Z patch)"
         required: false
   push:
     branches: [main]
@@ -34,13 +34,29 @@ jobs:
         id: version
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
-          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [ -n "${INPUT_TAG}" ]; then
             version="${INPUT_TAG}"
           else
-            version="build-${SHA::7}"
+            git fetch --tags --force
+            latest="$(
+              git tag -l 'v[0-9]*.[0-9]*.[0-9]*' |
+                sort -V |
+                tail -n 1
+            )"
+            if [ -z "${latest}" ]; then
+              version="v0.1.0"
+            else
+              raw="${latest#v}"
+              IFS=. read -r major minor patch <<< "${raw}"
+              patch=$((patch + 1))
+              version="v${major}.${minor}.${patch}"
+            fi
+          fi
+          if git rev-parse "${version}" >/dev/null 2>&1; then
+            echo "::error::resolved version ${version} already exists"
+            exit 1
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
