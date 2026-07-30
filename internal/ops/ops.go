@@ -81,9 +81,8 @@ type Handler struct {
 
 // Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|"update"|
 // "self-update"|"uninstall"|"health") — the switchboard link.go's cmd-frame handling
-// calls into. args is accepted (and currently unused) for forward
-// compatibility with the tunnel protocol; every verb here is
-// workspace-scoped and needs no per-call parameters today.
+// calls into. args carries optional per-verb parameters such as the exact
+// aw-workspace image version to install for workspace updates.
 func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any, emit Emit) (any, error) {
 	switch verb {
 	case "stop":
@@ -97,7 +96,7 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 	case "bootstrap":
 		return h.Bootstrap(ctx, h.Opts, emit)
 	case "update":
-		return h.Update(ctx, h.Opts, emit)
+		return h.Update(ctx, h.Opts, args, emit)
 	case "self-update":
 		return h.SelfUpdate(ctx, args, emit)
 	case "health":
@@ -126,6 +125,21 @@ func workspaceImage() string {
 		return image
 	}
 	return WorkspaceImage
+}
+
+func workspaceImageForVersion(version string) string {
+	image := workspaceImage()
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return image
+	}
+	if at := strings.Index(image, "@"); at >= 0 {
+		return image
+	}
+	if colon := strings.LastIndex(image, ":"); colon >= 0 && !strings.Contains(image[colon+1:], "/") {
+		return image[:colon+1] + version
+	}
+	return image + ":" + version
 }
 
 func podmanPullArgs(image string) []string {
@@ -216,7 +230,7 @@ func (h *Handler) Reinstall(ctx context.Context, opts BootstrapOpts, emit Emit) 
 // the host bind-mount, and recreates the workspace container. Mutable runtime
 // state under .aw-workspace is preserved; source files are replaced so deletes
 // in the image actually take effect on already-installed hosts.
-func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, emit Emit) (map[string]any, error) {
+func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[string]any, emit Emit) (map[string]any, error) {
 	if emit == nil {
 		emit = noopEmit
 	}
@@ -228,8 +242,14 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, emit Emit) (ma
 		return nil, fmt.Errorf("create workspace host dir %s: %w", hostDir, err)
 	}
 
-	image := workspaceImage()
-	emit("info", "update", "pulling latest aw-workspace image")
+	version, _ := args["version"].(string)
+	version = strings.TrimSpace(version)
+	image := workspaceImageForVersion(version)
+	if version != "" {
+		emit("info", "update", "pulling aw-workspace image "+version)
+	} else {
+		emit("info", "update", "pulling latest aw-workspace image")
+	}
 	if _, err := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); err != nil {
 		if _, existsErr := h.runner().Run(ctx, "podman", "image", "exists", image); existsErr != nil {
 			emit("error", "update", "image pull failed: "+err.Error())
@@ -268,7 +288,11 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, emit Emit) (ma
 		return nil, err
 	}
 	emit("info", "update", "workspace code updated")
-	return map[string]any{"updated": true}, nil
+	data := map[string]any{"updated": true}
+	if version != "" {
+		data["version"] = version
+	}
+	return data, nil
 }
 
 // SelfUpdate installs the requested aw-remote-host release through the public
@@ -526,10 +550,23 @@ func (h *Handler) probeHealth(ctx context.Context) (bool, any) {
 	if version == "" {
 		return true, nil
 	}
-	if len(version) > 7 {
+	if isLongHexSHA(version) {
 		version = version[:7]
 	}
 	return true, version
+}
+
+func isLongHexSHA(version string) bool {
+	if len(version) < 8 || len(version) > 40 {
+		return false
+	}
+	for _, r := range version {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (h *Handler) containerStats(ctx context.Context) (any, any) {

@@ -120,6 +120,22 @@ func TestWorkspaceImageFallsBackToDefault(t *testing.T) {
 	}
 }
 
+func TestWorkspaceImageForVersionPinsTag(t *testing.T) {
+	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace:latest")
+
+	if got := workspaceImageForVersion("abc1234"); got != "ghcr.io/fredericowu/aw-workspace:abc1234" {
+		t.Fatalf("workspaceImageForVersion() = %q, want pinned tag", got)
+	}
+}
+
+func TestWorkspaceImageForVersionPreservesDigest(t *testing.T) {
+	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace@sha256:deadbeef")
+
+	if got := workspaceImageForVersion("abc1234"); got != "ghcr.io/fredericowu/aw-workspace@sha256:deadbeef" {
+		t.Fatalf("workspaceImageForVersion() = %q, want digest image unchanged", got)
+	}
+}
+
 func TestPodmanPullArgsDisablesTLSForLocalhostRegistry(t *testing.T) {
 	got := podmanPullArgs("localhost:5000/aw-workspace:e2e")
 	want := []string{"pull", "--tls-verify=false", "localhost:5000/aw-workspace:e2e"}
@@ -299,6 +315,32 @@ func TestHealthRunningAndHTTPHealthy(t *testing.T) {
 	}
 	if disk["total"] != int64(1000000*1024) || disk["used"] != int64(400000*1024) {
 		t.Errorf("unexpected disk usage: %v", disk)
+	}
+}
+
+func TestHealthKeepsSemverWorkspaceVersion(t *testing.T) {
+	r := newFakeRunner()
+	r.on("true\t2020-01-01T00:00:00.000000000Z", "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	r.on(`{"status":"ok","version":"v0.12.10"}`, "curl", "-fsS", "--max-time", probeTimeout, HealthURL)
+	h := &Handler{Runner: r}
+
+	got := h.Health(context.Background())
+	if got["workspace_version"] != "v0.12.10" {
+		t.Errorf("expected full semver workspace_version, got %v", got["workspace_version"])
+	}
+}
+
+func TestHealthShortensLongSHAWorkspaceVersion(t *testing.T) {
+	r := newFakeRunner()
+	r.on("true\t2020-01-01T00:00:00.000000000Z", "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	r.on(`{"status":"ok","version":"abcdef1234567890"}`, "curl", "-fsS", "--max-time", probeTimeout, HealthURL)
+	h := &Handler{Runner: r}
+
+	got := h.Health(context.Background())
+	if got["workspace_version"] != "abcdef1" {
+		t.Errorf("expected shortened SHA workspace_version, got %v", got["workspace_version"])
 	}
 }
 
