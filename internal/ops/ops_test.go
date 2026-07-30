@@ -128,6 +128,14 @@ func TestPodmanPullArgsDisablesTLSForLocalhostRegistry(t *testing.T) {
 	}
 }
 
+func TestPodmanPullArgsDisablesTLSForLocalhostRepository(t *testing.T) {
+	got := podmanPullArgs("localhost/aw-workspace:e2e")
+	want := []string{"pull", "--tls-verify=false", "localhost/aw-workspace:e2e"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("podmanPullArgs(localhost repository) = %v, want %v", got, want)
+	}
+}
+
 func TestPodmanPullArgsKeepsDefaultRegistryStrict(t *testing.T) {
 	got := podmanPullArgs("ghcr.io/fredericowu/aw-workspace:latest")
 	want := []string{"pull", "ghcr.io/fredericowu/aw-workspace:latest"}

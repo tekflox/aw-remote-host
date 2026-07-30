@@ -127,7 +127,10 @@ func workspaceImage() string {
 
 func podmanPullArgs(image string) []string {
 	args := []string{"pull"}
-	if strings.HasPrefix(image, "localhost:") || strings.HasPrefix(image, "127.0.0.1:") {
+	if strings.HasPrefix(image, "localhost/") ||
+		strings.HasPrefix(image, "localhost:") ||
+		strings.HasPrefix(image, "127.0.0.1/") ||
+		strings.HasPrefix(image, "127.0.0.1:") {
 		args = append(args, "--tls-verify=false")
 	}
 	return append(args, image)

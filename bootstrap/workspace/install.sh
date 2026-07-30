@@ -37,7 +37,7 @@ HOST_DIR="${AW_WORKSPACE_HOST_DIR:-${HOME}/agentic-workspace}"
 mkdir -p "$HOST_DIR"
 
 PULL_ARGS=()
-if [[ "$IMAGE" == localhost:* || "$IMAGE" == 127.0.0.1:* ]]; then
+if [[ "$IMAGE" == localhost/* || "$IMAGE" == localhost:* || "$IMAGE" == 127.0.0.1/* || "$IMAGE" == 127.0.0.1:* ]]; then
   PULL_ARGS=(--tls-verify=false)
 fi
 
@@ -53,7 +53,7 @@ if [ -z "$(ls -A "$HOST_DIR" 2>/dev/null)" ]; then
   podman pull "${PULL_ARGS[@]}" "$IMAGE" >/dev/null 2>&1 || true
   SEED_CONTAINER="${CONTAINER_NAME}-seed"
   podman rm -f "$SEED_CONTAINER" >/dev/null 2>&1 || true
-  podman create --name "$SEED_CONTAINER" "$IMAGE" >/dev/null
+  podman create --pull=never --name "$SEED_CONTAINER" "$IMAGE" >/dev/null
   # trailing /. copies the directory *contents* into HOST_DIR.
   podman cp "${SEED_CONTAINER}:${CONTAINER_WORKDIR}/." "$HOST_DIR"
   podman rm -f "$SEED_CONTAINER" >/dev/null 2>&1 || true
