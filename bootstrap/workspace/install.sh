@@ -135,6 +135,10 @@ if podman container exists "$CONTAINER_NAME"; then
       | grep -q '^AW_CONTAINER_SOCKET='; then
     echo "workspace: existing container is missing AW_CONTAINER_SOCKET — recreating for Tier-2 apps"
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  elif [ "$SOCKET_AVAILABLE" = "1" ] && ! podman inspect "$CONTAINER_NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      | grep -q '^AW_WORKSPACE_HOST_DIR='; then
+    echo "workspace: existing container is missing AW_WORKSPACE_HOST_DIR — recreating for Tier-2 app volume mounts"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 fi
 
@@ -163,6 +167,8 @@ else
     -e AW_REDIS_URL="$REDIS_URL" \
     -e AW_BACKEND_URL="$AW_BACKEND_URL" \
     -e AW_WORKSPACE_HOST_TOKEN="$AW_WORKSPACE_HOST_TOKEN" \
+    -e AW_WORKSPACE_HOST_DIR="$HOST_DIR" \
+    -e AW_WORKSPACE_CONTAINER_DIR="$CONTAINER_WORKDIR" \
     "$IMAGE"
 fi
 
