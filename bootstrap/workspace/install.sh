@@ -71,9 +71,19 @@ fi
 # same podman network so the workspace reaches them by name (AW_CONTAINER_NETWORK),
 # exactly like it reaches postgres/redis.
 HOST_PODMAN_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+if [ ! -S "$HOST_PODMAN_SOCK" ]; then
+  # macOS launchd services normally do not have XDG_RUNTIME_DIR. For Podman
+  # machine installs, ask podman where its Docker-compatible API socket lives.
+  MACHINE_SOCK="$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null | head -n 1 || true)"
+  if [ -n "$MACHINE_SOCK" ] && [ -S "$MACHINE_SOCK" ]; then
+    HOST_PODMAN_SOCK="$MACHINE_SOCK"
+  fi
+fi
 CONTAINER_SOCK="/run/podman.sock"
 SOCKET_ARGS=()
+SOCKET_AVAILABLE=0
 if [ -S "$HOST_PODMAN_SOCK" ]; then
+  SOCKET_AVAILABLE=1
   echo "workspace: mounting rootless podman socket $HOST_PODMAN_SOCK (Tier-2 apps enabled)"
   # --security-opt label=disable: on an SELinux host (e.g. the Fedora CoreOS
   # podman-machine VM on macOS) the bind-mounted rootless socket carries an
@@ -97,6 +107,10 @@ if podman container exists "$CONTAINER_NAME"; then
   if ! podman inspect "$CONTAINER_NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' \
       | grep -q '^AW_WORKSPACE_HOST_TOKEN='; then
     echo "workspace: existing container is missing AW_WORKSPACE_HOST_TOKEN — recreating"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  elif [ "$SOCKET_AVAILABLE" = "1" ] && ! podman inspect "$CONTAINER_NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      | grep -q '^AW_CONTAINER_SOCKET='; then
+    echo "workspace: existing container is missing AW_CONTAINER_SOCKET — recreating for Tier-2 apps"
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 fi
