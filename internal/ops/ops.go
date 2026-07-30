@@ -118,6 +118,21 @@ func (h *Handler) dataDir() string {
 	return "/"
 }
 
+func workspaceImage() string {
+	if image := strings.TrimSpace(os.Getenv("AW_WORKSPACE_IMAGE")); image != "" {
+		return image
+	}
+	return WorkspaceImage
+}
+
+func podmanPullArgs(image string) []string {
+	args := []string{"pull"}
+	if strings.HasPrefix(image, "localhost:") || strings.HasPrefix(image, "127.0.0.1:") {
+		args = append(args, "--tls-verify=false")
+	}
+	return append(args, image)
+}
+
 // Stop stops the workspace container. Idempotent — podman stop on an
 // already-stopped/missing container just returns non-zero, which is
 // reported as an error to the caller (same as the docker driver's
@@ -207,10 +222,11 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, emit Emit) (ma
 		return nil, fmt.Errorf("create workspace host dir %s: %w", hostDir, err)
 	}
 
+	image := workspaceImage()
 	emit("info", "update", "pulling latest aw-workspace image")
-	if _, err := h.runner().Run(ctx, "podman", "pull", WorkspaceImage); err != nil {
+	if _, err := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); err != nil {
 		emit("error", "update", "image pull failed: "+err.Error())
-		return nil, fmt.Errorf("podman pull %s: %w", WorkspaceImage, err)
+		return nil, fmt.Errorf("podman pull %s: %w", image, err)
 	}
 
 	staging := filepath.Join(hostDir, fmt.Sprintf(".aw-workspace-update-%d", time.Now().UnixNano()))
@@ -224,7 +240,7 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, emit Emit) (ma
 
 	seedContainer := WorkspaceContainer + "-update"
 	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", seedContainer)
-	if _, err := h.runner().Run(ctx, "podman", "create", "--name", seedContainer, WorkspaceImage); err != nil {
+	if _, err := h.runner().Run(ctx, "podman", "create", "--name", seedContainer, image); err != nil {
 		return nil, fmt.Errorf("podman create update seed: %w", err)
 	}
 	defer h.runner().Run(ctx, "podman", "rm", "-f", seedContainer)
@@ -364,12 +380,12 @@ func (h *Handler) runModules(ctx context.Context, opts BootstrapOpts, full bool,
 	}
 	runOpts := bootstrap.RunOptions{
 		ExtractDir: opts.ExtractDir,
-		Env: []string{
-			"AW_WORKSPACE_SLUG=" + opts.WorkspaceSlug,
-			"AW_POSTGRES_PASSWORD=" + opts.PostgresPassword,
-			"AW_BACKEND_URL=" + opts.ControlPlane,
-			"AW_WORKSPACE_HOST_TOKEN=" + opts.HostCredential,
-		},
+		Env: append(bootstrap.EnvPassthrough("AW_WORKSPACE_IMAGE", "XDG_RUNTIME_DIR"),
+			"AW_WORKSPACE_SLUG="+opts.WorkspaceSlug,
+			"AW_POSTGRES_PASSWORD="+opts.PostgresPassword,
+			"AW_BACKEND_URL="+opts.ControlPlane,
+			"AW_WORKSPACE_HOST_TOKEN="+opts.HostCredential,
+		),
 	}
 	for _, mod := range manifest.Modules {
 		emit("info", mod.Name, fmt.Sprintf("bootstrapping %s...", mod.Name))

@@ -164,7 +164,7 @@ func runBootstrapWorkspace(args []string) error {
 
 	type registration struct {
 		slug           string
-		remoteHostID string
+		remoteHostID   string
 		hostCredential string
 	}
 	registered := make(chan registration, 1)
@@ -250,12 +250,12 @@ func runBootstrapWorkspace(args []string) error {
 
 	wsOpts := bootstrap.RunOptions{
 		ExtractDir: extractDir,
-		Env: []string{
-			"AW_WORKSPACE_SLUG=" + reg.slug,
-			"AW_POSTGRES_PASSWORD=" + st.PostgresPassword,
-			"AW_BACKEND_URL=" + *controlPlane,
-			"AW_WORKSPACE_HOST_TOKEN=" + reg.hostCredential,
-		},
+		Env: append(bootstrap.EnvPassthrough("AW_WORKSPACE_IMAGE", "XDG_RUNTIME_DIR"),
+			"AW_WORKSPACE_SLUG="+reg.slug,
+			"AW_POSTGRES_PASSWORD="+st.PostgresPassword,
+			"AW_BACKEND_URL="+*controlPlane,
+			"AW_WORKSPACE_HOST_TOKEN="+reg.hostCredential,
+		),
 	}
 	wsStatuses, err := bootstrap.Run(ctx, m.Only("workspace"), wsOpts)
 	reportStatuses(wsStatuses)

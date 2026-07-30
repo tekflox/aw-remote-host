@@ -104,6 +104,38 @@ func TestRestartOK(t *testing.T) {
 	}
 }
 
+func TestWorkspaceImageUsesEnvironmentOverride(t *testing.T) {
+	t.Setenv("AW_WORKSPACE_IMAGE", "localhost:5000/aw-workspace:e2e")
+
+	if got := workspaceImage(); got != "localhost:5000/aw-workspace:e2e" {
+		t.Fatalf("workspaceImage() = %q, want environment override", got)
+	}
+}
+
+func TestWorkspaceImageFallsBackToDefault(t *testing.T) {
+	t.Setenv("AW_WORKSPACE_IMAGE", " ")
+
+	if got := workspaceImage(); got != WorkspaceImage {
+		t.Fatalf("workspaceImage() = %q, want %q", got, WorkspaceImage)
+	}
+}
+
+func TestPodmanPullArgsDisablesTLSForLocalhostRegistry(t *testing.T) {
+	got := podmanPullArgs("localhost:5000/aw-workspace:e2e")
+	want := []string{"pull", "--tls-verify=false", "localhost:5000/aw-workspace:e2e"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("podmanPullArgs(localhost) = %v, want %v", got, want)
+	}
+}
+
+func TestPodmanPullArgsKeepsDefaultRegistryStrict(t *testing.T) {
+	got := podmanPullArgs("ghcr.io/fredericowu/aw-workspace:latest")
+	want := []string{"pull", "ghcr.io/fredericowu/aw-workspace:latest"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("podmanPullArgs(ghcr) = %v, want %v", got, want)
+	}
+}
+
 func TestSyncWorkspaceSourcePreservesRuntimeDataAndRemovesStaleFiles(t *testing.T) {
 	dst := t.TempDir()
 	src := t.TempDir()

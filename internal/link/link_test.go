@@ -55,11 +55,12 @@ type fakeLinkServer struct {
 	upgrader     websocket.Upgrader
 
 	registerFrames  []map[string]any
+	authTokens      []string
 	registerCount   int32
 	forceCloseAfter int32 // close the Nth connection right after registering (0 = never)
 	connCount       int32
 
-	framesToSend  []map[string]any // sent right after "registered", in order (Phase 3 pty tests)
+	framesToSend   []map[string]any // sent right after "registered", in order (Phase 3 pty tests)
 	receivedFrames []map[string]any // every non-register frame the client sends back
 }
 
@@ -75,6 +76,7 @@ func (s *fakeLinkServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(auth, "Bearer ")
 	s.mu.Lock()
 	hostCred, known := s.acceptTokens[token]
+	s.authTokens = append(s.authTokens, token)
 	s.mu.Unlock()
 	if !known {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -239,16 +241,66 @@ func TestRunReconnectsWithStoredCredentialAfterDrop(t *testing.T) {
 	}
 }
 
+func TestRunFallsBackToExplicitBootstrapTokenWhenStoredCredentialIsRejected(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_reinstall"] = "awlk_replacement"
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	if err := SaveCredentials(credPath, &Credentials{
+		RemoteHostID:   "host-stale",
+		HostCredential: "awlk_stale",
+	}); err != nil {
+		t.Fatalf("SaveCredentials: %v", err)
+	}
+
+	c := New(ts.URL, "awbs_reinstall")
+	c.MinBackoff = 5 * time.Millisecond
+	c.MaxBackoff = 20 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnRegistered: func(reply *RegisteredReply) {
+				cancel()
+			},
+		})
+	}()
+	<-done
+
+	creds, err := LoadCredentials(credPath)
+	if err != nil {
+		t.Fatalf("LoadCredentials: %v", err)
+	}
+	if creds == nil || creds.HostCredential != "awlk_replacement" {
+		t.Fatalf("expected replacement credential, got %+v", creds)
+	}
+
+	srv.mu.Lock()
+	tokens := append([]string(nil), srv.authTokens...)
+	srv.mu.Unlock()
+	if len(tokens) < 2 {
+		t.Fatalf("expected stale credential attempt plus bootstrap fallback, got %v", tokens)
+	}
+	if tokens[0] != "awlk_stale" || tokens[1] != "awbs_reinstall" {
+		t.Fatalf("unexpected token order: %v", tokens)
+	}
+}
+
 // fakeShellManager records every call so tests can assert dispatch without
 // touching a real pty/podman.
 type fakeShellManager struct {
-	mu       sync.Mutex
-	opened   []string
-	input    map[string][]byte
-	resized  map[string][2]uint16
-	closed   []string
-	openErr  error
-	emit     func(id, dataB64 string)
+	mu      sync.Mutex
+	opened  []string
+	input   map[string][]byte
+	resized map[string][2]uint16
+	closed  []string
+	openErr error
+	emit    func(id, dataB64 string)
 }
 
 func newFakeShellManager(emit func(id, dataB64 string)) *fakeShellManager {

@@ -279,6 +279,13 @@ func (c *Client) Run(ctx context.Context, credentialsPath string, cb RunCallback
 		}
 
 		result, err := c.Connect(ctx, token, credentialsPath)
+		if err != nil && c.Token != "" && c.Token != token {
+			// A saved host credential can become invalid after an uninstall or
+			// workspace reset. If the operator supplied a fresh bootstrap token,
+			// fall back to it once before backing off so BYOD reinstall can
+			// recover without manual credential-file cleanup.
+			result, err = c.Connect(ctx, c.Token, credentialsPath)
+		}
 		if err != nil {
 			if cb.OnDisconnect != nil {
 				cb.OnDisconnect(err)

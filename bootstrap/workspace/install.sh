@@ -17,7 +17,7 @@ set -euo pipefail
 : "${AW_BACKEND_URL:?AW_BACKEND_URL must be set}"
 : "${AW_WORKSPACE_HOST_TOKEN:?AW_WORKSPACE_HOST_TOKEN must be set (durable awlk_ host credential)}"
 
-IMAGE="ghcr.io/fredericowu/aw-workspace:latest"
+IMAGE="${AW_WORKSPACE_IMAGE:-ghcr.io/fredericowu/aw-workspace:latest}"
 CONTAINER_NAME="aw-remote-host-workspace"
 NETWORK_NAME="aw-remote-host"
 PG_HOST="aw-remote-host-postgres"
@@ -36,6 +36,11 @@ CONTAINER_WORKDIR="/opt/agentic-workspace"
 HOST_DIR="${AW_WORKSPACE_HOST_DIR:-${HOME}/agentic-workspace}"
 mkdir -p "$HOST_DIR"
 
+PULL_ARGS=()
+if [[ "$IMAGE" == localhost:* || "$IMAGE" == 127.0.0.1:* ]]; then
+  PULL_ARGS=(--tls-verify=false)
+fi
+
 # Ensure the shared network exists (postgres/redis create it too — idempotent).
 podman network exists "$NETWORK_NAME" >/dev/null 2>&1 || podman network create "$NETWORK_NAME" >/dev/null
 
@@ -45,7 +50,7 @@ podman network exists "$NETWORK_NAME" >/dev/null 2>&1 || podman network create "
 # (non-empty) host dir is left untouched — never clobber the user's files/apps.
 if [ -z "$(ls -A "$HOST_DIR" 2>/dev/null)" ]; then
   echo "workspace: seeding $HOST_DIR from image $IMAGE (first run)"
-  podman pull "$IMAGE" >/dev/null 2>&1 || true
+  podman pull "${PULL_ARGS[@]}" "$IMAGE" >/dev/null 2>&1 || true
   SEED_CONTAINER="${CONTAINER_NAME}-seed"
   podman rm -f "$SEED_CONTAINER" >/dev/null 2>&1 || true
   podman create --name "$SEED_CONTAINER" "$IMAGE" >/dev/null
@@ -101,7 +106,9 @@ if podman container exists "$CONTAINER_NAME"; then
   podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true
   podman start "$CONTAINER_NAME" >/dev/null 2>&1 || true
 else
+  podman pull "${PULL_ARGS[@]}" "$IMAGE" >/dev/null
   podman run -d \
+    --pull=never \
     --name "$CONTAINER_NAME" \
     --network "$NETWORK_NAME" \
     --restart=always \
