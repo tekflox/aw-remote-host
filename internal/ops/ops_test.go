@@ -391,7 +391,9 @@ func TestDispatchRoutesToStop(t *testing.T) {
 }
 
 func TestSelfUpdateInstallsRequestedVersion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("AW_REMOTE_HOST_SKIP_SERVICE_RESTART", "1")
+	t.Setenv("AW_REMOTE_HOST_SKIP_ROLLBACK_MONITOR", "1")
 	r := newFakeRunner()
 	h := &Handler{Runner: r, Opts: BootstrapOpts{WorkspaceSlug: "demo"}}
 
@@ -399,7 +401,7 @@ func TestSelfUpdateInstallsRequestedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if data["updated"] != true || data["version"] != "build-abc1234" {
+	if data["updated"] != true || data["version"] != "build-abc1234" || data["rollback_armed"] != true {
 		t.Fatalf("unexpected self-update result: %v", data)
 	}
 	if len(r.calls) != 1 || r.calls[0][0] != "sh" || r.calls[0][1] != "-c" {
@@ -409,10 +411,18 @@ func TestSelfUpdateInstallsRequestedVersion(t *testing.T) {
 	if !strings.Contains(cmd, "AW_REMOTE_HOST_VERSION='build-abc1234'") {
 		t.Fatalf("install command does not pin requested version: %s", cmd)
 	}
+	if !strings.Contains(cmd, "AW_REMOTE_HOST_INSTALL_DIR=") {
+		t.Fatalf("install command does not pin install dir: %s", cmd)
+	}
+	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), ".aw-remote-host", "self-update", "pending.json")); err != nil {
+		t.Fatalf("expected pending rollback marker: %v", err)
+	}
 }
 
 func TestDispatchRoutesToSelfUpdate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv("AW_REMOTE_HOST_SKIP_SERVICE_RESTART", "1")
+	t.Setenv("AW_REMOTE_HOST_SKIP_ROLLBACK_MONITOR", "1")
 	r := newFakeRunner()
 	h := &Handler{Runner: r}
 	data, err := h.Dispatch(context.Background(), "self-update", map[string]any{"version": "build-def5678"}, nil)

@@ -24,6 +24,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/shell"
 	"github.com/tekflox/aw-remote-host/internal/state"
 	"github.com/tekflox/aw-remote-host/internal/tunnelproxy"
+	"github.com/tekflox/aw-remote-host/internal/updater"
 )
 
 // registerTimeout bounds how long bootstrap-workspace waits for the first
@@ -183,6 +184,9 @@ func runBootstrapWorkspace(args []string) error {
 				if reply.WorkspaceSlug != "" {
 					st.WorkspaceSlug = reply.WorkspaceSlug
 					_ = state.Save(statePath, st)
+				}
+				if err := updater.ClearPending(); err != nil {
+					fmt.Fprintf(os.Stderr, "self-update: could not clear rollback marker after registration: %v\n", err)
 				}
 				hostCredential := reply.HostCredential
 				if hostCredential == "" && existingCreds != nil {

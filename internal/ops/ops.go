@@ -15,12 +15,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
+	"github.com/tekflox/aw-remote-host/internal/updater"
 )
 
 const (
@@ -284,44 +284,51 @@ func (h *Handler) SelfUpdate(ctx context.Context, args map[string]any, emit Emit
 	}
 
 	emit("info", "self-update", "installing aw-remote-host "+version)
+	currentPath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve current executable: %w", err)
+	}
+	if currentPath, err = filepath.Abs(currentPath); err != nil {
+		return nil, fmt.Errorf("resolve current executable path: %w", err)
+	}
+	pending, err := updater.Prepare(currentPath, version, h.Opts.WorkspaceSlug)
+	if err != nil {
+		return nil, err
+	}
+	installDir := updater.InstallDirFor(currentPath)
 	installCmd := fmt.Sprintf(
-		"curl -fsSL https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.sh | AW_REMOTE_HOST_VERSION=%s sh",
-		shellQuote(version),
+		"curl -fsSL https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.sh | AW_REMOTE_HOST_VERSION=%s AW_REMOTE_HOST_INSTALL_DIR=%s sh",
+		updater.ShellQuote(version),
+		updater.ShellQuote(installDir),
 	)
 	if out, err := h.runner().Run(ctx, "sh", "-c", installCmd); err != nil {
 		emit("error", "self-update", "install failed: "+err.Error())
+		_ = updater.ClearPending()
 		return nil, fmt.Errorf("install aw-remote-host %s: %w: %s", version, err, strings.TrimSpace(out))
 	}
 
+	if err := updater.StartRollbackMonitor(pending, updater.DefaultValidationTimeout); err != nil {
+		emit("warning", "self-update", "installed but rollback monitor was not scheduled: "+err.Error())
+	}
 	if err := restartHostServiceSoon(h.Opts.WorkspaceSlug); err != nil {
 		emit("warning", "self-update", "installed but service restart was not scheduled: "+err.Error())
 		return map[string]any{"updated": true, "version": version, "restart_scheduled": false}, nil
 	}
-	emit("info", "self-update", "aw-remote-host installed; restarting service")
-	return map[string]any{"updated": true, "version": version, "restart_scheduled": true}, nil
-}
-
-func shellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+	emit("info", "self-update", "aw-remote-host installed; restarting service; rollback armed until registration succeeds")
+	return map[string]any{
+		"updated":            true,
+		"version":            version,
+		"restart_scheduled":  true,
+		"rollback_armed":     true,
+		"validation_timeout": int(updater.DefaultValidationTimeout.Seconds()),
+	}, nil
 }
 
 func restartHostServiceSoon(slug string) error {
 	if os.Getenv("AW_REMOTE_HOST_SKIP_SERVICE_RESTART") == "1" {
 		return nil
 	}
-	var cmd string
-	switch runtime.GOOS {
-	case "darwin":
-		label := "com.tekflox.aw-remote-host"
-		if strings.TrimSpace(slug) != "" {
-			label += "." + strings.TrimSpace(slug)
-		}
-		cmd = fmt.Sprintf("sleep 1; launchctl kickstart -k gui/$(id -u)/%s", shellQuote(label))
-	case "linux":
-		cmd = "sleep 1; systemctl --user restart aw-remote-host"
-	default:
-		return fmt.Errorf("unsupported OS %s", runtime.GOOS)
-	}
+	cmd := "sleep 1; " + updater.RestartCommand(slug)
 	return exec.Command("sh", "-c", cmd).Start()
 }
 
