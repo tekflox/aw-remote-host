@@ -73,9 +73,10 @@ fi
 HOST_PODMAN_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
 if [ ! -S "$HOST_PODMAN_SOCK" ]; then
   # macOS launchd services normally do not have XDG_RUNTIME_DIR. For Podman
-  # machine installs, ask podman where its Docker-compatible API socket lives.
-  MACHINE_SOCK="$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null | head -n 1 || true)"
-  if [ -n "$MACHINE_SOCK" ] && [ -S "$MACHINE_SOCK" ]; then
+  # machine installs, the bind source must be the socket path inside the
+  # Podman VM, not the macOS client socket under /var/folders.
+  MACHINE_SOCK="$(podman machine ssh podman-machine-default 'sock="/run/user/$(id -u)/podman/podman.sock"; test -S "$sock" && printf %s "$sock"' 2>/dev/null || true)"
+  if [ -n "$MACHINE_SOCK" ]; then
     HOST_PODMAN_SOCK="$MACHINE_SOCK"
   fi
 fi
