@@ -106,7 +106,11 @@ if podman container exists "$CONTAINER_NAME"; then
   podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true
   podman start "$CONTAINER_NAME" >/dev/null 2>&1 || true
 else
-  podman pull "${PULL_ARGS[@]}" "$IMAGE" >/dev/null
+  if podman image exists "$IMAGE"; then
+    echo "workspace: using existing local image $IMAGE"
+  else
+    podman pull "${PULL_ARGS[@]}" "$IMAGE" >/dev/null
+  fi
   podman run -d \
     --pull=never \
     --name "$CONTAINER_NAME" \

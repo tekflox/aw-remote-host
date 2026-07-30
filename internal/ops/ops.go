@@ -231,8 +231,11 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, emit Emit) (ma
 	image := workspaceImage()
 	emit("info", "update", "pulling latest aw-workspace image")
 	if _, err := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); err != nil {
-		emit("error", "update", "image pull failed: "+err.Error())
-		return nil, fmt.Errorf("podman pull %s: %w", image, err)
+		if _, existsErr := h.runner().Run(ctx, "podman", "image", "exists", image); existsErr != nil {
+			emit("error", "update", "image pull failed: "+err.Error())
+			return nil, fmt.Errorf("podman pull %s: %w", image, err)
+		}
+		emit("warning", "update", "image pull failed; using existing local image "+image)
 	}
 
 	staging := filepath.Join(hostDir, fmt.Sprintf(".aw-workspace-update-%d", time.Now().UnixNano()))
