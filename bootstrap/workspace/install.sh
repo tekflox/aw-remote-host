@@ -26,14 +26,26 @@ SCHEMA="workspace_${AW_WORKSPACE_SLUG}"
 DB_URL="postgresql+psycopg://postgres:${AW_POSTGRES_PASSWORD}@${PG_HOST}:5432/aw_workspace"
 REDIS_URL="redis://${REDIS_HOST}:6379/0"
 
-# Host directory bind-mounted into the container at /opt/agentic-workspace so
+# Host directory bind-mounted into the container at /opt/aw-workspace so
 # the whole workspace fs is visible/editable from the host AND survives
 # container recreation (apps install into it — decoupled-apps framework).
-# Defaults to ~/agentic-workspace (no root needed; under $HOME so podman
+# Defaults to ~/aw-workspace (no root needed; under $HOME so podman
 # machine already shares it into the VM on macOS). Ties to
 # feature:aw-remote-host-configurable-install-path.
-CONTAINER_WORKDIR="/opt/agentic-workspace"
-HOST_DIR="${AW_WORKSPACE_HOST_DIR:-${HOME}/agentic-workspace}"
+CONTAINER_WORKDIR="/opt/aw-workspace"
+LEGACY_CONTAINER_WORKDIR="/opt/agentic-workspace"
+DEFAULT_HOST_DIR="${HOME}/aw-workspace"
+LEGACY_HOST_DIR="${HOME}/agentic-workspace"
+HOST_DIR="${AW_WORKSPACE_HOST_DIR:-${DEFAULT_HOST_DIR}}"
+
+if [ -z "${AW_WORKSPACE_HOST_DIR:-}" ] && [ ! -e "$DEFAULT_HOST_DIR" ] && [ -e "$LEGACY_HOST_DIR" ]; then
+  if podman container exists "$CONTAINER_NAME"; then
+    echo "workspace: removing existing container before host-dir migration"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+  echo "workspace: migrating host dir $LEGACY_HOST_DIR -> $DEFAULT_HOST_DIR"
+  mv "$LEGACY_HOST_DIR" "$DEFAULT_HOST_DIR"
+fi
 mkdir -p "$HOST_DIR"
 
 PULL_ARGS=()
@@ -104,6 +116,14 @@ if [ "$SOCKET_AVAILABLE" = "1" ]; then
   )
 else
   echo "workspace: no rootless podman socket at $HOST_PODMAN_SOCK — Tier-2 apps disabled" >&2
+fi
+
+if podman container exists "$CONTAINER_NAME"; then
+  if podman inspect "$CONTAINER_NAME" --format '{{range .Mounts}}{{println .Destination}}{{end}}' \
+      | grep -qx "$LEGACY_CONTAINER_WORKDIR"; then
+    echo "workspace: existing container uses legacy mount $LEGACY_CONTAINER_WORKDIR — recreating"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
 fi
 
 if podman container exists "$CONTAINER_NAME"; then

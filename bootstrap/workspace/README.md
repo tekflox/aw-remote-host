@@ -22,14 +22,14 @@ bound to `127.0.0.1:9030`, `--restart=always`, and polls
 `http://127.0.0.1:9030/api/health` until it responds. Idempotent — skips
 the `podman run` if the container already exists.
 
-The container's base dir `/opt/agentic-workspace` (image WORKDIR) is
-**bind-mounted from a host directory** — `~/agentic-workspace` by default,
+The container's base dir `/opt/aw-workspace` (image WORKDIR) is
+**bind-mounted from a host directory** — `~/aw-workspace` by default,
 override with `AW_WORKSPACE_HOST_DIR`. On first run (empty host dir) the repo
 baked into the image is seeded into the host dir so the mount doesn't mask it;
 on re-bootstrap an existing host dir is left untouched. Net effect: the whole
 workspace fs is browsable/editable from the host and survives container
 recreation — the foundation for the decoupled-apps framework (apps install
-into `/opt/agentic-workspace`). Ties to
+into `/opt/aw-workspace`). Ties to
 `feature:aw-remote-host-configurable-install-path`.
 
 ## Verify

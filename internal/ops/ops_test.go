@@ -136,12 +136,35 @@ func TestWorkspaceImageForVersionPreservesDigest(t *testing.T) {
 	}
 }
 
+func TestRunModuleEnvLetsPinnedUpdateImageOverrideInheritedLatest(t *testing.T) {
+	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace:latest")
+	env := runModuleEnv(
+		BootstrapOpts{WorkspaceSlug: "demo"},
+		[]string{"AW_WORKSPACE_IMAGE=ghcr.io/fredericowu/aw-workspace:v0.1.1"},
+	)
+
+	if got := lastEnvValue(env, "AW_WORKSPACE_IMAGE"); got != "ghcr.io/fredericowu/aw-workspace:v0.1.1" {
+		t.Fatalf("AW_WORKSPACE_IMAGE = %q, want pinned update image", got)
+	}
+}
+
 func TestPodmanPullArgsDisablesTLSForLocalhostRegistry(t *testing.T) {
 	got := podmanPullArgs("localhost:5000/aw-workspace:e2e")
 	want := []string{"pull", "--tls-verify=false", "localhost:5000/aw-workspace:e2e"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("podmanPullArgs(localhost) = %v, want %v", got, want)
 	}
+}
+
+func lastEnvValue(env []string, key string) string {
+	prefix := key + "="
+	value := ""
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			value = strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return value
 }
 
 func TestPodmanPullArgsDisablesTLSForLocalhostRepository(t *testing.T) {
@@ -157,6 +180,38 @@ func TestPodmanPullArgsKeepsDefaultRegistryStrict(t *testing.T) {
 	want := []string{"pull", "ghcr.io/fredericowu/aw-workspace:latest"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("podmanPullArgs(ghcr) = %v, want %v", got, want)
+	}
+}
+
+func TestWorkspaceHostDirDefaultsToAwWorkspace(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AW_WORKSPACE_HOST_DIR", "")
+
+	got, err := workspaceHostDir()
+	if err != nil {
+		t.Fatalf("workspaceHostDir failed: %v", err)
+	}
+	if want := filepath.Join(home, "aw-workspace"); got != want {
+		t.Fatalf("workspaceHostDir() = %q, want %q", got, want)
+	}
+}
+
+func TestWorkspaceHostDirUsesLegacyDirUntilInstallMigratesIt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AW_WORKSPACE_HOST_DIR", "")
+	legacy := filepath.Join(home, "agentic-workspace")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatalf("mkdir legacy host dir: %v", err)
+	}
+
+	got, err := workspaceHostDir()
+	if err != nil {
+		t.Fatalf("workspaceHostDir failed: %v", err)
+	}
+	if got != legacy {
+		t.Fatalf("workspaceHostDir() = %q, want legacy %q", got, legacy)
 	}
 }
 

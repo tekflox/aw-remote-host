@@ -26,7 +26,7 @@ import (
 const (
 	WorkspaceContainer = "aw-remote-host-workspace"
 	WorkspaceImage     = "ghcr.io/fredericowu/aw-workspace:latest"
-	ContainerWorkdir   = "/opt/agentic-workspace"
+	ContainerWorkdir   = "/opt/aw-workspace"
 	PostgresContainer  = "aw-remote-host-postgres"
 	RedisContainer     = "aw-remote-host-redis"
 	PostgresVolume     = "aw-remote-host-postgres-data"
@@ -316,7 +316,7 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 
 	emit("info", "update", "recreating workspace container")
 	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", WorkspaceContainer)
-	if _, err := h.runModules(ctx, opts, false, emit); err != nil {
+	if _, err := h.runModulesWithEnv(ctx, opts, false, emit, []string{"AW_WORKSPACE_IMAGE=" + image}); err != nil {
 		return nil, err
 	}
 	emit("info", "update", "workspace code updated")
@@ -407,7 +407,15 @@ func workspaceHostDir() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
-	return filepath.Join(home, "agentic-workspace"), nil
+	next := filepath.Join(home, "aw-workspace")
+	if _, err := os.Stat(next); err == nil {
+		return next, nil
+	}
+	legacy := filepath.Join(home, "agentic-workspace")
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy, nil
+	}
+	return next, nil
 }
 
 func syncWorkspaceSource(srcDir, dstDir string) error {
@@ -493,6 +501,10 @@ func copyPath(src, dst string) error {
 }
 
 func (h *Handler) runModules(ctx context.Context, opts BootstrapOpts, full bool, emit Emit) (map[string]any, error) {
+	return h.runModulesWithEnv(ctx, opts, full, emit, nil)
+}
+
+func (h *Handler) runModulesWithEnv(ctx context.Context, opts BootstrapOpts, full bool, emit Emit, extraEnv []string) (map[string]any, error) {
 	if emit == nil {
 		emit = noopEmit
 	}
@@ -509,12 +521,7 @@ func (h *Handler) runModules(ctx context.Context, opts BootstrapOpts, full bool,
 	}
 	runOpts := bootstrap.RunOptions{
 		ExtractDir: opts.ExtractDir,
-		Env: append(bootstrap.EnvPassthrough("AW_WORKSPACE_IMAGE", "XDG_RUNTIME_DIR"),
-			"AW_WORKSPACE_SLUG="+opts.WorkspaceSlug,
-			"AW_POSTGRES_PASSWORD="+opts.PostgresPassword,
-			"AW_BACKEND_URL="+opts.ControlPlane,
-			"AW_WORKSPACE_HOST_TOKEN="+opts.HostCredential,
-		),
+		Env:        runModuleEnv(opts, extraEnv),
 	}
 	for _, mod := range manifest.Modules {
 		emit("info", mod.Name, fmt.Sprintf("bootstrapping %s...", mod.Name))
@@ -526,6 +533,16 @@ func (h *Handler) runModules(ctx context.Context, opts BootstrapOpts, full bool,
 		emit("info", mod.Name, fmt.Sprintf("%s ok", mod.Name))
 	}
 	return map[string]any{"bootstrapped": true}, nil
+}
+
+func runModuleEnv(opts BootstrapOpts, extraEnv []string) []string {
+	env := append(bootstrap.EnvPassthrough("AW_WORKSPACE_IMAGE", "XDG_RUNTIME_DIR"),
+		"AW_WORKSPACE_SLUG="+opts.WorkspaceSlug,
+		"AW_POSTGRES_PASSWORD="+opts.PostgresPassword,
+		"AW_BACKEND_URL="+opts.ControlPlane,
+		"AW_WORKSPACE_HOST_TOKEN="+opts.HostCredential,
+	)
+	return append(env, extraEnv...)
 }
 
 // Health gathers {healthy, uptime_s, disk, cpu_pct, mem, offline} — the
