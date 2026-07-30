@@ -142,6 +142,14 @@ func workspaceImageForVersion(version string) string {
 	return image + ":" + version
 }
 
+func commandError(prefix string, err error, out string) error {
+	msg := strings.TrimSpace(out)
+	if msg == "" {
+		return fmt.Errorf("%s: %w", prefix, err)
+	}
+	return fmt.Errorf("%s: %w: %s", prefix, err, msg)
+}
+
 func podmanPullArgs(image string) []string {
 	args := []string{"pull"}
 	if strings.HasPrefix(image, "localhost/") ||
@@ -250,12 +258,36 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	} else {
 		emit("info", "update", "pulling latest aw-workspace image")
 	}
-	if _, err := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); err != nil {
-		if _, existsErr := h.runner().Run(ctx, "podman", "image", "exists", image); existsErr != nil {
-			emit("error", "update", "image pull failed: "+err.Error())
-			return nil, fmt.Errorf("podman pull %s: %w", image, err)
+	if out, err := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); err != nil {
+		pullErr := commandError("podman pull "+image, err, out)
+		if _, existsErr := h.runner().Run(ctx, "podman", "image", "exists", image); existsErr == nil {
+			emit("warning", "update", "image pull failed; using existing local image "+image)
+		} else {
+			if strings.HasPrefix(image, "ghcr.io/") {
+				_, _ = h.runner().Run(ctx, "podman", "logout", "ghcr.io")
+				if out, retryErr := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); retryErr == nil {
+					err = nil
+				} else {
+					pullErr = commandError("podman pull "+image, retryErr, out)
+				}
+			}
+			if err != nil && version != "" {
+				latestImage := workspaceImage()
+				if latestImage != image {
+					emit("warning", "update", "pinned image pull failed; trying "+latestImage)
+					if out, latestErr := h.runner().Run(ctx, "podman", podmanPullArgs(latestImage)...); latestErr == nil {
+						image = latestImage
+						err = nil
+					} else {
+						pullErr = commandError("podman pull "+latestImage, latestErr, out)
+					}
+				}
+			}
+			if err != nil {
+				emit("error", "update", "image pull failed: "+pullErr.Error())
+				return nil, pullErr
+			}
 		}
-		emit("warning", "update", "image pull failed; using existing local image "+image)
 	}
 
 	staging := filepath.Join(hostDir, fmt.Sprintf(".aw-workspace-update-%d", time.Now().UnixNano()))
