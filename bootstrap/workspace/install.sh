@@ -147,7 +147,7 @@ else
 fi
 
 echo "workspace: waiting for readiness..."
-for _ in $(seq 1 30); do
+for _ in $(seq 1 "${AW_WORKSPACE_READINESS_TIMEOUT:-180}"); do
   if curl -fsS "http://127.0.0.1:9030/api/health" >/dev/null 2>&1; then
     echo "workspace: ready"
     exit 0
