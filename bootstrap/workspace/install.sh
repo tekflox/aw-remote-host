@@ -71,20 +71,22 @@ fi
 # same podman network so the workspace reaches them by name (AW_CONTAINER_NETWORK),
 # exactly like it reaches postgres/redis.
 HOST_PODMAN_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
-if [ ! -S "$HOST_PODMAN_SOCK" ]; then
+SOCKET_AVAILABLE=0
+if [ -S "$HOST_PODMAN_SOCK" ]; then
+  SOCKET_AVAILABLE=1
+else
   # macOS launchd services normally do not have XDG_RUNTIME_DIR. For Podman
   # machine installs, the bind source must be the socket path inside the
   # Podman VM, not the macOS client socket under /var/folders.
   MACHINE_SOCK="$(podman machine ssh podman-machine-default 'sock="/run/user/$(id -u)/podman/podman.sock"; test -S "$sock" && printf %s "$sock"' 2>/dev/null || true)"
   if [ -n "$MACHINE_SOCK" ]; then
     HOST_PODMAN_SOCK="$MACHINE_SOCK"
+    SOCKET_AVAILABLE=1
   fi
 fi
 CONTAINER_SOCK="/run/podman.sock"
 SOCKET_ARGS=()
-SOCKET_AVAILABLE=0
-if [ -S "$HOST_PODMAN_SOCK" ]; then
-  SOCKET_AVAILABLE=1
+if [ "$SOCKET_AVAILABLE" = "1" ]; then
   echo "workspace: mounting rootless podman socket $HOST_PODMAN_SOCK (Tier-2 apps enabled)"
   # --security-opt label=disable: on an SELinux host (e.g. the Fedora CoreOS
   # podman-machine VM on macOS) the bind-mounted rootless socket carries an
