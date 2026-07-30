@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: [self-hosted, aw-baremetal]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
