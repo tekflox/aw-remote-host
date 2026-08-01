@@ -177,7 +177,20 @@ func restartCommand(slug string) string {
 		}
 		return fmt.Sprintf("launchctl kickstart -k gui/$(id -u)/%s", shellQuote(label))
 	case "linux":
-		return "systemctl --user restart aw-remote-host"
+		// A normal rootless BYOD host has this installed as a systemd --user
+		// service (Restart=always — see servicemgr/systemd.go), so the
+		// restart lands there directly. But a --foreground run (this
+		// process's own default, and how the aw-remote-host Docker image
+		// runs it: a shell entrypoint loop, not systemd as init) never
+		// installs that unit, so `systemctl --user restart` always fails —
+		// silently, since the caller only Start()s this command and never
+		// checks its exit code. Chaining a self-kill fallback means this
+		// process exits either way and whatever actually supervises it
+		// (systemd's Restart=always, or the shell loop) brings the new
+		// binary up — instead of the restart being a silent no-op that
+		// leaves the OLD binary running until the rollback monitor undoes
+		// the update 75s later.
+		return "systemctl --user restart aw-remote-host || kill $PPID"
 	default:
 		return "true"
 	}
