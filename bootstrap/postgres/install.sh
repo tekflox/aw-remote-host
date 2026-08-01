@@ -17,7 +17,12 @@ if podman container exists "$CONTAINER_NAME"; then
   podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true
   podman start "$CONTAINER_NAME" >/dev/null 2>&1 || true
 else
-  podman volume create "$VOLUME_NAME" >/dev/null
+  # Idempotent: the container can be removed (e.g. manual recovery from a
+  # stale-netns state after the host process restarted) while its data
+  # volume is deliberately left in place — `podman volume create` on an
+  # already-existing volume is a hard error, not a no-op, so this must be
+  # checked rather than assumed to only ever run once.
+  podman volume exists "$VOLUME_NAME" || podman volume create "$VOLUME_NAME" >/dev/null
   podman run -d \
     --name "$CONTAINER_NAME" \
     --network "$NETWORK_NAME" \

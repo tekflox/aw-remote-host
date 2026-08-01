@@ -15,7 +15,9 @@ if podman container exists "$CONTAINER_NAME"; then
   podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true
   podman start "$CONTAINER_NAME" >/dev/null 2>&1 || true
 else
-  podman volume create "$VOLUME_NAME" >/dev/null
+  # Idempotent — see the matching comment in bootstrap/postgres/install.sh:
+  # the container can be removed while its data volume is deliberately kept.
+  podman volume exists "$VOLUME_NAME" || podman volume create "$VOLUME_NAME" >/dev/null
   podman run -d \
     --name "$CONTAINER_NAME" \
     --network "$NETWORK_NAME" \
