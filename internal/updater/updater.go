@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	DefaultValidationTimeout = 75 * time.Second
+	DefaultValidationTimeout = 300 * time.Second
 	pendingFileName          = "pending.json"
 	backupFileName           = "aw-remote-host.previous"
 )
