@@ -69,46 +69,58 @@ if [ -z "$(ls -A "$HOST_DIR" 2>/dev/null)" ]; then
   # trailing /. copies the directory *contents* into HOST_DIR.
   podman cp "${SEED_CONTAINER}:${CONTAINER_WORKDIR}/." "$HOST_DIR"
   podman rm -f "$SEED_CONTAINER" >/dev/null 2>&1 || true
-  # `podman cp` out of a rootless container doesn't reliably land as the
-  # container's own UID 1001 (ubuntu, see the image's Dockerfile) on the
-  # host — it depends on how this host user's subuid range maps. HOST_DIR
-  # is a plain bind mount (no idmapping), so whatever numeric owner ends up
-  # here is exactly what the workspace container sees; `podman unshare`
-  # forces it to 1001 inside this user's own rootless namespace so the
-  # container's `ubuntu` user actually owns its own tree instead of getting
-  # a root-owned (or otherwise foreign-owned) checkout it can't write to.
-  podman unshare chown -R 1001:1001 "$HOST_DIR" || true
   echo "workspace: seeded $(ls -A "$HOST_DIR" | wc -l | tr -d ' ') entries into $HOST_DIR"
 else
   echo "workspace: $HOST_DIR already populated — leaving host files untouched"
 fi
 
-# Tier-2 (container-per-app) support: mount the host's ROOTLESS podman socket
-# into the workspace so the decoupled-apps ContainerSupervisor can spawn app
-# containers over the Docker API (podman is Docker-API-compatible). TRUST NOTE:
-# this is the *rootless* socket — scoped to the unprivileged `aw` user, NOT root
-# — so an app container can only do what user `aw` already can (no host root).
-# Frederico approved mounting it (Telegram 2026-07-28). App containers join the
-# same podman network so the workspace reaches them by name (AW_CONTAINER_NETWORK),
-# exactly like it reaches postgres/redis.
-HOST_PODMAN_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+# Tier-2 (container-per-app) support: mount the host's podman socket into the
+# workspace so the decoupled-apps ContainerSupervisor can spawn app containers
+# over the Docker API (podman is Docker-API-compatible). TRUST NOTE: on a
+# normal BYOD Linux/macOS host this is the *rootless* socket — scoped to the
+# unprivileged `aw`/host user, NOT root — so an app container can only do what
+# that user already can (no host root). On a rootful nested deployment (no
+# host user to be rootless as — see bootstrap/lib/podman_socket.sh) it's the
+# rootful socket instead, which is the best available on that host shape.
+# Frederico approved mounting it (Telegram 2026-07-28). App containers join
+# the same podman network so the workspace reaches them by name
+# (AW_CONTAINER_NETWORK), exactly like it reaches postgres/redis.
+HOST_PODMAN_SOCK=""
 SOCKET_AVAILABLE=0
-if [ -S "$HOST_PODMAN_SOCK" ]; then
-  SOCKET_AVAILABLE=1
+if [ "$(uname -s)" = "Darwin" ]; then
+  # macOS launchd services normally do not have XDG_RUNTIME_DIR, and podman
+  # itself runs against a VM — the bind source must be the socket path
+  # inside the Podman VM, not a macOS client-side path.
+  HOST_PODMAN_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+  if [ -S "$HOST_PODMAN_SOCK" ]; then
+    SOCKET_AVAILABLE=1
+  else
+    MACHINE_SOCK="$(podman machine ssh podman-machine-default 'sock="/run/user/$(id -u)/podman/podman.sock"; test -S "$sock" && printf %s "$sock"' 2>/dev/null || true)"
+    if [ -n "$MACHINE_SOCK" ]; then
+      HOST_PODMAN_SOCK="$MACHINE_SOCK"
+      SOCKET_AVAILABLE=1
+    fi
+  fi
 else
-  # macOS launchd services normally do not have XDG_RUNTIME_DIR. For Podman
-  # machine installs, the bind source must be the socket path inside the
-  # Podman VM, not the macOS client socket under /var/folders.
-  MACHINE_SOCK="$(podman machine ssh podman-machine-default 'sock="/run/user/$(id -u)/podman/podman.sock"; test -S "$sock" && printf %s "$sock"' 2>/dev/null || true)"
-  if [ -n "$MACHINE_SOCK" ]; then
-    HOST_PODMAN_SOCK="$MACHINE_SOCK"
+  # Linux: rootless-with-systemd and rootful-without-systemd (this
+  # container's own deployment shape) need different paths AND different
+  # start-up strategies — ensure_podman_socket works out which this host is
+  # and, if nothing's listening yet, brings the socket up itself (the
+  # bootstrap/podman module already tries this too; calling it again here
+  # is a cheap no-op unless workspace is being re-bootstrapped on its own).
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # shellcheck source=../lib/podman_socket.sh
+  source "$SCRIPT_DIR/../lib/podman_socket.sh"
+  HOST_PODMAN_SOCK="$(podman_socket_default_path)"
+  if sock="$(ensure_podman_socket)"; then
+    HOST_PODMAN_SOCK="$sock"
     SOCKET_AVAILABLE=1
   fi
 fi
 CONTAINER_SOCK="/run/podman.sock"
 SOCKET_ARGS=()
 if [ "$SOCKET_AVAILABLE" = "1" ]; then
-  echo "workspace: mounting rootless podman socket $HOST_PODMAN_SOCK (Tier-2 apps enabled)"
+  echo "workspace: mounting podman socket $HOST_PODMAN_SOCK (Tier-2 apps enabled)"
   # --security-opt label=disable: on an SELinux host (e.g. the Fedora CoreOS
   # podman-machine VM on macOS) the bind-mounted rootless socket carries an
   # `unconfined_t` context the nested container's confined domain can't reach —
@@ -124,7 +136,7 @@ if [ "$SOCKET_AVAILABLE" = "1" ]; then
     -e "AW_CONTAINER_NETWORK=${NETWORK_NAME}"
   )
 else
-  echo "workspace: no rootless podman socket at $HOST_PODMAN_SOCK — Tier-2 apps disabled" >&2
+  echo "workspace: no podman socket at $HOST_PODMAN_SOCK — Tier-2 apps disabled" >&2
 fi
 
 if podman container exists "$CONTAINER_NAME"; then

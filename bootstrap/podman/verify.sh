@@ -34,4 +34,17 @@ if ! command -v podman >/dev/null 2>&1; then
 fi
 
 podman info >/dev/null
-echo "podman: healthy ($(podman --version))"
+
+# Tier-2 (container-per-app) support needs a running podman API socket, not
+# just a working CLI — fail verify (forcing install.sh to run and bring the
+# socket up) until it's actually listening. See bootstrap/lib/podman_socket.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/podman_socket.sh
+source "$SCRIPT_DIR/../lib/podman_socket.sh"
+sock="$(podman_socket_default_path)"
+if [ ! -S "$sock" ]; then
+  echo "podman: API socket not listening at $sock (needed for Tier-2 app containers)" >&2
+  exit 1
+fi
+
+echo "podman: healthy ($(podman --version)), API socket at $sock"

@@ -121,3 +121,15 @@ install_podman_linux() {
 
 ensure_cmd podman install_podman_linux
 echo "podman installed: $(podman --version)"
+
+# Tier-2 (container-per-app) support needs a running podman API socket —
+# see bootstrap/lib/podman_socket.sh for why this can't just check one
+# fixed path (rootful vs rootless, systemd-as-init vs not, all change where
+# it lives and how it comes up).
+# shellcheck source=../lib/podman_socket.sh
+source "$SCRIPT_DIR/../lib/podman_socket.sh"
+if sock="$(ensure_podman_socket)"; then
+  echo "podman: API socket ready at $sock (Tier-2 app containers enabled)"
+else
+  echo "podman: could not bring up an API socket — Tier-2 app containers will be unavailable" >&2
+fi
