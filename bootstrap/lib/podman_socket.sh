@@ -58,7 +58,19 @@ _start_socket_directly() {
   nohup podman system service --time=0 "unix://${sock}" >/tmp/podman-system-service.log 2>&1 &
   disown 2>/dev/null || true
   for _ in $(seq 1 30); do
-    [ -S "$sock" ] && return 0
+    if [ -S "$sock" ]; then
+      # `podman system service` run this way (root, no systemd socket unit
+      # to set a group/mode for us) creates the socket root:root 0600 — a
+      # Tier-2 app container bind-mounting it in (workspace/install.sh)
+      # always runs as a non-root uid (1001), so every API call fails
+      # EACCES/"Permission denied" without this. Same trust boundary
+      # workspace/install.sh already accepts for the SELinux case
+      # (--security-opt label=disable): this socket is only ever reached
+      # from inside this same single-tenant host/container, not exposed
+      # externally, so a permissive DAC mode isn't widening anything real.
+      chmod 0666 "$sock" 2>/dev/null || true
+      return 0
+    fi
     sleep 0.5
   done
   return 1
