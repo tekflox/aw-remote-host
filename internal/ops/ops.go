@@ -33,6 +33,16 @@ const (
 	RedisVolume        = "aw-remote-host-redis-data"
 	HealthURL          = "http://127.0.0.1:9030/api/health"
 
+	// WorkspaceUID/WorkspaceGID match the `ubuntu` user the image's
+	// Dockerfile creates (useradd -u 1001 -g 1001) and runs the workspace
+	// process as. hostDir is a plain (non-idmapped) bind mount, so whatever
+	// numeric owner lands on the host is exactly what the container sees —
+	// anything copied/written here as this host's own user (root or
+	// otherwise, via a `--user` systemd unit) must be rechowned to 1001 or
+	// the container's `ubuntu` loses write access to its own tree.
+	WorkspaceUID = "1001"
+	WorkspaceGID = "1001"
+
 	probeTimeout = "5"
 )
 
@@ -312,6 +322,18 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	}
 	if err := syncWorkspaceSource(staging, hostDir); err != nil {
 		return nil, err
+	}
+	// copyPath (inside syncWorkspaceSource) writes as this process's own
+	// user — a `--user` systemd unit, so almost never UID 1001 — which
+	// leaves the just-synced entries owned by someone the `ubuntu` user
+	// inside the container can't write to. `podman unshare` runs the chown
+	// inside this host user's own rootless user-namespace mapping, so it
+	// lands as the same UID the container's `ubuntu` resolves to, without
+	// needing host root. Best-effort: an environment with no rootless
+	// userns (e.g. a plain non-podman host) just keeps prior ownership.
+	if out, err := h.runner().Run(ctx, "podman", "unshare", "chown", "-R",
+		WorkspaceUID+":"+WorkspaceGID, hostDir); err != nil {
+		emit("warning", "update", "could not normalize workspace ownership: "+commandError("podman unshare chown", err, out).Error())
 	}
 
 	emit("info", "update", "recreating workspace container")

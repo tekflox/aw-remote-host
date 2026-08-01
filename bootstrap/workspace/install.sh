@@ -69,6 +69,15 @@ if [ -z "$(ls -A "$HOST_DIR" 2>/dev/null)" ]; then
   # trailing /. copies the directory *contents* into HOST_DIR.
   podman cp "${SEED_CONTAINER}:${CONTAINER_WORKDIR}/." "$HOST_DIR"
   podman rm -f "$SEED_CONTAINER" >/dev/null 2>&1 || true
+  # `podman cp` out of a rootless container doesn't reliably land as the
+  # container's own UID 1001 (ubuntu, see the image's Dockerfile) on the
+  # host — it depends on how this host user's subuid range maps. HOST_DIR
+  # is a plain bind mount (no idmapping), so whatever numeric owner ends up
+  # here is exactly what the workspace container sees; `podman unshare`
+  # forces it to 1001 inside this user's own rootless namespace so the
+  # container's `ubuntu` user actually owns its own tree instead of getting
+  # a root-owned (or otherwise foreign-owned) checkout it can't write to.
+  podman unshare chown -R 1001:1001 "$HOST_DIR" || true
   echo "workspace: seeded $(ls -A "$HOST_DIR" | wc -l | tr -d ' ') entries into $HOST_DIR"
 else
   echo "workspace: $HOST_DIR already populated — leaving host files untouched"
