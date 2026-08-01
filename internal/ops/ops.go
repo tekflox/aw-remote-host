@@ -90,9 +90,11 @@ type Handler struct {
 }
 
 // Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|"update"|
-// "self-update"|"uninstall"|"health") — the switchboard link.go's cmd-frame handling
+// "self-update"|"uninstall"|"health"|"exec_start"|"exec_status"|"exec_wait"|
+// "exec_kill"|"list_processes") — the switchboard link.go's cmd-frame handling
 // calls into. args carries optional per-verb parameters such as the exact
-// aw-workspace image version to install for workspace updates.
+// aw-workspace image version to install for workspace updates, or the shell
+// command/timeout/job_id the exec_* verbs take (see ops_exec.go).
 func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any, emit Emit) (any, error) {
 	switch verb {
 	case "stop":
@@ -111,6 +113,16 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.SelfUpdate(ctx, args, emit)
 	case "health":
 		return h.Health(ctx), nil
+	case "exec_start":
+		return h.ExecStart(ctx, args, emit)
+	case "exec_status":
+		return h.ExecStatus(ctx, args)
+	case "exec_wait":
+		return h.ExecWait(ctx, args)
+	case "exec_kill":
+		return h.ExecKill(ctx, args, emit)
+	case "list_processes":
+		return h.ListProcesses(ctx), nil
 	default:
 		return nil, fmt.Errorf("unknown verb %q", verb)
 	}
