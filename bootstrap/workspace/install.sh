@@ -38,28 +38,6 @@ DEFAULT_HOST_DIR="${HOME}/aw-workspace"
 LEGACY_HOST_DIR="${HOME}/agentic-workspace"
 HOST_DIR="${AW_WORKSPACE_HOST_DIR:-${DEFAULT_HOST_DIR}}"
 
-# Two more host dirs, siblings of HOST_DIR — NOT nested inside it — bind-
-# mounted at /opt/home (HOME; dotfiles like ~/.claude) and /opt/data
-# (AW_WORKSPACE_HOME; app-installed bin shims/secrets/skills, formerly
-# $HOME/.aw-workspace). Separate mounts specifically so this file's own
-# `Update` sync of HOST_DIR (see ops.go's syncWorkspaceSource, which wipes
-# everything in HOST_DIR not named .aw-workspace before copying the fresh
-# image in) can never touch them — they're structurally outside what that
-# sync ever iterates. See repos/aw-workspace/Dockerfile for the full
-# rationale. Frederico decision 2026-08-01.
-HOME_DIR="${AW_WORKSPACE_HOME_DIR:-${HOST_DIR}-home}"
-DATA_DIR="${AW_WORKSPACE_DATA_DIR:-${HOST_DIR}-data}"
-mkdir -p "$HOME_DIR" "$DATA_DIR"
-# The normal (rootless podman, human-run) case relies on podman's own
-# userns uid-mapping the same way HOST_DIR already does — untouched here.
-# Only when this script itself runs as root (e.g. a privileged/rootful
-# podman-in-docker setup, not the common case) does a plain `mkdir -p`
-# leave these root-owned, which the container's uid-1001 `ubuntu` process
-# can't write into — pre-chown for that case only.
-if [ "$(id -u)" = "0" ]; then
-  chown 1001:1001 "$HOME_DIR" "$DATA_DIR" 2>/dev/null || true
-fi
-
 if [ -z "${AW_WORKSPACE_HOST_DIR:-}" ] && [ ! -e "$DEFAULT_HOST_DIR" ] && [ -e "$LEGACY_HOST_DIR" ]; then
   if podman container exists "$CONTAINER_NAME"; then
     echo "workspace: removing existing container before host-dir migration"
@@ -161,10 +139,6 @@ if podman container exists "$CONTAINER_NAME"; then
       | grep -q '^AW_WORKSPACE_HOST_DIR='; then
     echo "workspace: existing container is missing AW_WORKSPACE_HOST_DIR — recreating for Tier-2 app volume mounts"
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  elif ! podman inspect "$CONTAINER_NAME" --format '{{range .Mounts}}{{println .Destination}}{{end}}' \
-      | grep -qx "/opt/home"; then
-    echo "workspace: existing container predates the /opt/home + /opt/data mounts — recreating"
-    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 fi
 
@@ -185,8 +159,6 @@ else
     --restart=always \
     -p 127.0.0.1:9030:9030 \
     -v "${HOST_DIR}:${CONTAINER_WORKDIR}" \
-    -v "${HOME_DIR}:/opt/home" \
-    -v "${DATA_DIR}:/opt/data" \
     ${SOCKET_ARGS[@]+"${SOCKET_ARGS[@]}"} \
     -e AW_WORKSPACE="$AW_WORKSPACE_SLUG" \
     -e AW_WORKSPACE_SCHEMA="$SCHEMA" \

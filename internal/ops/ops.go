@@ -418,33 +418,33 @@ func workspaceHostDir() (string, error) {
 	return next, nil
 }
 
+// syncWorkspaceSource overwrites dstDir with whatever the freshly-pulled
+// image (staged at srcDir) ships — but only entries the image actually
+// ships. It never deletes anything else already in dstDir: a user's own
+// repos/ dir, ~/.claude, or any other file/dir some tool wrote there over
+// time is left completely untouched, with no allowlist/exclusion needed to
+// protect it (Frederico decision 2026-08-01 — Update replaces, it never
+// prunes). ".aw-workspace" is still skipped explicitly: it's not something
+// the image ships, but a defensive belt-and-braces in case an older
+// install still has one from before AW_WORKSPACE_HOME moved elsewhere.
 func syncWorkspaceSource(srcDir, dstDir string) error {
-	entries, err := os.ReadDir(dstDir)
-	if err != nil {
-		return fmt.Errorf("read workspace host dir: %w", err)
-	}
-	stagingName := filepath.Base(srcDir)
-	for _, entry := range entries {
-		name := entry.Name()
-		if name == ".aw-workspace" || name == stagingName {
-			continue
-		}
-		if strings.HasPrefix(name, ".aw-workspace-update-") {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(dstDir, name)); err != nil {
-			return fmt.Errorf("remove old workspace entry %s: %w", name, err)
-		}
-	}
 	srcEntries, err := os.ReadDir(srcDir)
 	if err != nil {
 		return fmt.Errorf("read staged workspace source: %w", err)
 	}
 	for _, entry := range srcEntries {
-		if entry.Name() == ".aw-workspace" {
+		name := entry.Name()
+		if name == ".aw-workspace" {
 			continue
 		}
-		if err := copyPath(filepath.Join(srcDir, entry.Name()), filepath.Join(dstDir, entry.Name())); err != nil {
+		dst := filepath.Join(dstDir, name)
+		// Remove the old entry first (handles a type change, e.g. a file
+		// becoming a directory between versions) then copy the fresh one
+		// in — this only ever touches names the image itself brought.
+		if err := os.RemoveAll(dst); err != nil {
+			return fmt.Errorf("remove old workspace entry %s: %w", name, err)
+		}
+		if err := copyPath(filepath.Join(srcDir, name), dst); err != nil {
 			return err
 		}
 	}

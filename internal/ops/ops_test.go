@@ -215,19 +215,38 @@ func TestWorkspaceHostDirUsesLegacyDirUntilInstallMigratesIt(t *testing.T) {
 	}
 }
 
-func TestSyncWorkspaceSourcePreservesRuntimeDataAndRemovesStaleFiles(t *testing.T) {
+func TestSyncWorkspaceSourceOverwritesShippedEntriesAndNeverDeletesAnythingElse(t *testing.T) {
 	dst := t.TempDir()
 	src := t.TempDir()
 
+	// Runtime data the image doesn't ship at all (.aw-workspace, and a
+	// user's own repos/ dir or any other file some tool wrote there) must
+	// survive untouched — Update only ever overwrites what the image
+	// brings, it never prunes.
 	if err := os.MkdirAll(filepath.Join(dst, ".aw-workspace", "apps"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dst, ".aw-workspace", "apps", "keep.txt"), []byte("runtime"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dst, "stale.py"), []byte("old"), 0o644); err != nil {
+	if err := os.MkdirAll(filepath.Join(dst, "repos", "some-repo"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dst, "repos", "some-repo", "file.txt"), []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "not-in-image.py"), []byte("mine too"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A file the OLD image shipped (and the NEW one still ships) — must be
+	// overwritten with the fresh content, not left stale.
+	if err := os.MkdirAll(filepath.Join(dst, "src", "api"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "src", "api", "app.py"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := os.MkdirAll(filepath.Join(src, "src", "api"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -241,15 +260,18 @@ func TestSyncWorkspaceSourcePreservesRuntimeDataAndRemovesStaleFiles(t *testing.
 	if _, err := os.Stat(filepath.Join(dst, ".aw-workspace", "apps", "keep.txt")); err != nil {
 		t.Fatalf("expected runtime data to survive: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dst, "stale.py")); !os.IsNotExist(err) {
-		t.Fatalf("expected stale source file to be removed, got err=%v", err)
+	if _, err := os.Stat(filepath.Join(dst, "repos", "some-repo", "file.txt")); err != nil {
+		t.Fatalf("expected user's own repos/ dir to survive untouched: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "not-in-image.py")); err != nil {
+		t.Fatalf("expected a file the image doesn't ship to survive: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(dst, "src", "api", "app.py"))
 	if err != nil {
 		t.Fatalf("expected new source file: %v", err)
 	}
 	if string(got) != "new" {
-		t.Fatalf("unexpected copied source content: %q", got)
+		t.Fatalf("expected the shipped file to be overwritten with fresh content, got %q", got)
 	}
 }
 
