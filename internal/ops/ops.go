@@ -336,16 +336,35 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 		return nil, err
 	}
 	// copyPath (inside syncWorkspaceSource) writes as this process's own
-	// user — a `--user` systemd unit, so almost never UID 1001 — which
-	// leaves the just-synced entries owned by someone the `ubuntu` user
-	// inside the container can't write to. `podman unshare` runs the chown
-	// inside this host user's own rootless user-namespace mapping, so it
-	// lands as the same UID the container's `ubuntu` resolves to, without
-	// needing host root. Best-effort: an environment with no rootless
-	// userns (e.g. a plain non-podman host) just keeps prior ownership.
-	if out, err := h.runner().Run(ctx, "podman", "unshare", "chown", "-R",
-		WorkspaceUID+":"+WorkspaceGID, hostDir); err != nil {
-		emit("warning", "update", "could not normalize workspace ownership: "+commandError("podman unshare chown", err, out).Error())
+	// user, which leaves the just-synced entries owned by someone the
+	// `ubuntu` user inside the container can't write to. Two cases:
+	//
+	//   - This process runs as host root (a privileged container/rootFUL
+	//     podman host, e.g. this project's own aw-remote-host deployment —
+	//     confirmed live 2026-08-03, `podman info` reports Rootless=false
+	//     here): a plain `chown -R` lands directly, no user-namespace tricks
+	//     needed or possible.
+	//   - This process runs unprivileged (a `--user` systemd unit on a
+	//     rootless-podman host): host root can't chown at all, but
+	//     `podman unshare chown` runs inside this user's own rootless
+	//     user-namespace mapping, landing as the UID the container's
+	//     `ubuntu` resolves to.
+	//
+	// Found live 2026-08-03: this always used the rootless path, which
+	// fails outright ("must be run with rootless") on a rootFUL host —
+	// silently swallowed as a best-effort warning, leaving every synced
+	// entry root-owned and unwritable by the workspace's own `ubuntu`
+	// process (surfaced as "Permission denied" installing any app).
+	chownArgs := []string{"unshare", "chown", "-R", WorkspaceUID + ":" + WorkspaceGID, hostDir}
+	chownLabel := "podman unshare chown"
+	if os.Geteuid() == 0 {
+		chownArgs = []string{"-R", WorkspaceUID + ":" + WorkspaceGID, hostDir}
+		chownLabel = "chown"
+		if out, err := h.runner().Run(ctx, "chown", chownArgs...); err != nil {
+			emit("warning", "update", "could not normalize workspace ownership: "+commandError(chownLabel, err, out).Error())
+		}
+	} else if out, err := h.runner().Run(ctx, "podman", chownArgs...); err != nil {
+		emit("warning", "update", "could not normalize workspace ownership: "+commandError(chownLabel, err, out).Error())
 	}
 
 	emit("info", "update", "recreating workspace container")
@@ -468,7 +487,13 @@ func syncWorkspaceSource(srcDir, dstDir string) error {
 	}
 	for _, entry := range srcEntries {
 		name := entry.Name()
-		if name == ".aw-workspace" {
+		// .aw-workspace holds mutable runtime state (see the function
+		// docstring); apps/ holds locally-installed workspace apps — also
+		// mutable, and NOT something the image's own baked scaffold (just a
+		// README) should ever overwrite. Found live 2026-08-03: every
+		// Update() wiped every installed app back down to that bare README,
+		// because this exclusion list only covered .aw-workspace.
+		if name == ".aw-workspace" || name == "apps" {
 			continue
 		}
 		dst := filepath.Join(dstDir, name)
