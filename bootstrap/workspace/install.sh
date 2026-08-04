@@ -38,6 +38,21 @@ DEFAULT_HOST_DIR="${HOME}/aw-workspace"
 LEGACY_HOST_DIR="${HOME}/agentic-workspace"
 HOST_DIR="${AW_WORKSPACE_HOST_DIR:-${DEFAULT_HOST_DIR}}"
 
+# The container's $HOME (/home/ubuntu) — where CLI tools installed by apps
+# (claude, codex, copilot, cursor-agent, gh, npm's own cache/config, ...)
+# keep their own login/config state — was NOT host-mounted at all before
+# 2026-08-04: only CONTAINER_WORKDIR was. Every workspace update/recreate
+# wiped it, so `claude login` (etc.) had to be redone every time. Sibling
+# dir to HOST_DIR, NOT nested inside it — syncWorkspaceSource's update path
+# only special-cases ".aw-workspace"/"apps" as things to preserve when
+# syncing HOST_DIR's tree from the image; keeping this outside HOST_DIR
+# entirely means that logic never has to know about it.
+CONTAINER_HOME="/home/ubuntu"
+DEFAULT_HOME_HOST_DIR="${HOME}/aw-workspace-home"
+HOME_HOST_DIR="${AW_WORKSPACE_HOME_HOST_DIR:-${DEFAULT_HOME_HOST_DIR}}"
+WORKSPACE_UID="1001"
+WORKSPACE_GID="1001"
+
 if [ -z "${AW_WORKSPACE_HOST_DIR:-}" ] && [ ! -e "$DEFAULT_HOST_DIR" ] && [ -e "$LEGACY_HOST_DIR" ]; then
   if podman container exists "$CONTAINER_NAME"; then
     echo "workspace: removing existing container before host-dir migration"
@@ -47,6 +62,16 @@ if [ -z "${AW_WORKSPACE_HOST_DIR:-}" ] && [ ! -e "$DEFAULT_HOST_DIR" ] && [ -e "
   mv "$LEGACY_HOST_DIR" "$DEFAULT_HOST_DIR"
 fi
 mkdir -p "$HOST_DIR"
+mkdir -p "$HOME_HOST_DIR"
+# Must be writable by the container's `ubuntu` (1001:1001) — root here can
+# chown directly; a rootless host needs `podman unshare` to land inside its
+# own user-namespace mapping (same dual-path ops.go's Update() uses for
+# HOST_DIR after every sync).
+if [ "$(id -u)" = "0" ]; then
+  chown -R "${WORKSPACE_UID}:${WORKSPACE_GID}" "$HOME_HOST_DIR" 2>/dev/null || true
+else
+  podman unshare chown -R "${WORKSPACE_UID}:${WORKSPACE_GID}" "$HOME_HOST_DIR" 2>/dev/null || true
+fi
 
 PULL_ARGS=()
 if [[ "$IMAGE" == localhost/* || "$IMAGE" == localhost:* || "$IMAGE" == 127.0.0.1/* || "$IMAGE" == 127.0.0.1:* ]]; then
@@ -160,6 +185,10 @@ if podman container exists "$CONTAINER_NAME"; then
       | grep -q '^AW_WORKSPACE_HOST_DIR='; then
     echo "workspace: existing container is missing AW_WORKSPACE_HOST_DIR — recreating for Tier-2 app volume mounts"
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  elif ! podman inspect "$CONTAINER_NAME" --format '{{range .Mounts}}{{println .Destination}}{{end}}' \
+      | grep -qx "$CONTAINER_HOME"; then
+    echo "workspace: existing container has no persistent \$HOME mount — recreating so CLI logins survive updates"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 fi
 
@@ -180,6 +209,7 @@ else
     --restart=always \
     -p 127.0.0.1:9030:9030 \
     -v "${HOST_DIR}:${CONTAINER_WORKDIR}" \
+    -v "${HOME_HOST_DIR}:${CONTAINER_HOME}" \
     ${SOCKET_ARGS[@]+"${SOCKET_ARGS[@]}"} \
     -e AW_WORKSPACE="$AW_WORKSPACE_SLUG" \
     -e AW_WORKSPACE_SCHEMA="$SCHEMA" \
@@ -190,6 +220,7 @@ else
     -e AW_WORKSPACE_HOST_TOKEN="$AW_WORKSPACE_HOST_TOKEN" \
     -e AW_WORKSPACE_HOST_DIR="$HOST_DIR" \
     -e AW_WORKSPACE_CONTAINER_DIR="$CONTAINER_WORKDIR" \
+    -e AW_WORKSPACE_HOME_HOST_DIR="$HOME_HOST_DIR" \
     "$IMAGE"
 fi
 
