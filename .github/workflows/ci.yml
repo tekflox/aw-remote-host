@@ -1,10 +1,11 @@
 name: CI
 
-# NOTE: auto-triggers (push/pull_request) disabled on 2026-07-26 to save
-# GitHub Actions minutes while the Remote Host is still being certified.
-# Run manually from the Actions tab (workflow_dispatch). Re-enable the
-# push/pull_request block once the build is proven stable.
+# Auto-triggers on push re-enabled 2026-08-03 per standing instruction: every
+# aw-* repo runs its unit tests on every push. Runs on a self-hosted runner
+# (aw-baremetal), so this doesn't consume billed GitHub Actions minutes —
+# the 2026-07-26 concern doesn't apply here.
 on:
+  push:
   workflow_dispatch:
 
 jobs:
