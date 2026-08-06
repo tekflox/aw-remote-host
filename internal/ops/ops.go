@@ -480,6 +480,27 @@ func workspaceHostDir() (string, error) {
 // prunes). ".aw-workspace" is still skipped explicitly: it's not something
 // the image ships, but a defensive belt-and-braces in case an older
 // install still has one from before AW_WORKSPACE_HOME moved elsewhere.
+//
+// CLI credential dirs/files (.claude, .claude.json, .codex, .copilot,
+// .cursor) get the SAME belt-and-braces treatment, for a subtler reason
+// than .aw-workspace's: aw-app-agents-platform-runners' execute.py uses
+// exactly these names, rooted at $AW_WORKSPACE_CONTAINER_DIR (== dstDir
+// here, /opt/aw-workspace) as the shared, workspace-persisted source it
+// resyncs Workspace Runner CLI logins from before every spawn (see that
+// app's `_sync_home_creds_into_workspace` / WORKSPACE_CONTAINER_DIR). The
+// docstring above assumed this dir would never collide with anything the
+// image itself ships — true in the common case, but aw-workspace's
+// Dockerfile has no .dockerignore, so a stray `.claude/` (or similar)
+// left in a build runner's checkout gets baked into the image and, once
+// baked, this loop's "only entries the image ships get replaced" rule
+// stops protecting it: every Update() would silently wipe live Workspace
+// Runner CLI credentials and replace them with whatever (mostly-empty,
+// dev-time) copy happened to be in that particular image build. Found
+// live 2026-08-06 (Frederico: "na hora de atualizar o workspace, a gente
+// deve tá apagando as credenciais" — reported after repeated,
+// unsuccessful manual attempts to fix it another way). Skipping these
+// names outright removes the collision at the root, independent of
+// whether any given image build happens to ship them.
 func syncWorkspaceSource(srcDir, dstDir string) error {
 	srcEntries, err := os.ReadDir(srcDir)
 	if err != nil {
@@ -493,7 +514,9 @@ func syncWorkspaceSource(srcDir, dstDir string) error {
 		// README) should ever overwrite. Found live 2026-08-03: every
 		// Update() wiped every installed app back down to that bare README,
 		// because this exclusion list only covered .aw-workspace.
-		if name == ".aw-workspace" || name == "apps" {
+		switch name {
+		case ".aw-workspace", "apps",
+			".claude", ".claude.json", ".codex", ".copilot", ".cursor":
 			continue
 		}
 		dst := filepath.Join(dstDir, name)
