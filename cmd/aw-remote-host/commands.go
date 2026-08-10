@@ -63,16 +63,36 @@ func confirm(prompt string) bool {
 	return strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes")
 }
 
+// runLink is the "link" command: a lean link, permanently — it never
+// provisions the local runtime, and doesn't even accept --with-workspace/
+// --full (fails fast with flag.ContinueOnError's own "flag provided but
+// not defined" if someone tries, rather than silently ignoring it). Use
+// bootstrap-workspace instead when the local runtime IS wanted.
+func runLink(args []string) error {
+	return runLinkOrBootstrap("link", args, false)
+}
+
+// runBootstrapWorkspace is the "bootstrap-workspace" command: lean by
+// default (identical to "link"), but accepts --with-workspace/--full to
+// also provision the local runtime — immediately, or later by re-running
+// with the flag.
 func runBootstrapWorkspace(args []string) error {
-	fs := flag.NewFlagSet("bootstrap-workspace", flag.ContinueOnError)
+	return runLinkOrBootstrap("bootstrap-workspace", args, true)
+}
+
+func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) error {
+	fs := flag.NewFlagSet(cmdName, flag.ContinueOnError)
 	token, plan, controlPlane := commonFlags(fs)
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
 	foreground := fs.Bool("foreground", false, "run attached, holding the /link connection; installs no service (default when neither flag is given)")
 	fg := fs.Bool("fg", false, "alias for --foreground")
 	background := fs.Bool("background", false, "install and start a background service (launchd on macOS, systemd on Linux), then detach")
 	detach := fs.Bool("detach", false, "alias for --background")
-	withWorkspace := fs.Bool("with-workspace", false, "also install/start the full local runtime (podman, postgres+pgvector, redis, the aw-workspace container) — default is a LEAN link: register this machine and hold /link (enables exec_* + control-plane-driven \"bootstrap\") without provisioning anything locally. Re-run with this flag later (no --token needed once linked) to provision, or trigger it remotely via the control plane's own \"bootstrap\" verb (see README) — no need to re-run by hand.")
-	full := fs.Bool("full", false, "alias for --with-workspace")
+	var withWorkspace, full *bool
+	if allowProvision {
+		withWorkspace = fs.Bool("with-workspace", false, "also install/start the full local runtime (podman, postgres+pgvector, redis, the aw-workspace container) — default is a LEAN link: register this machine and hold /link (enables exec_* + control-plane-driven \"bootstrap\") without provisioning anything locally. Re-run with this flag later (no --token needed once linked) to provision, or trigger it remotely via the control plane's own \"bootstrap\" verb (see README) — no need to re-run by hand.")
+		full = fs.Bool("full", false, "alias for --with-workspace")
+	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -83,7 +103,7 @@ func runBootstrapWorkspace(args []string) error {
 		return fmt.Errorf("--foreground and --background are mutually exclusive")
 	}
 	runInBackground := bgMode // default (neither flag given) is foreground
-	provisionWorkspace := *withWorkspace || *full
+	provisionWorkspace := allowProvision && (*withWorkspace || *full)
 
 	m, err := bootstrap.LoadEmbeddedManifest()
 	if err != nil {
@@ -97,9 +117,9 @@ func runBootstrapWorkspace(args []string) error {
 				fmt.Printf("[plan] %s: %s — %s\n", a.Module, a.Step, a.Detail)
 			}
 		} else {
-			fmt.Printf("[plan] would link to %s as this machine (lean: no local provisioning — pass --with-workspace to also run):\n", *controlPlane)
+			fmt.Printf("[plan] would link to %s as this machine (lean: no local provisioning — use 'bootstrap-workspace --with-workspace' to also run):\n", *controlPlane)
 			for _, a := range bootstrap.Plan(m) {
-				fmt.Printf("[plan] (skipped unless --with-workspace) %s: %s — %s\n", a.Module, a.Step, a.Detail)
+				fmt.Printf("[plan] (skipped — lean %s) %s: %s — %s\n", cmdName, a.Module, a.Step, a.Detail)
 			}
 		}
 		return nil
@@ -127,7 +147,7 @@ func runBootstrapWorkspace(args []string) error {
 		if provisionWorkspace {
 			fmt.Println("This will install/verify: podman, postgres+pgvector, redis, and start the aw-workspace runtime on this machine.")
 		} else {
-			fmt.Println("This will register this machine with the control plane and hold the /link connection open (enables exec_* + a control-plane-driven \"bootstrap\" later) — no local runtime (podman, postgres, redis, aw-workspace) is installed. Pass --with-workspace to also do that now.")
+			fmt.Println("This will register this machine with the control plane and hold the /link connection open (enables exec_* + a control-plane-driven \"bootstrap\" later) — no local runtime (podman, postgres, redis, aw-workspace) is installed. Use 'bootstrap-workspace --with-workspace' to also do that now.")
 		}
 		if !confirm("Continue? [y/N] ") {
 			return fmt.Errorf("aborted")
@@ -296,7 +316,7 @@ func runBootstrapWorkspace(args []string) error {
 			}
 		}
 	} else {
-		fmt.Println("lean link: local runtime NOT installed — re-run with --with-workspace (no --token needed, already linked) to provision it here, or trigger it from the control plane (the \"bootstrap\" verb over this same /link connection — see README).")
+		fmt.Println("lean link: local runtime NOT installed — run 'bootstrap-workspace --with-workspace' (no --token needed, already linked) to provision it here, or trigger it from the control plane (the \"bootstrap\" verb over this same /link connection — see README).")
 	}
 
 	if runInBackground {
