@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
+	"github.com/tekflox/aw-remote-host/internal/state"
 	"github.com/tekflox/aw-remote-host/internal/updater"
 )
 
@@ -78,6 +79,14 @@ type BootstrapOpts struct {
 	PostgresPassword string
 	ControlPlane     string
 	HostCredential   string
+	// StatePath, when set, is ~/.aw-remote-host/state.json — a successful
+	// FULL runModulesWithEnv (the control-plane-driven "bootstrap" verb, or
+	// a local `bootstrap-workspace --with-workspace` re-run) marks
+	// state.Provisioned=true there, so `status` reflects reality even when
+	// provisioning was triggered remotely rather than by re-running the CLI
+	// by hand. Left empty by callers (tests, or any future non-CLI caller)
+	// that don't care about persisting this — a no-op, not an error.
+	StatePath string
 }
 
 // Handler executes lifecycle/health verbs against the local podman runtime.
@@ -613,6 +622,12 @@ func (h *Handler) runModulesWithEnv(ctx context.Context, opts BootstrapOpts, ful
 			return nil, fmt.Errorf("module %q failed", mod.Name)
 		}
 		emit("info", mod.Name, fmt.Sprintf("%s ok", mod.Name))
+	}
+	if full && opts.StatePath != "" {
+		if st, err := state.Load(opts.StatePath); err == nil && !st.Provisioned {
+			st.Provisioned = true
+			_ = state.Save(opts.StatePath, st) // best-effort — a save failure here shouldn't fail the bootstrap that already succeeded
+		}
 	}
 	return map[string]any{"bootstrapped": true}, nil
 }

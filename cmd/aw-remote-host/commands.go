@@ -71,6 +71,8 @@ func runBootstrapWorkspace(args []string) error {
 	fg := fs.Bool("fg", false, "alias for --foreground")
 	background := fs.Bool("background", false, "install and start a background service (launchd on macOS, systemd on Linux), then detach")
 	detach := fs.Bool("detach", false, "alias for --background")
+	withWorkspace := fs.Bool("with-workspace", false, "also install/start the full local runtime (podman, postgres+pgvector, redis, the aw-workspace container) — default is a LEAN link: register this machine and hold /link (enables exec_* + control-plane-driven \"bootstrap\") without provisioning anything locally. Re-run with this flag later (no --token needed once linked) to provision, or trigger it remotely via the control plane's own \"bootstrap\" verb (see README) — no need to re-run by hand.")
+	full := fs.Bool("full", false, "alias for --with-workspace")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -81,6 +83,7 @@ func runBootstrapWorkspace(args []string) error {
 		return fmt.Errorf("--foreground and --background are mutually exclusive")
 	}
 	runInBackground := bgMode // default (neither flag given) is foreground
+	provisionWorkspace := *withWorkspace || *full
 
 	m, err := bootstrap.LoadEmbeddedManifest()
 	if err != nil {
@@ -88,9 +91,16 @@ func runBootstrapWorkspace(args []string) error {
 	}
 
 	if *plan {
-		fmt.Printf("[plan] would link to %s as this machine, then run:\n", *controlPlane)
-		for _, a := range bootstrap.Plan(m) {
-			fmt.Printf("[plan] %s: %s — %s\n", a.Module, a.Step, a.Detail)
+		if provisionWorkspace {
+			fmt.Printf("[plan] would link to %s as this machine, then run:\n", *controlPlane)
+			for _, a := range bootstrap.Plan(m) {
+				fmt.Printf("[plan] %s: %s — %s\n", a.Module, a.Step, a.Detail)
+			}
+		} else {
+			fmt.Printf("[plan] would link to %s as this machine (lean: no local provisioning — pass --with-workspace to also run):\n", *controlPlane)
+			for _, a := range bootstrap.Plan(m) {
+				fmt.Printf("[plan] (skipped unless --with-workspace) %s: %s — %s\n", a.Module, a.Step, a.Detail)
+			}
 		}
 		return nil
 	}
@@ -114,7 +124,11 @@ func runBootstrapWorkspace(args []string) error {
 	}
 
 	if !*yes {
-		fmt.Println("This will install/verify: podman, postgres+pgvector, redis, and start the aw-workspace runtime on this machine.")
+		if provisionWorkspace {
+			fmt.Println("This will install/verify: podman, postgres+pgvector, redis, and start the aw-workspace runtime on this machine.")
+		} else {
+			fmt.Println("This will register this machine with the control plane and hold the /link connection open (enables exec_* + a control-plane-driven \"bootstrap\" later) — no local runtime (podman, postgres, redis, aw-workspace) is installed. Pass --with-workspace to also do that now.")
+		}
 		if !confirm("Continue? [y/N] ") {
 			return fmt.Errorf("aborted")
 		}
@@ -143,15 +157,22 @@ func runBootstrapWorkspace(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	infra := m.Except("workspace")
-	infraOpts := bootstrap.RunOptions{
-		ExtractDir: extractDir,
-		Env:        []string{"AW_POSTGRES_PASSWORD=" + st.PostgresPassword},
-	}
-	statuses, err := bootstrap.Run(ctx, infra, infraOpts)
-	reportStatuses(statuses)
-	if err != nil {
-		return err
+	// Lean by default: skip local infra provisioning entirely unless
+	// --with-workspace opted in. The /link registration below (and the
+	// ops.Handler it wires up) works standalone — exec_* and the
+	// control-plane-driven "bootstrap" verb (src/api/placement/
+	// remote_host_driver.py) don't need any module installed locally first.
+	if provisionWorkspace {
+		infra := m.Except("workspace")
+		infraOpts := bootstrap.RunOptions{
+			ExtractDir: extractDir,
+			Env:        []string{"AW_POSTGRES_PASSWORD=" + st.PostgresPassword},
+		}
+		statuses, err := bootstrap.Run(ctx, infra, infraOpts)
+		reportStatuses(statuses)
+		if err != nil {
+			return err
+		}
 	}
 
 	hostname, _ := os.Hostname()
@@ -203,6 +224,7 @@ func runBootstrapWorkspace(args []string) error {
 					PostgresPassword: st.PostgresPassword,
 					ControlPlane:     *controlPlane,
 					HostCredential:   hostCredential,
+					StatePath:        statePath,
 				}
 				fmt.Printf("link: registered (remote_host_id=%s, workspace=%s)\n", reply.RemoteHostID, reply.WorkspaceSlug)
 				if reply.WorkspaceSlug != "" {
@@ -249,22 +271,32 @@ func runBootstrapWorkspace(args []string) error {
 	}
 
 	if reg.slug == "" {
-		return fmt.Errorf("registered but the control plane didn't return a workspace_slug — cannot start the workspace runtime")
+		return fmt.Errorf("registered but the control plane didn't return a workspace_slug")
 	}
 
-	wsOpts := bootstrap.RunOptions{
-		ExtractDir: extractDir,
-		Env: append(bootstrap.EnvPassthrough("AW_WORKSPACE_IMAGE", "XDG_RUNTIME_DIR"),
-			"AW_WORKSPACE_SLUG="+reg.slug,
-			"AW_POSTGRES_PASSWORD="+st.PostgresPassword,
-			"AW_BACKEND_URL="+*controlPlane,
-			"AW_WORKSPACE_HOST_TOKEN="+reg.hostCredential,
-		),
-	}
-	wsStatuses, err := bootstrap.Run(ctx, m.Only("workspace"), wsOpts)
-	reportStatuses(wsStatuses)
-	if err != nil {
-		return err
+	if provisionWorkspace {
+		wsOpts := bootstrap.RunOptions{
+			ExtractDir: extractDir,
+			Env: append(bootstrap.EnvPassthrough("AW_WORKSPACE_IMAGE", "XDG_RUNTIME_DIR"),
+				"AW_WORKSPACE_SLUG="+reg.slug,
+				"AW_POSTGRES_PASSWORD="+st.PostgresPassword,
+				"AW_BACKEND_URL="+*controlPlane,
+				"AW_WORKSPACE_HOST_TOKEN="+reg.hostCredential,
+			),
+		}
+		wsStatuses, err := bootstrap.Run(ctx, m.Only("workspace"), wsOpts)
+		reportStatuses(wsStatuses)
+		if err != nil {
+			return err
+		}
+		if !st.Provisioned {
+			st.Provisioned = true
+			if err := state.Save(statePath, st); err != nil {
+				return err
+			}
+		}
+	} else {
+		fmt.Println("lean link: local runtime NOT installed — re-run with --with-workspace (no --token needed, already linked) to provision it here, or trigger it from the control plane (the \"bootstrap\" verb over this same /link connection — see README).")
 	}
 
 	if runInBackground {
@@ -283,7 +315,11 @@ func runBootstrapWorkspace(args []string) error {
 		return nil
 	}
 
-	fmt.Printf("workspace %q running — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
+	if provisionWorkspace {
+		fmt.Printf("workspace %q running — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
+	} else {
+		fmt.Printf("linked to workspace %q (lean, no local runtime) — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
+	}
 	<-ctx.Done()
 	return <-runDone
 }
@@ -379,6 +415,11 @@ func runStatus(args []string) error {
 	extractDir := extractDirFor(credPath)
 	if err := bootstrap.ExtractScripts(extractDir); err != nil {
 		return fmt.Errorf("extract bootstrap scripts: %w", err)
+	}
+
+	if !st.Provisioned {
+		fmt.Println("provisioned: no (lean link — run bootstrap-workspace --with-workspace to install podman/postgres/redis/aw-workspace here)")
+		return nil
 	}
 
 	ctx := context.Background()

@@ -57,7 +57,8 @@ Usage:
   aw-remote-host <command> [flags]
 
 Commands:
-  bootstrap-workspace   Install/verify the workspace runtime (podman, postgres+pgvector, redis)
+  bootstrap-workspace   Link this machine to a workspace (lean by default —
+                        see --with-workspace below)
   status                Show link + bootstrap status
   unlink                Disconnect this machine from the control plane
   version               Print the client version
@@ -67,6 +68,16 @@ Flags (bootstrap-workspace, status, unlink):
   --plan            Print planned actions without executing them
   --control-plane   Control plane base URL (default %s)
   --yes             (bootstrap-workspace) skip the confirmation prompt
+  --with-workspace/--full
+                    (bootstrap-workspace) also install/start the full local
+                    runtime — podman, postgres+pgvector, redis, and the
+                    aw-workspace container. DEFAULT is a LEAN link: register
+                    this machine and hold /link (enables exec_* command
+                    execution + a control-plane-driven "bootstrap" later)
+                    without installing anything locally. Re-run later with
+                    this flag (no --token needed once linked) to provision,
+                    or trigger it from the control plane instead — no need
+                    to come back to this machine by hand.
   --foreground/--fg (bootstrap-workspace) run attached, holding the /link
                     connection; installs no background service. This is
                     the DEFAULT when neither --foreground nor --background

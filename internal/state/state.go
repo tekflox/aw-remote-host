@@ -17,6 +17,14 @@ import (
 type State struct {
 	PostgresPassword string `json:"postgres_password,omitempty"`
 	WorkspaceSlug    string `json:"workspace_slug,omitempty"`
+	// Provisioned is true once bootstrap-workspace --with-workspace (or the
+	// control-plane-driven "bootstrap" ops verb) has installed the local
+	// runtime (podman, postgres, redis, aw-workspace) at least once. A lean
+	// link (the default) leaves this false — `status` uses it to decide
+	// whether checking those modules' health is meaningful, and a later
+	// --with-workspace run sets it permanently true (never reset back to
+	// false; re-provisioning doesn't "undo" a prior install).
+	Provisioned bool `json:"provisioned,omitempty"`
 }
 
 // DefaultPath returns ~/.aw-remote-host/state.json.

@@ -37,11 +37,13 @@ ever run it. That is the whole transparency contract:
 
 ## Status
 
-Card 4 of 6 (BYOD onboarding chain): `bootstrap-workspace` is real —
-idempotent detect→install→verify over every manifest module, a dial-back
-to the control plane's `/link` over WebSocket that redeems the one-time
-`awbs_` token for a durable `awlk_` credential, and a persistent reconnect
-loop (exponential backoff). Cross-platform: Linux (systemd user unit) and
+Card 4 of 6 (BYOD onboarding chain): `bootstrap-workspace` is real — a
+dial-back to the control plane's `/link` over WebSocket that redeems the
+one-time `awbs_` token for a durable `awlk_` credential, and a persistent
+reconnect loop (exponential backoff). Lean by default (link only, see
+[Lean link vs `--with-workspace`](#lean-link-vs---with-workspace) below);
+`--with-workspace` runs the idempotent detect→install→verify cycle over
+every manifest module too. Cross-platform: Linux (systemd user unit) and
 macOS (launchd LaunchAgent — the e2e test box, macbook-fred, is a Mac with
 no systemd) via `internal/servicemgr`. `--plan` still previews everything
 without touching your system. See [Roadmap](#roadmap).
@@ -93,7 +95,7 @@ commit `753214a`) only takes effect on the target machine once the
 ## Usage
 
 ```sh
-aw-remote-host bootstrap-workspace --token <token> [--plan] [--yes] [--foreground|--background] [--control-plane https://api.aw.tekflox.com]
+aw-remote-host bootstrap-workspace --token <token> [--with-workspace] [--plan] [--yes] [--foreground|--background] [--control-plane https://api.aw.tekflox.com]
 aw-remote-host status [--plan]
 aw-remote-host unlink [--plan] [--stop-containers]
 aw-remote-host version
@@ -104,6 +106,33 @@ anything — use it to see exactly what would happen before running for
 real. `--yes` skips the confirmation prompt `bootstrap-workspace` shows
 before touching your system. Once linked, `--token` is no longer needed —
 `bootstrap-workspace` reuses the stored `awlk_` credential.
+
+### Lean link vs `--with-workspace`
+
+`bootstrap-workspace` is **lean by default**: it registers this machine
+with the control plane and holds the `/link` connection open, without
+installing anything locally. A lean link already gives the control plane
+`exec_start`/`exec_status`/`exec_wait`/`exec_kill`/`list_processes` on this
+machine (see `internal/ops/ops_exec.go`) — enough for command execution,
+CI-style deploy steps, etc. — with zero local footprint.
+
+Pass **`--with-workspace`** (`--full`) to also install/start the full local
+runtime: podman, postgres+pgvector, redis, and the `aw-workspace` container.
+Do this immediately at link time, or defer it — both are equivalent:
+
+- **Later, from this machine**: re-run `bootstrap-workspace --with-workspace`
+  (no `--token` needed, it reuses the stored credential).
+- **From the control plane** (e.g. a "provision this host" button in
+  aw-console): no need to come back to this machine at all — a lean-linked
+  host already answers the same `"bootstrap"` verb over `/link` that
+  `src/api/placement/remote_host_driver.py` dispatches for a managed
+  workspace, which runs the exact same install code
+  (`internal/ops.Handler.Bootstrap`).
+
+`aw-remote-host status` reports `provisioned: no` for a lean link (module
+health checks are skipped — nothing was installed, so nothing to check) and
+switches to the full per-module health report once either path above has
+completed successfully.
 
 ### `--foreground` vs `--background`
 
