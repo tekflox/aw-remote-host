@@ -53,6 +53,12 @@ HOME_HOST_DIR="${AW_WORKSPACE_HOME_HOST_DIR:-${DEFAULT_HOME_HOST_DIR}}"
 WORKSPACE_UID="1001"
 WORKSPACE_GID="1001"
 
+# Opt-in passthrough for aw-app-agents-platform-runners' warm-container mode
+# (RUNNER_WARM_CONTAINER=1, default off — see that app's warm_pool.py). Only
+# forwarded into the container when the HOST's own aw-remote-host process has
+# it set, so every other BYOD host's default stays untouched.
+RUNNER_WARM_CONTAINER="${RUNNER_WARM_CONTAINER:-}"
+
 if [ -z "${AW_WORKSPACE_HOST_DIR:-}" ] && [ ! -e "$DEFAULT_HOST_DIR" ] && [ -e "$LEGACY_HOST_DIR" ]; then
   if podman container exists "$CONTAINER_NAME"; then
     echo "workspace: removing existing container before host-dir migration"
@@ -189,6 +195,10 @@ if podman container exists "$CONTAINER_NAME"; then
       | grep -qx "$CONTAINER_HOME"; then
     echo "workspace: existing container has no persistent \$HOME mount — recreating so CLI logins survive updates"
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  elif [ -n "$RUNNER_WARM_CONTAINER" ] && ! podman inspect "$CONTAINER_NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      | grep -qx "RUNNER_WARM_CONTAINER=${RUNNER_WARM_CONTAINER}"; then
+    echo "workspace: RUNNER_WARM_CONTAINER changed — recreating to pick it up"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 fi
 
@@ -221,6 +231,7 @@ else
     -e AW_WORKSPACE_HOST_DIR="$HOST_DIR" \
     -e AW_WORKSPACE_CONTAINER_DIR="$CONTAINER_WORKDIR" \
     -e AW_WORKSPACE_HOME_HOST_DIR="$HOME_HOST_DIR" \
+    ${RUNNER_WARM_CONTAINER:+-e RUNNER_WARM_CONTAINER="$RUNNER_WARM_CONTAINER"} \
     "$IMAGE"
 fi
 
