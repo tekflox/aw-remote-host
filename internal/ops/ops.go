@@ -31,6 +31,14 @@ const (
 	PostgresContainer  = "aw-remote-host-postgres"
 	RedisContainer     = "aw-remote-host-redis"
 	PostgresVolume     = "aw-remote-host-postgres-data"
+	// Postgres/redis data moved out of podman named volumes and onto $HOME —
+	// podman's storage lives in the aw-remote-host container's writable layer
+	// on a containerised host, so an update's `docker rm -f` destroyed it.
+	// Keep these in sync with bootstrap/{postgres,redis}/install.sh.
+	PostgresHostDirEnv = "AW_POSTGRES_HOST_DIR"
+	PostgresDirName    = "postgres-data"
+	RedisHostDirEnv    = "AW_REDIS_HOST_DIR"
+	RedisDirName       = "redis-data"
 	RedisVolume        = "aw-remote-host-redis-data"
 	HealthURL          = "http://127.0.0.1:9030/api/health"
 
@@ -240,9 +248,27 @@ func (h *Handler) Uninstall(ctx context.Context, emit Emit) (map[string]any, err
 			errs = append(errs, fmt.Sprintf("remove container %s: %v", name, err))
 		}
 	}
+	// Legacy named volumes: still removed so a host that predates the move to
+	// host data dirs (see bootstrap/postgres/install.sh) is torn down fully.
 	for _, vol := range []string{PostgresVolume, RedisVolume} {
 		if _, err := h.runner().Run(ctx, "podman", "volume", "rm", "-f", vol); err != nil {
 			errs = append(errs, fmt.Sprintf("remove volume %s: %v", vol, err))
+		}
+	}
+	// Where postgres/redis data actually lives now. Without this, "uninstall
+	// AND its data" would silently leave the databases on disk and a later
+	// bootstrap would adopt the old data instead of starting clean.
+	for _, d := range []struct{ env, name string }{
+		{PostgresHostDirEnv, PostgresDirName},
+		{RedisHostDirEnv, RedisDirName},
+	} {
+		dir, err := dataHostDir(d.env, d.name)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("resolve %s dir: %v", d.name, err))
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			errs = append(errs, fmt.Sprintf("remove data dir %s: %v", dir, err))
 		}
 	}
 	if len(errs) > 0 {
@@ -459,6 +485,21 @@ func restartHostServiceSoon(slug string) error {
 // passes.
 func (h *Handler) Bootstrap(ctx context.Context, opts BootstrapOpts, emit Emit) (map[string]any, error) {
 	return h.runModules(ctx, opts, true, emit)
+}
+
+// dataHostDir resolves a sibling data dir under the same $HOME the workspace
+// host dir lives in, honouring an explicit env override first — mirroring the
+// ${HOME}/<name> + AW_*_HOST_DIR convention the bootstrap install.sh scripts
+// use, so both sides agree on where the data is.
+func dataHostDir(envVar, name string) (string, error) {
+	if dir := strings.TrimSpace(os.Getenv(envVar)); dir != "" {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	return filepath.Join(home, name), nil
 }
 
 func workspaceHostDir() (string, error) {
