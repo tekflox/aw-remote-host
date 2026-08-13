@@ -1,12 +1,15 @@
 // Package shell implements Phase 3's PTY channel — the host side of the
 // pty_open/pty_input/pty_output/pty_resize/pty_close frames link.go's pump()
 // dispatches (see that file's module docstring for the frame protocol,
-// mirrored in aw-backend's src/api/routes/host_link.py). Each pty_open
-// spawns an interactive shell INSIDE the workspace container
-// (`podman exec -it aw-remote-host-workspace bash`, falling back to `sh`
-// if bash isn't installed in the image) and streams its stdout/stderr back
-// as pty_output frames, keyed by the session id the browser/control-plane
-// picked — multiple concurrent sessions are supported.
+// mirrored in aw-backend's src/api/routes/host_link.py). Each pty_open spawns
+// an interactive shell and streams its stdout/stderr back as pty_output
+// frames, keyed by the session id the browser/control-plane picked —
+// multiple concurrent sessions are supported.
+//
+// pty_open's "target" field picks WHICH MACHINE: "workspace" (or absent, for
+// control planes older than the field) runs `podman exec -it
+// aw-remote-host-workspace`, "host" runs the shell right here, on the box
+// this process is running on. Bash with an `sh` fallback either way.
 package shell
 
 import (
@@ -16,6 +19,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/creack/pty"
@@ -55,26 +59,86 @@ func (e *execPTY) Close() error {
 	return nil
 }
 
-// Spawner starts a new PTY-backed shell process. Overridable in tests so
-// they never touch a real podman/creack-pty.
-type Spawner func(ctx context.Context) (PTY, error)
+// Where a pty_open lands. These are two genuinely different machines, not a
+// convenience flag: TargetWorkspace is inside the podman-managed workspace
+// container, TargetHost is the box running this aw-remote-host process itself
+// — which for a containerised deployment is that container, and for a bare
+// metal deployment is the metal.
+const (
+	TargetWorkspace = "workspace"
+	TargetHost      = "host"
+)
 
-// DefaultSpawner runs an interactive shell inside the workspace container.
-// The bash-then-sh fallback happens INSIDE the container (via `sh -c`): detect
-// bash with `command -v` (redirecting only the *probe's* output), then exec it
-// WITHOUT redirecting the shell's own stderr — an interactive bash writes its
-// prompt (PS1) and readline UI to stderr, so the old `exec bash 2>/dev/null`
-// silently discarded the prompt and the session looked dead until you typed a
-// command whose stdout happened to show. `exec` replaces the process but keeps
-// fd redirections, which is exactly why that redirection leaked into the shell.
-func DefaultSpawner(ctx context.Context) (PTY, error) {
-	cmd := exec.CommandContext(ctx, "podman", "exec", "-it", ops.WorkspaceContainer,
-		"sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh")
+// resolveTarget maps a pty_open's target field onto one of the two constants.
+// An absent/empty target means TargetWorkspace, NOT TargetHost: the console's
+// browser terminal has always sent no target and has always landed in the
+// workspace container, and a control plane newer than this binary must not be
+// able to silently redirect an existing session onto the host. Any unknown
+// value is an error rather than a default, so a typo fails loudly instead of
+// opening a shell somewhere the caller did not ask for.
+func resolveTarget(target string) (string, error) {
+	switch target {
+	case "", TargetWorkspace:
+		return TargetWorkspace, nil
+	case TargetHost:
+		return TargetHost, nil
+	default:
+		return "", fmt.Errorf("unknown pty target %q (expected %q or %q)", target, TargetHost, TargetWorkspace)
+	}
+}
+
+// Spawner starts a new PTY-backed shell process on target. Overridable in
+// tests so they never touch a real podman/creack-pty.
+type Spawner func(ctx context.Context, target string) (PTY, error)
+
+// interactiveShell is the command both targets run: detect bash with
+// `command -v` (redirecting only the *probe's* output), then exec it WITHOUT
+// redirecting the shell's own stderr — an interactive bash writes its prompt
+// (PS1) and readline UI to stderr, so the old `exec bash 2>/dev/null` silently
+// discarded the prompt and the session looked dead until you typed a command
+// whose stdout happened to show. `exec` replaces the process but keeps fd
+// redirections, which is exactly why that redirection leaked into the shell.
+const interactiveShell = "command -v bash >/dev/null 2>&1 && exec bash || exec sh"
+
+// DefaultSpawner runs an interactive shell on target — inside the workspace
+// container via podman exec, or directly on this host.
+//
+// The host branch is NOT `podman exec` minus the podman: it is this process's
+// own environment, so it inherits whatever aw-remote-host was started with.
+// That makes TERM the one thing worth forcing — a shell spawned from a systemd
+// unit or a container entrypoint has no TERM at all, and bash then falls back
+// to `dumb`, which kills arrow keys, colour and every full-screen program
+// (vim, top) the interactive shell exists for.
+func DefaultSpawner(ctx context.Context, target string) (PTY, error) {
+	resolved, err := resolveTarget(target)
+	if err != nil {
+		return nil, err
+	}
+
+	var cmd *exec.Cmd
+	if resolved == TargetHost {
+		cmd = exec.CommandContext(ctx, "sh", "-c", interactiveShell)
+		cmd.Env = withTerm(os.Environ())
+	} else {
+		cmd = exec.CommandContext(ctx, "podman", "exec", "-it", ops.WorkspaceContainer,
+			"sh", "-c", interactiveShell)
+	}
+
 	f, err := pty.Start(cmd)
 	if err != nil {
-		return nil, fmt.Errorf("start pty: %w", err)
+		return nil, fmt.Errorf("start pty (%s): %w", resolved, err)
 	}
 	return &execPTY{cmd: cmd, f: f}, nil
+}
+
+// withTerm returns env with a usable TERM, leaving an existing one alone.
+func withTerm(env []string) []string {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "TERM=") && kv != "TERM=" {
+			return env
+		}
+	}
+	return append(env, "TERM=xterm-256color")
 }
 
 // EmitFunc sends a pty_output frame for sessionID back over the /link
@@ -106,9 +170,11 @@ func NewManager(spawner Spawner, emit EmitFunc) *Manager {
 	return &Manager{sessions: map[string]*session{}, spawner: spawner, emit: emit}
 }
 
-// Open spawns a new PTY for id and starts pumping its output as pty_output
-// frames. Returns an error if id is already open or the spawn fails.
-func (m *Manager) Open(ctx context.Context, id string, cols, rows uint16) error {
+// Open spawns a new PTY for id on target ("host", "workspace", or "" for the
+// workspace container) and starts pumping its output as pty_output frames.
+// Returns an error if id is already open, target is unknown, or the spawn
+// fails.
+func (m *Manager) Open(ctx context.Context, id string, cols, rows uint16, target string) error {
 	m.mu.Lock()
 	if _, exists := m.sessions[id]; exists {
 		m.mu.Unlock()
@@ -116,7 +182,7 @@ func (m *Manager) Open(ctx context.Context, id string, cols, rows uint16) error 
 	}
 	m.mu.Unlock()
 
-	p, err := m.spawner(ctx)
+	p, err := m.spawner(ctx, target)
 	if err != nil {
 		return err
 	}

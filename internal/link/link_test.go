@@ -296,6 +296,7 @@ func TestRunFallsBackToExplicitBootstrapTokenWhenStoredCredentialIsRejected(t *t
 type fakeShellManager struct {
 	mu      sync.Mutex
 	opened  []string
+	targets []string
 	input   map[string][]byte
 	resized map[string][2]uint16
 	closed  []string
@@ -307,13 +308,14 @@ func newFakeShellManager(emit func(id, dataB64 string)) *fakeShellManager {
 	return &fakeShellManager{input: map[string][]byte{}, resized: map[string][2]uint16{}, emit: emit}
 }
 
-func (f *fakeShellManager) Open(_ context.Context, id string, cols, rows uint16) error {
+func (f *fakeShellManager) Open(_ context.Context, id string, cols, rows uint16, target string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.openErr != nil {
 		return f.openErr
 	}
 	f.opened = append(f.opened, id)
+	f.targets = append(f.targets, target)
 	if f.emit != nil {
 		f.emit(id, "aGVsbG8=") // "hello", proves the emit path is wired end to end
 	}
@@ -458,5 +460,61 @@ func TestRunFailsFastWithNoTokenAndNoStoredCredential(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no token available") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestPTYOpenForwardsTarget covers the field that decides WHICH MACHINE the
+// shell lands on — the workspace container or the box running this process.
+// Dropping it silently would open a session on the wrong host, which is
+// exactly the failure a user cannot detect from the prompt alone.
+func TestPTYOpenForwardsTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		frame map[string]any
+		want  string
+	}{
+		{"host", map[string]any{"op": "pty_open", "id": "s1", "target": "host"}, "host"},
+		{"workspace", map[string]any{"op": "pty_open", "id": "s1", "target": "workspace"}, "workspace"},
+		// A control plane older than the field sends no target at all; the
+		// shell package turns "" into the workspace container, so what matters
+		// here is only that link.go doesn't invent a value.
+		{"absent", map[string]any{"op": "pty_open", "id": "s1"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newFakeLinkServer()
+			srv.acceptTokens["awbs_test"] = "awlk_minted"
+			srv.framesToSend = []map[string]any{tc.frame}
+			ts := httptest.NewServer(srv)
+			defer ts.Close()
+
+			credPath := filepath.Join(t.TempDir(), "credentials.json")
+			c := New(ts.URL, "awbs_test")
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			var mgr *fakeShellManager
+			done := make(chan error, 1)
+			go func() {
+				done <- c.Run(ctx, credPath, RunCallbacks{
+					OnShell: func(emit func(id, dataB64 string)) ShellManager {
+						mgr = newFakeShellManager(emit)
+						return mgr
+					},
+				})
+			}()
+
+			time.Sleep(200 * time.Millisecond)
+			cancel()
+			<-done
+
+			if mgr == nil {
+				t.Fatal("OnShell was never called")
+			}
+			mgr.mu.Lock()
+			defer mgr.mu.Unlock()
+			if len(mgr.targets) != 1 || mgr.targets[0] != tc.want {
+				t.Errorf("targets = %v, want [%q]", mgr.targets, tc.want)
+			}
+		})
 	}
 }

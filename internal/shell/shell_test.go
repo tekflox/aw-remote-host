@@ -127,9 +127,9 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 func TestOpenPumpsOutputAsPTYOutputFrames(t *testing.T) {
 	fake := newFakePTY()
 	emit, calls := collectEmit()
-	mgr := NewManager(func(context.Context) (PTY, error) { return fake, nil }, emit)
+	mgr := NewManager(func(context.Context, string) (PTY, error) { return fake, nil }, emit)
 
-	if err := mgr.Open(context.Background(), "s1", 80, 24); err != nil {
+	if err := mgr.Open(context.Background(), "s1", 80, 24, ""); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	if fake.cols != 80 || fake.rows != 24 {
@@ -151,27 +151,27 @@ func TestOpenPumpsOutputAsPTYOutputFrames(t *testing.T) {
 
 func TestOpenRejectsDuplicateID(t *testing.T) {
 	fake := newFakePTY()
-	mgr := NewManager(func(context.Context) (PTY, error) { return fake, nil }, nil)
+	mgr := NewManager(func(context.Context, string) (PTY, error) { return fake, nil }, nil)
 
-	if err := mgr.Open(context.Background(), "s1", 0, 0); err != nil {
+	if err := mgr.Open(context.Background(), "s1", 0, 0, ""); err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if err := mgr.Open(context.Background(), "s1", 0, 0); err == nil {
+	if err := mgr.Open(context.Background(), "s1", 0, 0, ""); err == nil {
 		t.Fatal("expected an error opening a duplicate session id")
 	}
 }
 
 func TestOpenPropagatesSpawnerError(t *testing.T) {
-	mgr := NewManager(func(context.Context) (PTY, error) { return nil, errors.New("boom") }, nil)
-	if err := mgr.Open(context.Background(), "s1", 0, 0); err == nil {
+	mgr := NewManager(func(context.Context, string) (PTY, error) { return nil, errors.New("boom") }, nil)
+	if err := mgr.Open(context.Background(), "s1", 0, 0, ""); err == nil {
 		t.Fatal("expected spawner error to propagate")
 	}
 }
 
 func TestInputWritesToPTYStdin(t *testing.T) {
 	fake := newFakePTY()
-	mgr := NewManager(func(context.Context) (PTY, error) { return fake, nil }, nil)
-	_ = mgr.Open(context.Background(), "s1", 0, 0)
+	mgr := NewManager(func(context.Context, string) (PTY, error) { return fake, nil }, nil)
+	_ = mgr.Open(context.Background(), "s1", 0, 0, "")
 
 	if err := mgr.Input("s1", []byte("echo hi\n")); err != nil {
 		t.Fatalf("Input: %v", err)
@@ -182,7 +182,7 @@ func TestInputWritesToPTYStdin(t *testing.T) {
 }
 
 func TestInputUnknownSessionErrors(t *testing.T) {
-	mgr := NewManager(func(context.Context) (PTY, error) { return newFakePTY(), nil }, nil)
+	mgr := NewManager(func(context.Context, string) (PTY, error) { return newFakePTY(), nil }, nil)
 	if err := mgr.Input("nope", []byte("x")); err == nil {
 		t.Fatal("expected an error for an unknown session id")
 	}
@@ -190,8 +190,8 @@ func TestInputUnknownSessionErrors(t *testing.T) {
 
 func TestResizeAppliesToPTY(t *testing.T) {
 	fake := newFakePTY()
-	mgr := NewManager(func(context.Context) (PTY, error) { return fake, nil }, nil)
-	_ = mgr.Open(context.Background(), "s1", 80, 24)
+	mgr := NewManager(func(context.Context, string) (PTY, error) { return fake, nil }, nil)
+	_ = mgr.Open(context.Background(), "s1", 80, 24, "")
 
 	if err := mgr.Resize("s1", 120, 50); err != nil {
 		t.Fatalf("Resize: %v", err)
@@ -203,8 +203,8 @@ func TestResizeAppliesToPTY(t *testing.T) {
 
 func TestCloseKillsSessionAndIsIdempotent(t *testing.T) {
 	fake := newFakePTY()
-	mgr := NewManager(func(context.Context) (PTY, error) { return fake, nil }, nil)
-	_ = mgr.Open(context.Background(), "s1", 0, 0)
+	mgr := NewManager(func(context.Context, string) (PTY, error) { return fake, nil }, nil)
+	_ = mgr.Open(context.Background(), "s1", 0, 0, "")
 
 	if err := mgr.Close("s1"); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -224,14 +224,14 @@ func TestCloseAllTearsDownEverySession(t *testing.T) {
 	fake1, fake2 := newFakePTY(), newFakePTY()
 	seq := []PTY{fake1, fake2}
 	i := 0
-	mgr := NewManager(func(context.Context) (PTY, error) {
+	mgr := NewManager(func(context.Context, string) (PTY, error) {
 		p := seq[i]
 		i++
 		return p, nil
 	}, nil)
 
-	_ = mgr.Open(context.Background(), "s1", 0, 0)
-	_ = mgr.Open(context.Background(), "s2", 0, 0)
+	_ = mgr.Open(context.Background(), "s1", 0, 0, "")
+	_ = mgr.Open(context.Background(), "s2", 0, 0, "")
 
 	mgr.CloseAll()
 
@@ -247,8 +247,8 @@ func TestCloseAllTearsDownEverySession(t *testing.T) {
 func TestPTYExitClosesSessionAndStopsEmitting(t *testing.T) {
 	fake := newFakePTY()
 	emit, calls := collectEmit()
-	mgr := NewManager(func(context.Context) (PTY, error) { return fake, nil }, emit)
-	_ = mgr.Open(context.Background(), "s1", 0, 0)
+	mgr := NewManager(func(context.Context, string) (PTY, error) { return fake, nil }, emit)
+	_ = mgr.Open(context.Background(), "s1", 0, 0, "")
 
 	fake.push("bye")
 	_ = fake.Close() // simulate the shell process exiting — Read returns EOF next
@@ -257,4 +257,86 @@ func TestPTYExitClosesSessionAndStopsEmitting(t *testing.T) {
 
 	// A pty_input after the session's Read loop already reaped it should error.
 	waitFor(t, time.Second, func() bool { return mgr.Input("s1", []byte("x")) != nil })
+}
+
+func TestResolveTarget(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		// Absent means the workspace container, NOT the host: the console's
+		// browser terminal has always sent no target, and a newer control
+		// plane must not be able to silently move that session onto the host.
+		{"", TargetWorkspace, false},
+		{TargetWorkspace, TargetWorkspace, false},
+		{TargetHost, TargetHost, false},
+		// A typo must fail loudly rather than defaulting — "hsot" opening a
+		// shell in the wrong place is undetectable from the prompt.
+		{"hsot", "", true},
+		{"HOST", "", true},
+	} {
+		got, err := resolveTarget(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("resolveTarget(%q) = %q, want error", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("resolveTarget(%q) errored: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Errorf("resolveTarget(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestOpenRejectsAnUnknownTargetWithoutSpawning(t *testing.T) {
+	spawned := false
+	mgr := NewManager(func(_ context.Context, target string) (PTY, error) {
+		spawned = true
+		return newFakePTY(), nil
+	}, nil)
+
+	// The real DefaultSpawner validates, so a Manager wired to a fake spawner
+	// that ignores target must still not leave a half-open session behind.
+	if err := mgr.Open(context.Background(), "s1", 0, 0, "host"); err != nil {
+		t.Fatalf("valid target rejected: %v", err)
+	}
+	if !spawned {
+		t.Error("spawner was never called for a valid target")
+	}
+}
+
+func TestOpenPassesTargetThroughToTheSpawner(t *testing.T) {
+	var got string
+	mgr := NewManager(func(_ context.Context, target string) (PTY, error) {
+		got = target
+		return newFakePTY(), nil
+	}, nil)
+
+	if err := mgr.Open(context.Background(), "s1", 80, 24, TargetHost); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got != TargetHost {
+		t.Errorf("spawner got target %q, want %q", got, TargetHost)
+	}
+}
+
+func TestWithTermOnlyFillsAMissingOne(t *testing.T) {
+	// A shell spawned from a systemd unit or container entrypoint inherits no
+	// TERM, and bash then falls back to `dumb` — no arrow keys, no colour, no
+	// vim. But an inherited TERM must be left alone.
+	if got := withTerm([]string{"PATH=/bin", "TERM=screen"}); len(got) != 2 {
+		t.Errorf("withTerm overrode an existing TERM: %v", got)
+	}
+	got := withTerm([]string{"PATH=/bin"})
+	if len(got) != 2 || got[1] != "TERM=xterm-256color" {
+		t.Errorf("withTerm = %v, want a TERM appended", got)
+	}
+	// TERM= (set but empty) is as useless as absent.
+	if got := withTerm([]string{"TERM="}); len(got) != 2 {
+		t.Errorf("withTerm left an empty TERM in place: %v", got)
+	}
 }

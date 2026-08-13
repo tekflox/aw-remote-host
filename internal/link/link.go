@@ -216,7 +216,7 @@ type CommandHandler func(ctx context.Context, verb string, args map[string]any, 
 // fresh per connection by NewShellManagerFunc, torn down via CloseAll when
 // the connection drops).
 type ShellManager interface {
-	Open(ctx context.Context, id string, cols, rows uint16) error
+	Open(ctx context.Context, id string, cols, rows uint16, target string) error
 	Input(id string, data []byte) error
 	Resize(id string, cols, rows uint16) error
 	Close(id string) error
@@ -436,6 +436,15 @@ func ptyDims(msg map[string]any) (id string, cols, rows uint16) {
 	return
 }
 
+// ptyTarget reads pty_open's optional "target" field — "host" for a shell on
+// the box running this process, "workspace" (or absent, for control planes
+// older than the field) for the workspace container. Validation belongs to the
+// shell package, which owns what the values mean; this only extracts.
+func ptyTarget(msg map[string]any) string {
+	target, _ := msg["target"].(string)
+	return target
+}
+
 // handlePTYOpen spawns the session in its own goroutine — podman-exec
 // startup can take a noticeable moment and must not block the read loop
 // (same rationale as handleCmd). A spawn failure is reported as a
@@ -447,8 +456,9 @@ func handlePTYOpen(ctx context.Context, fw *frameWriter, msg map[string]any, mgr
 		_ = fw.WriteJSON(map[string]any{"op": "pty_close", "id": id, "reason": "no shell manager registered on this host"})
 		return
 	}
+	target := ptyTarget(msg)
 	go func() {
-		if err := mgr.Open(ctx, id, cols, rows); err != nil {
+		if err := mgr.Open(ctx, id, cols, rows, target); err != nil {
 			_ = fw.WriteJSON(map[string]any{"op": "pty_close", "id": id, "reason": err.Error()})
 		}
 	}()
