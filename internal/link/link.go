@@ -245,6 +245,21 @@ type TunnelProxy interface {
 	CloseAllWS()
 }
 
+// TCPProxy is the OPTIONAL tcp_* half of the tunnel — a proxy that can also
+// dial an arbitrary host:port from this machine (see internal/tcpproxy).
+// Deliberately a separate interface, type-asserted at dispatch: an older or
+// narrower TunnelProxy that only knows http/ws still satisfies TunnelProxy,
+// and its tcp_open frames are answered with a close+reason instead of a
+// compile error or a panic.
+type TCPProxy interface {
+	OpenTCP(ctx context.Context, id, host string, port int,
+		sendData func(id string, data []byte),
+		onEOF func(id string, reason string)) error
+	SendTCP(id string, data []byte) error
+	CloseTCP(id string) error
+	CloseAllTCP()
+}
+
 // NewTunnelProxyFunc builds a fresh TunnelProxy for one live connection.
 type NewTunnelProxyFunc func() TunnelProxy
 
@@ -400,6 +415,12 @@ func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler, new
 			handleWSMsg(msg, proxy)
 		case "ws_close":
 			handleWSClose(msg, proxy)
+		case "tcp_open":
+			handleTCPOpen(ctx, fw, msg, proxy)
+		case "tcp_data":
+			handleTCPData(msg, proxy)
+		case "tcp_close":
+			handleTCPClose(msg, proxy)
 		}
 	}
 }
@@ -607,6 +628,75 @@ func handleWSClose(msg map[string]any, proxy TunnelProxy) {
 	}
 	id, _ := msg["id"].(string)
 	_ = proxy.CloseWS(id)
+}
+
+// tcpOf returns the proxy's tcp half, or nil when this build/implementation
+// does not have one.
+func tcpOf(proxy TunnelProxy) TCPProxy {
+	t, _ := proxy.(TCPProxy)
+	return t
+}
+
+func handleTCPOpen(ctx context.Context, fw *frameWriter, msg map[string]any, proxy TunnelProxy) {
+	id, _ := msg["id"].(string)
+	host, _ := msg["host"].(string)
+	port := 0
+	if p, ok := msg["port"].(float64); ok {
+		port = int(p)
+	}
+
+	tcp := tcpOf(proxy)
+	if tcp == nil {
+		_ = fw.WriteJSON(map[string]any{
+			"op": "tcp_close", "id": id, "reason": "no tcp proxy registered on this host"})
+		return
+	}
+
+	// Dial off the read loop: a connect can take up to dialTimeout, and
+	// blocking pump() there would stall every other frame on the tunnel
+	// (same rationale as handleWSOpen/handleCmd).
+	go func() {
+		err := tcp.OpenTCP(ctx, id, host, port,
+			func(id string, data []byte) {
+				_ = fw.WriteJSON(map[string]any{
+					"op": "tcp_data", "id": id,
+					"data": base64.StdEncoding.EncodeToString(data)})
+			},
+			func(id string, reason string) {
+				_ = fw.WriteJSON(map[string]any{"op": "tcp_close", "id": id, "reason": reason})
+			})
+		if err != nil {
+			_ = fw.WriteJSON(map[string]any{"op": "tcp_close", "id": id, "reason": err.Error()})
+			return
+		}
+		// Tell the control plane the socket is up, so it can distinguish
+		// "connected, waiting for the server to speak first" (which is exactly
+		// what RFB does) from "still dialing".
+		_ = fw.WriteJSON(map[string]any{"op": "tcp_open_ok", "id": id})
+	}()
+}
+
+func handleTCPData(msg map[string]any, proxy TunnelProxy) {
+	tcp := tcpOf(proxy)
+	if tcp == nil {
+		return
+	}
+	id, _ := msg["id"].(string)
+	dataB64, _ := msg["data"].(string)
+	data, err := base64.StdEncoding.DecodeString(dataB64)
+	if err != nil {
+		return
+	}
+	_ = tcp.SendTCP(id, data)
+}
+
+func handleTCPClose(msg map[string]any, proxy TunnelProxy) {
+	tcp := tcpOf(proxy)
+	if tcp == nil {
+		return
+	}
+	id, _ := msg["id"].(string)
+	_ = tcp.CloseTCP(id)
 }
 
 func sleepBackoff(ctx context.Context, d time.Duration) bool {

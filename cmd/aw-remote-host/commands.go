@@ -23,6 +23,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/servicemgr"
 	"github.com/tekflox/aw-remote-host/internal/shell"
 	"github.com/tekflox/aw-remote-host/internal/state"
+	"github.com/tekflox/aw-remote-host/internal/tcpproxy"
 	"github.com/tekflox/aw-remote-host/internal/tunnelproxy"
 	"github.com/tekflox/aw-remote-host/internal/updater"
 )
@@ -270,7 +271,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 				return shell.NewManager(nil, shell.EmitFunc(emit))
 			},
 			OnTunnelProxy: func() link.TunnelProxy {
-				return tunnelproxy.NewHandler()
+				return newLinkProxy()
 			},
 		})
 	}()
@@ -514,3 +515,60 @@ func runUnlink(args []string) error {
 	fmt.Println("unlink: removed local credentials")
 	return nil
 }
+
+
+
+// linkProxy is what one live /link connection is handed: tunnelproxy's
+// http_req/ws_* half (a reverse proxy onto the local workspace server) plus
+// tcpproxy's tcp_* half (an arbitrary host:port dialled from this machine).
+//
+// Composed HERE rather than by embedding one package in the other, because
+// they answer different questions — "proxy my known local service" vs "reach
+// something on my network" — and neither should have to import the other to
+// stay usable alone. Forwarded explicitly rather than by struct embedding:
+// both types are named Handler, so embedding both is a duplicate-field
+// compile error.
+type linkProxy struct {
+	web *tunnelproxy.Handler
+	tcp *tcpproxy.Handler
+}
+
+func newLinkProxy() *linkProxy {
+	return &linkProxy{web: tunnelproxy.NewHandler(), tcp: &tcpproxy.Handler{}}
+}
+
+func (p *linkProxy) ServeHTTP(ctx context.Context, id, method, path string,
+	headers map[string]string, body []byte,
+	head func(id string, status int, headers map[string]string),
+	chunk func(id string, data []byte), end func(id string)) {
+	p.web.ServeHTTP(ctx, id, method, path, headers, body, head, chunk, end)
+}
+
+func (p *linkProxy) OpenWS(ctx context.Context, id, path string, headers map[string]string,
+	sendMsg func(id string, data []byte, isText bool)) error {
+	return p.web.OpenWS(ctx, id, path, headers, sendMsg)
+}
+
+func (p *linkProxy) WSMessage(id string, data []byte, isText bool) error {
+	return p.web.WSMessage(id, data, isText)
+}
+
+func (p *linkProxy) CloseWS(id string) error { return p.web.CloseWS(id) }
+
+// CloseAllWS is what link calls when the connection drops. The tcp sessions
+// are just as dead at that moment — nothing can deliver another tcp_data for
+// them — so drain both here rather than leaking every dialled socket for the
+// life of the process.
+func (p *linkProxy) CloseAllWS() {
+	p.web.CloseAllWS()
+	p.tcp.CloseAllTCP()
+}
+
+func (p *linkProxy) OpenTCP(ctx context.Context, id, host string, port int,
+	sendData func(id string, data []byte), onEOF func(id string, reason string)) error {
+	return p.tcp.OpenTCP(ctx, id, host, port, sendData, onEOF)
+}
+
+func (p *linkProxy) SendTCP(id string, data []byte) error { return p.tcp.SendTCP(id, data) }
+func (p *linkProxy) CloseTCP(id string) error            { return p.tcp.CloseTCP(id) }
+func (p *linkProxy) CloseAllTCP()                        { p.tcp.CloseAllTCP() }
