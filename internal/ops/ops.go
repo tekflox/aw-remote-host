@@ -108,10 +108,12 @@ type Handler struct {
 
 // Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|"update"|
 // "self-update"|"uninstall"|"health"|"exec_start"|"exec_status"|"exec_wait"|
-// "exec_kill"|"list_processes") — the switchboard link.go's cmd-frame handling
-// calls into. args carries optional per-verb parameters such as the exact
-// aw-workspace image version to install for workspace updates, or the shell
-// command/timeout/job_id the exec_* verbs take (see ops_exec.go).
+// "exec_kill"|"list_processes"|"fs_stat"|"fs_list"|"fs_mkdir"|"fs_delete"|
+// "fs_read_chunk"|"fs_write_chunk") — the switchboard link.go's cmd-frame
+// handling calls into. args carries optional per-verb parameters such as the
+// exact aw-workspace image version to install for workspace updates, the shell
+// command/timeout/job_id the exec_* verbs take (see ops_exec.go), or the
+// path/offset/chunk the fs_* verbs take (see ops_fs.go).
 func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any, emit Emit) (any, error) {
 	switch verb {
 	case "stop":
@@ -140,6 +142,18 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.ExecKill(ctx, args, emit)
 	case "list_processes":
 		return h.ListProcesses(ctx), nil
+	case "fs_stat":
+		return h.FsStat(ctx, args)
+	case "fs_list":
+		return h.FsList(ctx, args)
+	case "fs_mkdir":
+		return h.FsMkdir(ctx, args)
+	case "fs_delete":
+		return h.FsDelete(ctx, args)
+	case "fs_read_chunk":
+		return h.FsReadChunk(ctx, args)
+	case "fs_write_chunk":
+		return h.FsWriteChunk(ctx, args)
 	default:
 		return nil, fmt.Errorf("unknown verb %q", verb)
 	}
