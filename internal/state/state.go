@@ -25,6 +25,17 @@ type State struct {
 	// --with-workspace run sets it permanently true (never reset back to
 	// false; re-provisioning doesn't "undo" a prior install).
 	Provisioned bool `json:"provisioned,omitempty"`
+	// HostPower is what the operator ASKED for via --host-power (grant names,
+	// or the ones "all" expanded to) — not what this host can deliver.
+	//
+	// The request is what persists, and the probe re-runs on every bootstrap
+	// and every `status`, on purpose: a machine that gains /dev/kvm later
+	// (nested virt enabled, the user added to the kvm group) starts offering
+	// it without anyone remembering to re-run the flag. Storing the effective
+	// set instead would freeze a "no" that has since become a "yes".
+	//
+	// Empty on every host that never opted in, which is the default.
+	HostPower []string `json:"host_power,omitempty"`
 }
 
 // DefaultPath returns ~/.aw-remote-host/state.json.

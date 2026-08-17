@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
+	"github.com/tekflox/aw-remote-host/internal/hostpower"
 	"github.com/tekflox/aw-remote-host/internal/lanfastpath"
 	"github.com/tekflox/aw-remote-host/internal/link"
 	"github.com/tekflox/aw-remote-host/internal/ops"
@@ -54,6 +55,68 @@ func reportStatuses(statuses []bootstrap.ModuleStatus) {
 			fmt.Printf("%s: FAILED\n", st.Module)
 		}
 	}
+}
+
+// parseHostPowerFlag reads --host-power. The bool says whether the flag was
+// GIVEN, which is different from whether it parsed to something non-empty:
+// omitting it must leave a previously stored grant alone, while an explicit
+// --host-power=none must revoke it. Collapsing those two into "is the list
+// empty" would make every plain re-run silently disarm the host.
+func parseHostPowerFlag(fs *flag.FlagSet, raw string) ([]string, bool, error) {
+	given := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "host-power" {
+			given = true
+		}
+	})
+	if !given {
+		return nil, false, nil
+	}
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == "none" || trimmed == "" {
+		return nil, true, nil
+	}
+	grants, err := hostpower.Parse(raw)
+	if err != nil {
+		return nil, false, err
+	}
+	return grants, true, nil
+}
+
+// resolveHostPower probes the requested grants and returns the wire value for
+// AW_HOST_POWER — the EFFECTIVE set, never the requested one.
+//
+// A grant this host cannot deliver is reported and dropped, not fatal:
+// --host-power=all on a machine without binder devices should grant the rest.
+// What must not happen is the request being passed on as though it succeeded,
+// because then the workspace lets an app load that will come up without the
+// device it needs.
+func resolveHostPower(requested []string) (string, error) {
+	if len(requested) == 0 {
+		return "", nil
+	}
+	res := hostpower.Resolve(requested)
+	for _, name := range requested {
+		if reason, denied := res.Refused[name]; denied {
+			fmt.Fprintf(os.Stderr, "host-power: %s NOT granted — %s\n", name, reason)
+		}
+	}
+	if len(res.Effective) == 0 {
+		return "", fmt.Errorf(
+			"host-power: none of %s can be delivered by this host — see the reasons above",
+			strings.Join(requested, ","))
+	}
+	fmt.Printf("host-power: %s\n", hostpower.Describe(res.Effective))
+	return hostpower.Format(res.Effective), nil
+}
+
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 func confirm(prompt string) bool {
@@ -94,7 +157,16 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		withWorkspace = fs.Bool("with-workspace", false, "also install/start the full local runtime (podman, postgres+pgvector, redis, the aw-workspace container) — default is a LEAN link: register this machine and hold /link (enables exec_* + control-plane-driven \"bootstrap\") without provisioning anything locally. Re-run with this flag later (no --token needed once linked) to provision, or trigger it remotely via the control plane's own \"bootstrap\" verb (see README) — no need to re-run by hand.")
 		full = fs.Bool("full", false, "alias for --with-workspace")
 	}
+	hostPower := fs.String("host-power", "", "comma-separated elevated host access to grant app containers on this machine (default: none). Grants:\n"+hostpower.Help()+
+		"Only what this host can actually deliver is granted — each grant is probed, and anything undeliverable is reported, not silently assumed. An app must ALSO declare it in runtime.host_power and hold the matching host:* permission. Re-run with a different value to change it; pass --host-power=none to revoke.")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// Parse before anything else touches the disk: a typo'd grant name must
+	// abort here, not halfway through provisioning.
+	hostPowerRequested, hostPowerChanged, err := parseHostPowerFlag(fs, *hostPower)
+	if err != nil {
 		return err
 	}
 
@@ -155,6 +227,18 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		}
 	}
 
+	// Asked separately from the install confirmation above, and asked even
+	// under --yes when it is the blunt grant. --yes means "don't make me
+	// retype the obvious"; handing every app container on this machine full
+	// root-equivalent access to the host is not the obvious.
+	if hostPowerChanged && contains(hostPowerRequested, hostpower.Privileged) && !*yes {
+		fmt.Println("--host-power=privileged removes container isolation for every app that requests it on this machine: an app container gets every device and every Linux capability, which is root-equivalent access to this host.")
+		fmt.Println("Prefer naming the specific grants an app needs (e.g. --host-power=kvm,tun), or --host-power=all for every device grant without dropping isolation.")
+		if !confirm("Grant privileged anyway? [y/N] ") {
+			return fmt.Errorf("aborted")
+		}
+	}
+
 	extractDir := extractDirFor(credPath)
 	if err := bootstrap.ExtractScripts(extractDir); err != nil {
 		return fmt.Errorf("extract bootstrap scripts: %w", err)
@@ -173,6 +257,19 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		if err := state.Save(statePath, st); err != nil {
 			return err
 		}
+	}
+	// Only rewrite when the flag was actually given, so a plain re-run (or a
+	// `--with-workspace` added later) never silently revokes a grant the host
+	// is already relying on. Revoking is explicit: --host-power=none.
+	if hostPowerChanged {
+		st.HostPower = hostPowerRequested
+		if err := state.Save(statePath, st); err != nil {
+			return err
+		}
+	}
+	hostPowerEnv, err := resolveHostPower(st.HostPower)
+	if err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -199,10 +296,12 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	hostname, _ := os.Hostname()
 	c := link.New(*controlPlane, *token)
 	c.Info = link.RegisterInfo{
-		Hostname:   hostname,
-		OS:         runtime.GOOS,
-		Arch:       runtime.GOARCH,
-		CLIVersion: version,
+		Hostname:           hostname,
+		OS:                 runtime.GOOS,
+		Arch:               runtime.GOARCH,
+		CLIVersion:         version,
+		HostPower:          hostPowerEnv,
+		HostPowerRequested: hostpower.Format(st.HostPower),
 	}
 
 	type registration struct {
@@ -303,6 +402,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 				"AW_POSTGRES_PASSWORD="+st.PostgresPassword,
 				"AW_BACKEND_URL="+*controlPlane,
 				"AW_WORKSPACE_HOST_TOKEN="+reg.hostCredential,
+				"AW_HOST_POWER="+hostPowerEnv,
 			),
 		}
 		wsStatuses, err := bootstrap.Run(ctx, m.Only("workspace"), wsOpts)
@@ -379,6 +479,24 @@ func startLANFastPath(ctx context.Context, slug string) {
 	}()
 }
 
+// reportHostPowerStatus prints requested vs effective, and the delta.
+//
+// The delta is the reason this is in `status` at all: the failure this feature
+// can produce is someone believing they enabled KVM on a machine that cannot
+// provide it, and then debugging a slow VM instead of a missing device.
+func reportHostPowerStatus(requested []string) {
+	if len(requested) == 0 {
+		fmt.Println("host-power: none (app containers get no host devices — the default)")
+		return
+	}
+	res := hostpower.Resolve(requested)
+	fmt.Printf("host-power: requested %s -> effective %s\n",
+		hostpower.Format(requested), hostpower.Describe(res.Effective))
+	for name, reason := range res.Refused {
+		fmt.Printf("host-power:   %s NOT available — %s\n", name, reason)
+	}
+}
+
 func runStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	_, plan, controlPlane := commonFlags(fs)
@@ -415,6 +533,7 @@ func runStatus(args []string) error {
 	if st.WorkspaceSlug != "" {
 		fmt.Printf("workspace: %s\n", st.WorkspaceSlug)
 	}
+	reportHostPowerStatus(st.HostPower)
 
 	if mgr, mgrErr := servicemgr.Default(); mgrErr != nil {
 		fmt.Printf("service: no supported service manager (%v)\n", mgrErr)

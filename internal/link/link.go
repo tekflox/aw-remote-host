@@ -58,6 +58,17 @@ type RegisterInfo struct {
 	Arch            string
 	CLIVersion      string
 	BootstrapReport map[string]any
+	// HostPower is the elevated host access this machine grants app
+	// containers (comma-separated grant names), and HostPowerRequested is
+	// what the operator asked for. They differ when the host cannot deliver
+	// something — `--host-power=all` on a Mac has no /dev/kvm to give.
+	//
+	// Both are sent so the console badge can show the DELTA, not just the
+	// result. "You asked for kvm and this machine cannot provide it" is the
+	// one thing about this feature nobody can discover otherwise: the
+	// symptom otherwise shows up as a guest VM that is mysteriously slow.
+	HostPower          string
+	HostPowerRequested string
 }
 
 // RegisteredReply is the server's response to a register frame.
@@ -144,6 +155,12 @@ func (c *Client) registerFrame() map[string]any {
 	if c.Info.BootstrapReport != nil {
 		frame["bootstrap_report"] = c.Info.BootstrapReport
 	}
+	// Sent on every register, including reconnects, and including when empty:
+	// the backend's reconnect path only overwrites a field when the frame
+	// carries a truthy value, so a host that REVOKED its grants has to be
+	// able to say so. An empty string is a real state here, not a missing one.
+	frame["host_power"] = c.Info.HostPower
+	frame["host_power_requested"] = c.Info.HostPowerRequested
 	return frame
 }
 

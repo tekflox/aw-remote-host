@@ -59,6 +59,19 @@ WORKSPACE_GID="1001"
 # it set, so every other BYOD host's default stays untouched.
 RUNNER_WARM_CONTAINER="${RUNNER_WARM_CONTAINER:-}"
 
+# Elevated host access this machine opted into, already probed and reduced to
+# the EFFECTIVE set by internal/hostpower (see resolveHostPower in
+# cmd/aw-remote-host/commands.go). Empty on every host that never opted in.
+#
+# This is passed to the workspace as an env var, NOT as podman flags on the
+# workspace container itself. The workspace does not use these devices — it
+# creates app containers as its own siblings over the mounted podman socket,
+# and it is those containers that get --device/--cap-add, built from this same
+# grant list by src/apps/hostpower.py. Elevating the workspace container here
+# would grant access to the one process that has no use for it while leaving
+# the app that needs it unchanged.
+AW_HOST_POWER="${AW_HOST_POWER:-}"
+
 if [ -z "${AW_WORKSPACE_HOST_DIR:-}" ] && [ ! -e "$DEFAULT_HOST_DIR" ] && [ -e "$LEGACY_HOST_DIR" ]; then
   if podman container exists "$CONTAINER_NAME"; then
     echo "workspace: removing existing container before host-dir migration"
@@ -199,6 +212,14 @@ if podman container exists "$CONTAINER_NAME"; then
       | grep -qx "RUNNER_WARM_CONTAINER=${RUNNER_WARM_CONTAINER}"; then
     echo "workspace: RUNNER_WARM_CONTAINER changed — recreating to pick it up"
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  # Env is fixed at container creation, so a changed grant set only reaches the
+  # workspace through a recreate. Unlike the checks above this one compares in
+  # BOTH directions (revoking has to take effect too, or --host-power=none
+  # leaves a workspace that still believes it may elevate app containers).
+  elif [ "$(podman inspect "$CONTAINER_NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      | sed -n 's/^AW_HOST_POWER=//p' | head -n1)" != "$AW_HOST_POWER" ]; then
+    echo "workspace: AW_HOST_POWER changed (now '${AW_HOST_POWER:-none}') — recreating to pick it up"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 fi
 
@@ -232,6 +253,7 @@ else
     -e AW_WORKSPACE_CONTAINER_DIR="$CONTAINER_WORKDIR" \
     -e AW_WORKSPACE_HOME_HOST_DIR="$HOME_HOST_DIR" \
     ${RUNNER_WARM_CONTAINER:+-e RUNNER_WARM_CONTAINER="$RUNNER_WARM_CONTAINER"} \
+    -e AW_HOST_POWER="$AW_HOST_POWER" \
     "$IMAGE"
 fi
 

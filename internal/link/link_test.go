@@ -518,3 +518,33 @@ func TestPTYOpenForwardsTarget(t *testing.T) {
 		})
 	}
 }
+
+
+// The badge in aw-console reads both, and needs them on every register —
+// including a reconnect, and including when empty. An empty string is a real
+// state here (the host revoked its grants), not a missing field.
+func TestRegisterFrameCarriesHostPower(t *testing.T) {
+	c := &Client{ControlPlane: "https://example.test"}
+	c.Info = RegisterInfo{HostPower: "kvm", HostPowerRequested: "kvm,tun"}
+	frame := c.registerFrame()
+	if frame["host_power"] != "kvm" {
+		t.Fatalf("host_power = %v", frame["host_power"])
+	}
+	if frame["host_power_requested"] != "kvm,tun" {
+		t.Fatalf("host_power_requested = %v", frame["host_power_requested"])
+	}
+}
+
+func TestRegisterFrameSendsEmptyHostPowerNotOmitted(t *testing.T) {
+	c := &Client{ControlPlane: "https://example.test"}
+	frame := c.registerFrame()
+	for _, key := range []string{"host_power", "host_power_requested"} {
+		v, ok := frame[key]
+		if !ok {
+			t.Fatalf("%s must be present so a revoke can be expressed", key)
+		}
+		if v != "" {
+			t.Fatalf("%s = %v", key, v)
+		}
+	}
+}

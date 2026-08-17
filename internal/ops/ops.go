@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
+	"github.com/tekflox/aw-remote-host/internal/hostpower"
 	"github.com/tekflox/aw-remote-host/internal/state"
 	"github.com/tekflox/aw-remote-host/internal/updater"
 )
@@ -693,8 +694,31 @@ func runModuleEnv(opts BootstrapOpts, extraEnv []string) []string {
 		"AW_POSTGRES_PASSWORD="+opts.PostgresPassword,
 		"AW_BACKEND_URL="+opts.ControlPlane,
 		"AW_WORKSPACE_HOST_TOKEN="+opts.HostCredential,
+		"AW_HOST_POWER="+effectiveHostPower(opts.StatePath),
 	)
 	return append(env, extraEnv...)
+}
+
+// effectiveHostPower reads the operator's stored --host-power request and
+// re-probes it, so the control-plane-driven "bootstrap" verb grants exactly
+// what a local `bootstrap-workspace` re-run would.
+//
+// Reading it from state rather than taking it as a BootstrapOpts field is the
+// point: this path is reached from the cloud, which has no business deciding
+// how much access this machine hands out. The grant is a local decision,
+// recorded locally, and a remote bootstrap can only honour it.
+//
+// Re-probed (not read back verbatim) so a host that has since gained
+// /dev/kvm starts offering it without the operator re-running the flag.
+func effectiveHostPower(statePath string) string {
+	if statePath == "" {
+		return ""
+	}
+	st, err := state.Load(statePath)
+	if err != nil || len(st.HostPower) == 0 {
+		return ""
+	}
+	return hostpower.Format(hostpower.Resolve(st.HostPower).Effective)
 }
 
 // Health gathers {healthy, uptime_s, disk, cpu_pct, mem, offline} — the
