@@ -18,6 +18,13 @@ CONTAINER_DATA_DIR="/data"
 REDIS_UID="999"
 REDIS_GID="999"
 
+# Host-port publish is optional — see bootstrap/lib/publish.sh for why a taken
+# port must not fail the install.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/publish.sh
+source "$SCRIPT_DIR/../lib/publish.sh"
+mapfile -t PUBLISH_ARGS < <(publish_args redis 6379 "${AW_REDIS_PUBLISH:-}")
+
 # Shared network so the workspace container reaches redis by name.
 podman network exists "$NETWORK_NAME" >/dev/null 2>&1 || podman network create "$NETWORK_NAME" >/dev/null
 
@@ -57,7 +64,7 @@ if ! podman container exists "$CONTAINER_NAME"; then
   podman run -d \
     --name "$CONTAINER_NAME" \
     --network "$NETWORK_NAME" \
-    -p 127.0.0.1:6379:6379 \
+    ${PUBLISH_ARGS[@]+"${PUBLISH_ARGS[@]}"} \
     -v "$DATA_DIR":"$CONTAINER_DATA_DIR" \
     "$IMAGE" redis-server --appendonly yes
 fi

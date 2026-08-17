@@ -22,6 +22,13 @@ CONTAINER_DATA_DIR="/var/lib/postgresql/data"
 POSTGRES_UID="999"
 POSTGRES_GID="999"
 
+# Host-port publish is optional — see bootstrap/lib/publish.sh for why a taken
+# port must not fail the install.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/publish.sh
+source "$SCRIPT_DIR/../lib/publish.sh"
+mapfile -t PUBLISH_ARGS < <(publish_args postgres 5432 "${AW_POSTGRES_PUBLISH:-}")
+
 # Shared network so the workspace container reaches postgres by name (a BYOD
 # host has no aw-sandbox netns to piggyback on 127.0.0.1).
 podman network exists "$NETWORK_NAME" >/dev/null 2>&1 || podman network create "$NETWORK_NAME" >/dev/null
@@ -71,7 +78,7 @@ if ! podman container exists "$CONTAINER_NAME"; then
   podman run -d \
     --name "$CONTAINER_NAME" \
     --network "$NETWORK_NAME" \
-    -p 127.0.0.1:5432:5432 \
+    ${PUBLISH_ARGS[@]+"${PUBLISH_ARGS[@]}"} \
     -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
     -v "$DATA_DIR":"$CONTAINER_DATA_DIR" \
     "$IMAGE"

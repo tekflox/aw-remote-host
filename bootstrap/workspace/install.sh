@@ -114,6 +114,24 @@ if [ -z "$(ls -A "$HOST_DIR" 2>/dev/null)" ]; then
   podman cp "${SEED_CONTAINER}:${CONTAINER_WORKDIR}/." "$HOST_DIR"
   podman rm -f "$SEED_CONTAINER" >/dev/null 2>&1 || true
   echo "workspace: seeded $(ls -A "$HOST_DIR" | wc -l | tr -d ' ') entries into $HOST_DIR"
+  # `podman cp` writes as the invoking user (root on a rootful host), but the
+  # image's process runs as uid 1001 — so the freshly seeded tree is unwritable
+  # by the very container about to mount it. Boot then dies on
+  #     PermissionError: '/opt/aw-workspace/.aw-workspace/bin'
+  # which reads as a broken image rather than a chown that never happened.
+  #
+  # This was invisible on a CONTAINERISED BYOD host, where aw-remote-host's own
+  # entrypoint.sh runs a background chown loop over $HOME/aw-workspace. A NATIVE
+  # install has no such entrypoint, so nothing covered it and every bare-metal
+  # provision hit it (found on aw.tekflox.com, 2026-08-17). ops.go's Update()
+  # already chowns HOST_DIR after every sync — the gap was only the first seed.
+  #
+  # Same dual root/rootless path the HOME_HOST_DIR chown above uses.
+  if [ "$(id -u)" = "0" ]; then
+    chown -R "${WORKSPACE_UID}:${WORKSPACE_GID}" "$HOST_DIR" 2>/dev/null || true
+  else
+    podman unshare chown -R "${WORKSPACE_UID}:${WORKSPACE_GID}" "$HOST_DIR" 2>/dev/null || true
+  fi
 else
   echo "workspace: $HOST_DIR already populated — leaving host files untouched"
 fi
