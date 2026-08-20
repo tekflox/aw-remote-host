@@ -230,6 +230,27 @@ if podman container exists "$CONTAINER_NAME"; then
       | grep -qx "RUNNER_WARM_CONTAINER=${RUNNER_WARM_CONTAINER}"; then
     echo "workspace: RUNNER_WARM_CONTAINER changed — recreating to pick it up"
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  # Without --init, PID 1 is the workspace's own `python -m src.start.workspace`,
+  # which only waits on pids it spawned itself. Every process in the container
+  # that outlives its parent gets re-parented to it and then never reaped: 151
+  # zombies out of 173 processes after 2.7 days of uptime when this was found on
+  # 2026-08-20 (gh, chrome-headless, bash, ssh-agent, go, git). --init puts
+  # catatonit at PID 1 to reap them, and leaves the server's own subprocess.run
+  # children alone — unlike a wildcard waitpid(-1) in-process, which races
+  # subprocess.run and turns a failed command into a silent success (see the
+  # workspace's src/api/terminal_manager.py:_reap_children).
+  #
+  # The same recreate also picks up --ulimit core=0. The host kernel's
+  # core_pattern is a bare "core" with core_uses_pid=1, so a segfaulting app
+  # dumps its whole RSS into its cwd — /opt/aw-workspace/core.<pid>, on the
+  # bind mount, where it survives every restart. codegraphcontext SIGSEGV'd 4
+  # times in 2 days and left 27 GB there, on a disk already at 79%. Nobody was
+  # ever going to load an 11.7 GB core; the crash is worth fixing, the dump is
+  # not worth keeping. core_pattern itself is host-wide and shared with every
+  # other container, so it is not this installer's to change.
+  elif [ "$(podman inspect "$CONTAINER_NAME" --format '{{.HostConfig.Init}}')" != "true" ]; then
+    echo "workspace: existing container has no init at PID 1 — recreating so orphaned processes get reaped"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   # Env is fixed at container creation, so a changed grant set only reaches the
   # workspace through a recreate. Unlike the checks above this one compares in
   # BOTH directions (revoking has to take effect too, or --host-power=none
@@ -256,6 +277,8 @@ else
     --name "$CONTAINER_NAME" \
     --network "$NETWORK_NAME" \
     --restart=always \
+    --init \
+    --ulimit core=0 \
     -p 127.0.0.1:9030:9030 \
     -v "${HOST_DIR}:${CONTAINER_WORKDIR}" \
     -v "${HOME_HOST_DIR}:${CONTAINER_HOME}" \
