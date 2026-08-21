@@ -29,4 +29,18 @@ if [ "$(uname -s)" != "Darwin" ]; then
   fi
 fi
 
+# Same short-circuit, different drift: the runner treats a module whose
+# verify.sh exits 0 as AlreadyOK and never runs install.sh at all, so every
+# recreate condition install.sh knows about is unreachable on a host whose
+# container is merely *up*. install.sh gained a --init check on 2026-08-20 and
+# it never once fired for that reason — the live workspace kept PID 1 as its
+# own python process, which reaps nothing it did not spawn, and accumulated
+# 151 zombies out of 173 processes over 2.7 days. Anything install.sh
+# guarantees about HOW the container was created has to be asserted here too,
+# or it only ever applies to hosts that had no container yet.
+if [ "$(podman inspect "$CONTAINER_NAME" --format '{{.HostConfig.Init}}')" != "true" ]; then
+  echo "workspace: container has no init at PID 1 — recreating so orphaned processes get reaped" >&2
+  exit 1
+fi
+
 echo "workspace: healthy"
