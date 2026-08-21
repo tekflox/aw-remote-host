@@ -33,6 +33,18 @@ import (
 // /link registration reply before giving up.
 const registerTimeout = 30 * time.Second
 
+// workspaceSelfHealMinBackoff/MaxBackoff bound the retry loop
+// bootstrapWorkspaceSelfHeal uses when the workspace module's
+// detect->install->verify cycle fails (typically a readiness timeout —
+// the container's FastAPI app taking longer than
+// AW_WORKSPACE_READINESS_TIMEOUT to come up). Same shape as link.go's
+// reconnect backoff (1s->60s cap), just started a bit slower since each
+// attempt already includes a multi-minute readiness poll of its own.
+const (
+	workspaceSelfHealMinBackoff = 5 * time.Second
+	workspaceSelfHealMaxBackoff = 2 * time.Minute
+)
+
 func commonFlags(fs *flag.FlagSet) (token *string, plan *bool, controlPlane *string) {
 	token = fs.String("token", "", "bearer token identifying this machine to the control plane")
 	plan = fs.Bool("plan", false, "print planned actions without executing them")
@@ -405,17 +417,22 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 				"AW_HOST_POWER="+hostPowerEnv,
 			),
 		}
-		wsStatuses, err := bootstrap.Run(ctx, m.Only("workspace"), wsOpts)
-		reportStatuses(wsStatuses)
-		if err != nil {
-			return err
-		}
-		if !st.Provisioned {
-			st.Provisioned = true
-			if err := state.Save(statePath, st); err != nil {
-				return err
-			}
-		}
+		// Run the workspace module's bootstrap in the background with its
+		// own retry loop instead of inline: this same function/process
+		// holds the /link tunnel connection (started above), and a
+		// synchronous failure here used to `return err` straight out of
+		// runBootstrapWorkspace, cancelling ctx and tearing the tunnel down
+		// with it — over one slow container startup. Since the UI's restart
+		// button (POST /api/workspaces/{slug}/restart) travels over that
+		// SAME tunnel, that left the workspace stuck offline with no way to
+		// recover except SSHing into the host and force-restarting the
+		// container by hand (confirmed live 2026-08-21: the container
+		// itself came up healthy on its own minutes later — only the tunnel
+		// never came back because the process that owned it had already
+		// exited). Backgrounding this means a readiness timeout just
+		// retries with backoff — the tunnel, and therefore the restart
+		// button, stay usable the whole time.
+		go bootstrapWorkspaceSelfHeal(ctx, m.Only("workspace"), wsOpts, statePath, st)
 	} else {
 		fmt.Println("lean link: local runtime NOT installed — run 'bootstrap-workspace --with-workspace' (no --token needed, already linked) to provision it here, or trigger it from the control plane (the \"bootstrap\" verb over this same /link connection — see README).")
 	}
@@ -437,12 +454,48 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	}
 
 	if provisionWorkspace {
-		fmt.Printf("workspace %q running — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
+		fmt.Printf("workspace %q linked — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
 	} else {
 		fmt.Printf("linked to workspace %q (lean, no local runtime) — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
 	}
 	<-ctx.Done()
 	return <-runDone
+}
+
+// bootstrapWorkspaceSelfHeal runs the workspace module's
+// detect->install->verify cycle in a loop until it succeeds or ctx is
+// cancelled, backing off between attempts (workspaceSelfHealMinBackoff up
+// to workspaceSelfHealMaxBackoff) instead of returning an error to a
+// caller that would tear down the /link tunnel over it. See the call site
+// in runBootstrapWorkspace for why this must not be synchronous.
+func bootstrapWorkspaceSelfHeal(ctx context.Context, m *bootstrap.Manifest, opts bootstrap.RunOptions, statePath string, st *state.State) {
+	backoff := workspaceSelfHealMinBackoff
+	for {
+		statuses, err := bootstrap.Run(ctx, m, opts)
+		reportStatuses(statuses)
+		if err == nil {
+			if !st.Provisioned {
+				st.Provisioned = true
+				if err := state.Save(statePath, st); err != nil {
+					fmt.Fprintf(os.Stderr, "workspace: bootstrapped but could not persist provisioned state: %v\n", err)
+				}
+			}
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "workspace: bootstrap failed, retrying in %s: %v\n", backoff, err)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		}
+		backoff *= 2
+		if backoff > workspaceSelfHealMaxBackoff {
+			backoff = workspaceSelfHealMaxBackoff
+		}
+	}
 }
 
 // startLANFastPath boots the LAN fast-path TLS terminator (case a) in the
