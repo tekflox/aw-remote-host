@@ -265,10 +265,13 @@ func TestResolveTarget(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		// Absent means the workspace container, NOT the host: the console's
-		// browser terminal has always sent no target, and a newer control
-		// plane must not be able to silently move that session onto the host.
-		{"", TargetWorkspace, false},
+		// Absent resolves to the platform's defaultTarget — the workspace
+		// container on a host that can run one (the console's browser
+		// terminal has always sent no target, and a newer control plane
+		// must not be able to silently move that session onto the host),
+		// the host itself on Windows, where no container can exist. Asserted
+		// against the constant so this passes on both.
+		{"", defaultTarget, false},
 		{TargetWorkspace, TargetWorkspace, false},
 		{TargetHost, TargetHost, false},
 		// A typo must fail loudly rather than defaulting — "hsot" opening a

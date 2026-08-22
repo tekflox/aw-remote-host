@@ -16,6 +16,11 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/ops"
 )
 
+// defaultTarget is where a pty_open with no target lands on this platform.
+// The workspace container, because a POSIX host can host one — see
+// resolveTarget for why that default must not change here.
+const defaultTarget = TargetWorkspace
+
 // execPTY is the production PTY — a real podman-exec or local shell process
 // attached to a creack/pty master.
 type execPTY struct {

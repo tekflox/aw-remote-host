@@ -34,6 +34,14 @@ var (
 	procClosePseudoConsole  = kernel32.NewProc("ClosePseudoConsole")
 )
 
+// defaultTarget is where a pty_open with no target lands on this platform.
+// The host itself, NOT the workspace: a Windows box can never run the
+// workspace (Linux container image), so defaulting a no-target caller at it
+// only guarantees failure. aw-backend's workspace_shell.py sends no target
+// at all, which is why the console's "Open Shell" was the one client that
+// could not open a shell here. See resolveTarget.
+const defaultTarget = TargetHost
+
 // procThreadAttributePseudoConsole is PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 // from processthreadsapi.h. Not exported by x/sys/windows, and it is a
 // stable documented constant, so it is spelled out.

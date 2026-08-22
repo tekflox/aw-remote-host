@@ -46,15 +46,28 @@ const (
 )
 
 // resolveTarget maps a pty_open's target field onto one of the two constants.
-// An absent/empty target means TargetWorkspace, NOT TargetHost: the console's
-// browser terminal has always sent no target and has always landed in the
-// workspace container, and a control plane newer than this binary must not be
-// able to silently redirect an existing session onto the host. Any unknown
-// value is an error rather than a default, so a typo fails loudly instead of
-// opening a shell somewhere the caller did not ask for.
+//
+// An absent/empty target resolves to defaultTarget, which is per-platform and
+// deliberately so. On a host that CAN run the workspace it is
+// TargetWorkspace: the console's browser terminal has always sent no target
+// (aw-backend's workspace_shell.py defaults it to "") and has always landed
+// in the container, and a control plane newer than this binary must not be
+// able to silently redirect an existing session onto the host.
+//
+// On a host that CANNOT — Windows, where the workspace is a Linux container
+// image — that reasoning inverts. There is no container to protect the
+// session from being redirected away from, so defaulting to it just makes
+// every no-target caller fail. That is not hypothetical: it is exactly why
+// "Open Shell" in the console returned "no workspace container on a Windows
+// host" while the CLI, which sends an explicit --target host, worked fine.
+//
+// Any unknown value is still an error rather than a default, so a typo fails
+// loudly instead of opening a shell somewhere the caller did not ask for.
 func resolveTarget(target string) (string, error) {
 	switch target {
-	case "", TargetWorkspace:
+	case "":
+		return defaultTarget, nil
+	case TargetWorkspace:
 		return TargetWorkspace, nil
 	case TargetHost:
 		return TargetHost, nil

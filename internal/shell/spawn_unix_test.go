@@ -4,6 +4,19 @@ package shell
 
 import "testing"
 
+// The POSIX default must stay the workspace container: the console sends no
+// target, and flipping this would silently move every existing browser
+// terminal session from the container onto the metal.
+func TestDefaultTargetIsTheWorkspaceOnPOSIX(t *testing.T) {
+	if defaultTarget != TargetWorkspace {
+		t.Errorf("defaultTarget = %q, want %q", defaultTarget, TargetWorkspace)
+	}
+	got, err := resolveTarget("")
+	if err != nil || got != TargetWorkspace {
+		t.Errorf("resolveTarget(\"\") = %q, %v; want %q, nil", got, err, TargetWorkspace)
+	}
+}
+
 func TestWithTermOnlyFillsAMissingOne(t *testing.T) {
 	// A shell spawned from a systemd unit or container entrypoint inherits no
 	// TERM, and bash then falls back to `dumb` — no arrow keys, no colour, no
