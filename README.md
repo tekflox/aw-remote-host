@@ -183,8 +183,12 @@ itself out of the existing data volume.
 - **Windows:** a Scheduled Task named `aw-remote-host`, defined by
   `~/.aw-remote-host/aw-remote-host.xml` and registered with `schtasks
   /Create /XML`. Its trigger is **logon**, so it comes back when you sign
-  in — not at boot. Inspect it with `schtasks /Query /TN aw-remote-host /V
-  /FO LIST`.
+  in — not at boot. It also restarts itself every minute on failure. The
+  task runs **`aw-remote-hostw.exe`**, a second GUI-subsystem build shipped
+  in the same zip, so no console window sits on your desktop; because a GUI
+  binary has no stdout, that build appends everything it would have printed
+  to `~/.aw-remote-host/aw-remote-host.log`. Inspect the task with
+  `schtasks /Query /TN aw-remote-host /V /FO LIST`.
 
 ### Windows (lean link only)
 
@@ -220,10 +224,18 @@ aw-remote-host link --token awbs_... --background
 
 Three Windows-specific things worth knowing:
 
-- **Commands run under PowerShell**, not `sh` — `powershell.exe -NoProfile
-  -NonInteractive -Command` (see `internal/ops/proc_windows.go`). A native
-  program's exit code is propagated explicitly via `$LASTEXITCODE`; without
-  that, PowerShell reports 0 for a command that plainly failed.
+- **Commands run under PowerShell**, not `sh` — `-NoProfile -NonInteractive
+  -Command` (see `internal/ops/proc_windows.go`). A native program's exit
+  code is propagated explicitly via `$LASTEXITCODE`; without that,
+  PowerShell reports 0 for a command that plainly failed. **`pwsh` (7+) is
+  used when installed**, falling back to `powershell.exe`: on a real Win10
+  host, 5.1 cost 13.6s of startup on *every* command. Installing PowerShell
+  7 is the single biggest thing you can do for remote-exec latency here.
+- **`wsl.exe` writes UTF-16LE**, so its output arrives through `exec_start`
+  with a null byte between every character. That is wsl being wsl, not a
+  transport bug — pipe it through `| Out-String` and it still comes back
+  UTF-16. Prefix such commands with `chcp 65001 | Out-Null;` or read them
+  as UTF-16 on your side.
 - **`--background` installs a Scheduled Task**, not a service, triggered at
   **logon**. A rebooted machine sitting at the lock screen is therefore not
   linked yet — someone has to sign in. That is the honest trade for an

@@ -1,6 +1,8 @@
 package servicemgr
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -103,6 +105,68 @@ func TestUTF16LEWithBOM(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("byte %d = %#x, want %#x (full: %v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+// A dropped link must come back on its own — the machine is not somewhere
+// anyone can go and restart a service by hand.
+func TestGenerateSchtasksTaskXMLRestartsOnFailure(t *testing.T) {
+	doc := GenerateSchtasksTaskXML(Config{ExePath: `C:\x.exe`, ControlPlane: "https://y"})
+	if !strings.Contains(doc, "<RestartOnFailure>") {
+		t.Fatalf("task must restart on failure:\n%s", doc)
+	}
+	if !strings.Contains(doc, "<Interval>PT1M</Interval>") {
+		t.Error("expected a 1-minute restart interval")
+	}
+	// RestartOnFailure sits after Priority in the sequence Task Scheduler
+	// itself emits. Order is load-bearing here — a misplaced element is a
+	// hard "incorrectly formatted" rejection from schtasks /Create.
+	if strings.Index(doc, "<RestartOnFailure>") < strings.Index(doc, "<Priority>") {
+		t.Error("RestartOnFailure must come after Priority")
+	}
+	if strings.Index(doc, "<RestartOnFailure>") > strings.Index(doc, "</Settings>") {
+		t.Error("RestartOnFailure must stay inside Settings")
+	}
+}
+
+func TestTaskExePathPrefersTheWindowlessBuild(t *testing.T) {
+	dir := t.TempDir()
+	console := filepath.Join(dir, "aw-remote-host.exe")
+	windowless := filepath.Join(dir, "aw-remote-hostw.exe")
+
+	if err := os.WriteFile(console, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// No `w` binary yet — a host that installed before it existed must keep
+	// working rather than get a task pointing at a missing file.
+	if got := taskExePath(console); got != console {
+		t.Errorf("with no windowless build, want %q, got %q", console, got)
+	}
+
+	if err := os.WriteFile(windowless, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := taskExePath(console); got != windowless {
+		t.Errorf("want the windowless build %q, got %q", windowless, got)
+	}
+}
+
+func TestTaskExePathHandlesEdgeCases(t *testing.T) {
+	if got := taskExePath(""); got != "" {
+		t.Errorf("empty path should stay empty, got %q", got)
+	}
+	// A directory named like the sibling must not be mistaken for it.
+	dir := t.TempDir()
+	console := filepath.Join(dir, "aw-remote-host.exe")
+	if err := os.WriteFile(console, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "aw-remote-hostw.exe"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := taskExePath(console); got != console {
+		t.Errorf("a directory is not a binary; want %q, got %q", console, got)
 	}
 }
 

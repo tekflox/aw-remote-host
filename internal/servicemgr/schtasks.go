@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"unicode/utf16"
 )
 
@@ -69,6 +70,10 @@ const schtasksXMLTemplate = `<?xml version="1.0" encoding="UTF-16"?>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
     <Exec>
@@ -94,6 +99,31 @@ func GenerateSchtasksTaskXML(cfg Config) string {
 	}
 	return fmt.Sprintf(schtasksXMLTemplate,
 		xmlEscape(slug), schtasksName, xmlEscape(cfg.ExePath), xmlEscape(cfg.ControlPlane))
+}
+
+// taskExePath prefers the windowless sibling binary — aw-remote-hostw.exe
+// next to aw-remote-host.exe — for the Scheduled Task's <Command>.
+//
+// Task Scheduler starting a CONSOLE-subsystem binary allocates a console,
+// and that console window sits on the desktop for as long as the link is
+// up. Nothing in the task definition can suppress it: <Hidden> controls
+// whether the task is listed in the Task Scheduler UI, not whether its
+// process draws a window. The only fix is a GUI-subsystem binary, which is
+// why the release ships a second `w` build (the pythonw.exe convention).
+//
+// Falls back to the given path when the sibling isn't there, so a host that
+// installed before the `w` binary existed keeps working — with its window —
+// rather than getting a task pointing at a file that does not exist.
+func taskExePath(exePath string) string {
+	if exePath == "" {
+		return exePath
+	}
+	ext := filepath.Ext(exePath)
+	candidate := strings.TrimSuffix(exePath, ext) + "w" + ext
+	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+		return candidate
+	}
+	return exePath
 }
 
 // xmlEscape makes a value safe to drop between XML tags. The exe path is
@@ -139,6 +169,11 @@ func (m *schtasksManager) Install(cfg Config) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
 	}
+	// Resolved here rather than inside the generator so the generator stays
+	// a pure function of Config — it is the one Windows-shaped output a
+	// Linux test run can assert on, and a filesystem probe inside it would
+	// make those assertions depend on the machine running them.
+	cfg.ExePath = taskExePath(cfg.ExePath)
 	if err := os.WriteFile(path, utf16LEWithBOM(GenerateSchtasksTaskXML(cfg)), 0o644); err != nil {
 		return "", fmt.Errorf("write %s: %w", path, err)
 	}

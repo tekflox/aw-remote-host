@@ -13,9 +13,24 @@ import (
 // version is set via -ldflags "-X main.version=vX.Y.Z" at release build time.
 var version = "dev"
 
+// windowless is set to "true" via -ldflags at build time for the Windows
+// `aw-remote-hostw.exe` variant, which is additionally linked with
+// -H=windowsgui so Task Scheduler can run it without a console window
+// parked on the user's desktop for as long as the machine is up.
+//
+// The catch that makes this flag necessary rather than just a link mode: a
+// GUI-subsystem binary has NO console, so stdout and stderr go nowhere at
+// all. Every line this process logs — registration, reconnects, the reason
+// a link dropped — would be silently discarded, which is precisely the
+// silent-degradation failure this project keeps being bitten by. So the
+// windowless build redirects both to a log file instead.
+var windowless = ""
+
 const defaultControlPlane = "https://api.aw.tekflox.com"
 
 func main() {
+	redirectOutputIfWindowless()
+
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)

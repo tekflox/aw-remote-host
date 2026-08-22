@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"sync"
 	"syscall"
 )
 
@@ -27,10 +28,34 @@ const workspaceRuntimeSupported = false
 // is never going to change.
 const createNewProcessGroup = 0x00000200
 
-// powerShell runs the command. cmd.exe would be lighter, but its quoting
-// rules mangle anything with a quote or an ampersand in it, and the control
-// plane sends whole command lines verbatim.
-const powerShell = "powershell.exe"
+// The shell that runs a command. cmd.exe would be far lighter — measured at
+// 0.24s startup against 13.6s for powershell.exe on a real Windows 10 host —
+// but its quoting rules mangle anything containing a quote or an ampersand,
+// and the control plane sends whole command lines verbatim. Correctness wins;
+// pickShell below buys back what it can.
+const (
+	powerShell7 = "pwsh.exe"       // PowerShell 7+, dramatically faster to start
+	powerShell5 = "powershell.exe" // Windows PowerShell 5.1, always present
+)
+
+// pickShell prefers pwsh when it is installed.
+//
+// Startup cost is the entire reason. Windows PowerShell 5.1 measured 13.6s
+// per invocation on a real host (a Surface running Win10 Pro with Defender
+// real-time scanning on), and exec_start pays that on EVERY command. pwsh
+// starts in a fraction of it. Neither is present-by-default in the same
+// sense — 5.1 always exists, pwsh only if someone installed it — so this
+// probes once and caches.
+//
+// Cached rather than probed per command because LookPath walks PATH and
+// stats each entry, and doing that per exec_start on an already-slow box
+// adds latency to fix latency.
+var pickShell = sync.OnceValue(func() string {
+	if path, err := exec.LookPath(powerShell7); err == nil && path != "" {
+		return powerShell7
+	}
+	return powerShell5
+})
 
 // psExitPropagation is appended to every command because of a genuine
 // PowerShell trap: with -Command, powershell.exe exits 0 even when the
@@ -47,11 +72,17 @@ const psExitPropagation = "\nif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }
 // through this host's shell. -NoProfile keeps a user's $PROFILE from
 // injecting output into the job's stdout; -NonInteractive makes a command
 // that would have prompted fail fast instead of hanging until the timeout.
+//
+// Note what is NOT here: -ExecutionPolicy Bypass. It looks harmless and is
+// the usual cargo-cult addition, but execution policy governs script FILES
+// and this passes an inline -Command string, which no policy has ever
+// blocked. It is not merely useless — on a real host it measured 23.9s of
+// startup against 13.6s without it, so it was costing ~10 seconds on every
+// single command to buy nothing.
 func shellCommand(command string) (string, []string) {
-	return powerShell, []string{
+	return pickShell(), []string{
 		"-NoProfile",
 		"-NonInteractive",
-		"-ExecutionPolicy", "Bypass",
 		"-Command", command + psExitPropagation,
 	}
 }

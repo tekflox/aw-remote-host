@@ -78,8 +78,19 @@ jobs:
                 -ldflags "-X main.version=${VERSION}" \
                 -o "dist/aw-remote-host.exe" \
                 ./cmd/aw-remote-host
-              (cd dist && zip -q "aw-remote-host_${VERSION}_${os}_${arch}.zip" aw-remote-host.exe)
-              rm dist/aw-remote-host.exe
+              # Second, GUI-subsystem build for the Scheduled Task. Task
+              # Scheduler allocates a console for a console-subsystem
+              # binary, and that window sits on the desktop for as long as
+              # the link is up — nothing in the task XML can suppress it.
+              # main.windowless makes this build log to a file, since a GUI
+              # binary has no stdout to lose output to. See
+              # servicemgr.taskExePath and cmd/aw-remote-host/windowless.go.
+              GOOS=$os GOARCH=$arch go build \
+                -ldflags "-H=windowsgui -X main.version=${VERSION} -X main.windowless=true" \
+                -o "dist/aw-remote-hostw.exe" \
+                ./cmd/aw-remote-host
+              (cd dist && zip -q "aw-remote-host_${VERSION}_${os}_${arch}.zip" aw-remote-host.exe aw-remote-hostw.exe)
+              rm dist/aw-remote-host.exe dist/aw-remote-hostw.exe
             else
               GOOS=$os GOARCH=$arch go build \
                 -ldflags "-X main.version=${VERSION}" \
