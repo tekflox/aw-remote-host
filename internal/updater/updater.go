@@ -191,6 +191,14 @@ func restartCommand(slug string) string {
 		// leaves the OLD binary running until the rollback monitor undoes
 		// the update 75s later.
 		return "systemctl --user restart aw-remote-host || kill $PPID"
+	case "windows":
+		// Unreachable in practice — ops.Dispatch refuses "self-update" on
+		// Windows before it can get here (the rollback monitor below is a
+		// `sh -c` script, and there is no sh). Spelled out anyway so that
+		// if self-update is ever ported, the restart half is already
+		// correct rather than a silent "true" that no-ops the new binary
+		// into never running.
+		return "schtasks /End /TN aw-remote-host & schtasks /Run /TN aw-remote-host"
 	default:
 		return "true"
 	}

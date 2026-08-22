@@ -443,9 +443,13 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 			return err
 		}
 		fmt.Println("Detaching — the background service now holds the /link connection.")
-		if runtime.GOOS == "darwin" {
+		switch runtime.GOOS {
+		case "darwin":
 			fmt.Println("(loginctl-equivalent not needed on macOS: LaunchAgents start automatically at login)")
-		} else {
+		case "windows":
+			fmt.Println("(loginctl-equivalent not needed on Windows: the Scheduled Task's logon trigger starts it at sign-in)")
+			fmt.Println("Note: it starts at SIGN-IN, not at boot — a rebooted machine sitting at the lock screen is not linked yet.")
+		default:
 			fmt.Println("Run: loginctl enable-linger $USER   # so it survives logout/reboot")
 		}
 		stop() // cancel our own /link connection — the service owns it now
@@ -688,8 +692,6 @@ func runUnlink(args []string) error {
 	return nil
 }
 
-
-
 // linkProxy is what one live /link connection is handed: tunnelproxy's
 // http_req/ws_* half (a reverse proxy onto the local workspace server) plus
 // tcpproxy's tcp_* half (an arbitrary host:port dialled from this machine).
@@ -742,5 +744,5 @@ func (p *linkProxy) OpenTCP(ctx context.Context, id, host string, port int,
 }
 
 func (p *linkProxy) SendTCP(id string, data []byte) error { return p.tcp.SendTCP(id, data) }
-func (p *linkProxy) CloseTCP(id string) error            { return p.tcp.CloseTCP(id) }
-func (p *linkProxy) CloseAllTCP()                        { p.tcp.CloseAllTCP() }
+func (p *linkProxy) CloseTCP(id string) error             { return p.tcp.CloseTCP(id) }
+func (p *linkProxy) CloseAllTCP()                         { p.tcp.CloseAllTCP() }

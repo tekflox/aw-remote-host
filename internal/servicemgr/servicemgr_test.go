@@ -22,8 +22,106 @@ func TestNewReturnsExpectedManagerPerGOOS(t *testing.T) {
 		t.Errorf("New(darwin).Name() = %q, want launchd", darwin.Name())
 	}
 
-	if _, err := New("windows"); err == nil {
-		t.Error("New(windows): expected an error, got nil")
+	windows, err := New("windows")
+	if err != nil {
+		t.Fatalf("New(windows): %v", err)
+	}
+	if windows.Name() != "schtasks" {
+		t.Errorf("New(windows).Name() = %q, want schtasks", windows.Name())
+	}
+
+	if _, err := New("plan9"); err == nil {
+		t.Error("New(plan9): expected an error, got nil")
+	}
+}
+
+func TestGenerateSchtasksTaskXML(t *testing.T) {
+	cfg := Config{
+		Slug:         "acme",
+		ExePath:      `C:\Users\fred\.local\bin\aw-remote-host.exe`,
+		ControlPlane: "https://api.aw.tekflox.com",
+	}
+	doc := GenerateSchtasksTaskXML(cfg)
+
+	if !strings.HasPrefix(doc, `<?xml version="1.0" encoding="UTF-16"?>`) {
+		t.Error("declaration must say UTF-16 — schtasks /XML reads it literally")
+	}
+	if !strings.Contains(doc, "<Command>"+cfg.ExePath+"</Command>") {
+		t.Errorf("missing <Command> with the exe path, got:\n%s", doc)
+	}
+	wantArgs := "<Arguments>bootstrap-workspace --control-plane https://api.aw.tekflox.com --yes --foreground</Arguments>"
+	if !strings.Contains(doc, wantArgs) {
+		t.Errorf("missing <Arguments>, want substring:\n%s", wantArgs)
+	}
+	if !strings.Contains(doc, "<LogonTrigger>") {
+		t.Error("task must be triggered at logon, or a reboot leaves the host unlinked")
+	}
+	// The Windows default is 3 days; this task holds a WebSocket for as
+	// long as the box is up, so an unlimited run time is load-bearing.
+	if !strings.Contains(doc, "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>") {
+		t.Error("ExecutionTimeLimit must be PT0S (unlimited)")
+	}
+	if !strings.Contains(doc, "acme") {
+		t.Error("description should reference the workspace slug")
+	}
+}
+
+// A Windows username with an XML metacharacter in it lands straight in
+// <Command> via the profile path — unescaped, that is a malformed document
+// and schtasks rejects the whole task.
+func TestGenerateSchtasksTaskXMLEscapesMetacharacters(t *testing.T) {
+	doc := GenerateSchtasksTaskXML(Config{
+		Slug:         "a&b",
+		ExePath:      `C:\Users\R&D <team>\aw-remote-host.exe`,
+		ControlPlane: "https://x/?a=1&b=2",
+	})
+	if strings.Contains(doc, "R&D") || strings.Contains(doc, "<team>") {
+		t.Errorf("exe path was not XML-escaped:\n%s", doc)
+	}
+	if !strings.Contains(doc, "R&amp;D") || !strings.Contains(doc, "&lt;team&gt;") {
+		t.Errorf("expected escaped entities in <Command>:\n%s", doc)
+	}
+	if !strings.Contains(doc, "a=1&amp;b=2") {
+		t.Errorf("control-plane URL was not XML-escaped:\n%s", doc)
+	}
+}
+
+func TestGenerateSchtasksTaskXMLDefaultsSlugWhenEmpty(t *testing.T) {
+	doc := GenerateSchtasksTaskXML(Config{ExePath: `C:\x.exe`, ControlPlane: "https://y"})
+	if !strings.Contains(doc, "unknown") {
+		t.Error("expected a placeholder slug when Config.Slug is empty")
+	}
+}
+
+func TestUTF16LEWithBOM(t *testing.T) {
+	got := utf16LEWithBOM("AB")
+	want := []byte{0xFF, 0xFE, 'A', 0x00, 'B', 0x00}
+	if len(got) != len(want) {
+		t.Fatalf("length = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("byte %d = %#x, want %#x (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestSchtasksPathIsNotSlugScoped(t *testing.T) {
+	mgr := &schtasksManager{}
+
+	pathA, err := mgr.Path(Config{Slug: "acme"})
+	if err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+	pathB, err := mgr.Path(Config{Slug: "widgets"})
+	if err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+	if pathA != pathB {
+		t.Errorf("task path should be fixed regardless of slug, got %q vs %q", pathA, pathB)
+	}
+	if !strings.HasSuffix(pathA, "aw-remote-host.xml") {
+		t.Errorf("unexpected task xml path: %q", pathA)
 	}
 }
 

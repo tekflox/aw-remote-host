@@ -43,21 +43,35 @@ one-time `awbs_` token for a durable `awlk_` credential, and a persistent
 reconnect loop (exponential backoff). Lean by default (link only, see
 [Lean link vs `--with-workspace`](#lean-link-vs---with-workspace) below);
 `--with-workspace` runs the idempotent detect→install→verify cycle over
-every manifest module too. Cross-platform: Linux (systemd user unit) and
+every manifest module too. Cross-platform: Linux (systemd user unit),
 macOS (launchd LaunchAgent — the e2e test box, macbook-fred, is a Mac with
-no systemd) via `internal/servicemgr`. `--plan` still previews everything
-without touching your system. See [Roadmap](#roadmap).
+no systemd) and Windows (Task Scheduler, **lean link only** — see
+[Windows](#windows-lean-link-only)) via `internal/servicemgr`. `--plan`
+still previews everything without touching your system. See
+[Roadmap](#roadmap).
 
 ## Installing
+
+Linux and macOS:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.sh | sh
 ```
 
-This pins an exact release version, downloads the matching
-`linux_amd64`/`linux_arm64`/`darwin_amd64`/`darwin_arm64` binary from
-[GitHub Releases](https://github.com/tekflox/aw-remote-host/releases),
-verifies its SHA-256 checksum, and installs it to `~/.local/bin`.
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.ps1 | iex
+```
+
+Both pin an exact release version, verify its SHA-256 checksum against the
+release's published `checksums.txt`, and install without needing admin
+rights. `install.sh` downloads the matching
+`linux_amd64`/`linux_arm64`/`darwin_amd64`/`darwin_arm64` tarball from
+[GitHub Releases](https://github.com/tekflox/aw-remote-host/releases) into
+`~/.local/bin`; `install.ps1` downloads the `windows_amd64`/`windows_arm64`
+zip into `%LOCALAPPDATA%\Programs\aw-remote-host` and adds it to your user
+PATH.
 
 ### Upgrading an already-installed binary (e.g. macbook-fred)
 
@@ -142,8 +156,9 @@ everything to stdout, and holds the `/link` connection itself. Nothing is
 installed as a service.
 
 Pass **`--background`** (`--detach`) to install and start the platform
-service instead — **launchd** on macOS, **systemd** on Linux (see
-`internal/servicemgr`) — then detach; the service re-invokes
+service instead — **launchd** on macOS, **systemd** on Linux, **Task
+Scheduler** on Windows (see `internal/servicemgr`) — then detach; the
+service re-invokes
 `bootstrap-workspace --foreground` on your behalf so the connection
 survives this terminal closing. `unlink` stops and uninstalls whichever
 service is present.
@@ -165,6 +180,62 @@ itself out of the existing data volume.
 - **macOS:** `~/Library/LaunchAgents/com.tekflox.aw-remote-host.<slug>.plist`
   — a LaunchAgent, so it starts automatically at login with no extra
   linger step needed. Logs go to `~/Library/Logs/aw-remote-host.<slug>.log`.
+- **Windows:** a Scheduled Task named `aw-remote-host`, defined by
+  `~/.aw-remote-host/aw-remote-host.xml` and registered with `schtasks
+  /Create /XML`. Its trigger is **logon**, so it comes back when you sign
+  in — not at boot. Inspect it with `schtasks /Query /TN aw-remote-host /V
+  /FO LIST`.
+
+### Windows (lean link only)
+
+A Windows host is **always a lean link** — and that is a property of the
+product, not a gap waiting to be filled: the workspace is a *Linux
+container image*, so there is nothing `--with-workspace` could install
+there. What a Windows machine gets is the `/link` connection itself:
+
+| Works | Does not |
+|---|---|
+| `exec_start` / `exec_status` / `exec_wait` / `exec_kill` | `stop` / `restart` / `reinstall` / `bootstrap` / `update` |
+| `list_processes` | `self-update` |
+| every `fs_*` verb (stat/list/mkdir/delete/read/write) | the interactive PTY shell |
+| `health` (reports `offline: true` — there is no workspace to report on) | |
+
+The verbs in the right column are refused **by name** with an explanation,
+rather than failing with a bare "podman: executable file not found" that
+reads like a broken PATH (see `workspaceLifecycleVerbs` in
+`internal/ops/ops.go`). The PTY shell needs ConPTY, which this build does
+not implement — `exec_start` covers one-shot commands in the meantime.
+
+Install:
+
+```powershell
+irm https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.ps1 | iex
+```
+
+Then, in a **new** terminal (the installer adds itself to your user PATH):
+
+```powershell
+aw-remote-host link --token awbs_... --background
+```
+
+Three Windows-specific things worth knowing:
+
+- **Commands run under PowerShell**, not `sh` — `powershell.exe -NoProfile
+  -NonInteractive -Command` (see `internal/ops/proc_windows.go`). A native
+  program's exit code is propagated explicitly via `$LASTEXITCODE`; without
+  that, PowerShell reports 0 for a command that plainly failed.
+- **`--background` installs a Scheduled Task**, not a service, triggered at
+  **logon**. A rebooted machine sitting at the lock screen is therefore not
+  linked yet — someone has to sign in. That is the honest trade for an
+  install that needs no admin rights.
+- **Killing a job kills its whole tree** (`taskkill /T /F`), the Windows
+  stand-in for the process-group SIGKILL used on POSIX.
+
+If you want the *full* workspace runtime on a Windows machine, use **WSL2**
+instead: inside a WSL2 Ubuntu everything is ordinary Linux, so `install.sh`
+and `--with-workspace` work unmodified. Enable systemd (`[boot]
+systemd=true` in `/etc/wsl.conf`) and `loginctl enable-linger $USER` first,
+or the service will not survive your terminal closing.
 
 ### macOS container runtime
 
@@ -195,13 +266,15 @@ across separate `bootstrap.Run()` calls.
 cmd/aw-remote-host/     Go CLI entrypoint (bootstrap-workspace, status, unlink, version)
 internal/link/          WS client that dials wss://<control-plane>/link, credential persistence, reconnect loop
 internal/bootstrap/     Manifest loader + embedded-script extraction + detect/install/verify orchestration
-internal/servicemgr/    Per-OS background service manager (systemd on Linux, launchd on macOS)
+internal/servicemgr/    Per-OS background service manager (systemd on Linux, launchd on macOS, schtasks on Windows)
+internal/ops/proc_*.go  Per-OS process control: which shell runs a command, process-group setup, tree kill
 internal/state/         Local state (generated Postgres password, last-known workspace slug)
 bootstrap/embed.go      go:embed of manifest.json + lib/ + every module's scripts into the binary
 bootstrap/manifest.json Pinned module list (name, version, image digest or package, verify command)
 bootstrap/lib/          Shared dependency-resolution helpers (deps.sh) sourced by module install.sh scripts
 bootstrap/<module>/     One dir per module: README.md, install.sh, verify.sh
-install.sh              Root installer: pinned binary download + checksum verify
+install.sh              Root installer (Linux/macOS): pinned binary download + checksum verify
+install.ps1             Root installer (Windows): same contract, PowerShell + zip
 ```
 
 ## Roadmap (BYOD onboarding chain)

@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -182,9 +181,11 @@ func stringArg(args map[string]any, key string) string {
 	return s
 }
 
-// ExecStart runs command (via "sh -c") as a new OS process in its own
-// process group (so a shell that forks children can still be killed as a
-// unit) and returns immediately — {job_id, pid, started: true}. args:
+// ExecStart runs command through this host's shell ("sh -c" on POSIX,
+// "powershell.exe -Command" on Windows — see shellCommand) as a new OS
+// process in its own process group (so a shell that forks children can
+// still be killed as a unit) and returns immediately —
+// {job_id, pid, started: true}. args:
 // "command" (required), "timeout_s" (optional, default execDefaultTimeout,
 // hard-capped at execHardTimeout — the job is force-killed past this).
 func (h *Handler) ExecStart(ctx context.Context, args map[string]any, emit Emit) (map[string]any, error) {
@@ -210,21 +211,23 @@ func (h *Handler) ExecStart(ctx context.Context, args map[string]any, emit Emit)
 	// which link.go's handleCmd may cancel once cmd_result is written) —
 	// this job must keep running independently after exec_start replies.
 	jobCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	cmd := exec.CommandContext(jobCtx, "sh", "-c", command)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	shellName, shellArgs := shellCommand(command)
+	cmd := exec.CommandContext(jobCtx, shellName, shellArgs...)
+	configureProcessGroup(cmd)
 	// Go's default ctx-cancel behavior only kills cmd.Process itself — if
-	// "sh -c" forked instead of exec'ing (a grandchild inherits the
+	// the shell forked instead of exec'ing (a grandchild inherits the
 	// stdout/stderr pipe fds this package wires below), that grandchild
 	// keeps the pipe open and cmd.Wait() hangs past the deadline waiting
 	// for EOF even though the direct child is long dead. Kill the whole
-	// process group instead (negative pid, valid because of Setpgid
-	// above), and WaitDelay is the belt-and-braces backstop: if the group
-	// kill still doesn't free every fd holder within 2s, Wait() force-
-	// closes the pipes and returns anyway. Without both of these, one
-	// forking command can hang a job forever regardless of timeout_s —
-	// exactly the "não travar" requirement this feature exists for.
+	// tree instead (killProcessTree — a process-group SIGKILL on POSIX, a
+	// taskkill /T on Windows; see proc_unix.go / proc_windows.go), and
+	// WaitDelay is the belt-and-braces backstop: if that still doesn't
+	// free every fd holder within 2s, Wait() force-closes the pipes and
+	// returns anyway. Without both of these, one forking command can hang
+	// a job forever regardless of timeout_s — exactly the "não travar"
+	// requirement this feature exists for.
 	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		return killProcessTree(cmd.Process.Pid)
 	}
 	cmd.WaitDelay = 2 * time.Second
 
@@ -297,7 +300,7 @@ func (h *Handler) ExecStatus(ctx context.Context, args map[string]any) (map[stri
 // ExecWait blocks until the job reaches a terminal status or timeout_s
 // elapses (default 30s, hard-capped at execWaitHardCap), then returns the
 // current snapshot either way — check "status" to tell timeout-while-
-//-still-running apart from a real terminal state.
+// -still-running apart from a real terminal state.
 func (h *Handler) ExecWait(ctx context.Context, args map[string]any) (map[string]any, error) {
 	id := stringArg(args, "job_id")
 	job, ok := jobs.get(id)
@@ -344,10 +347,10 @@ func (h *Handler) ExecKill(ctx context.Context, args map[string]any, emit Emit) 
 		return map[string]any{"killed": false, "reason": "already finished"}, nil
 	}
 
-	// Negative pid == kill the whole process group (Setpgid above made the
-	// job's own pid double as its group id) — a shell that forked children
-	// gets all of them, not just the shell itself.
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	// Kill the whole tree, not just the shell itself — a shell that forked
+	// children gets all of them. configureProcessGroup at start time is
+	// what makes that possible on both platforms.
+	_ = killProcessTree(pid)
 	job.cancel()
 	emit("warning", "exec", fmt.Sprintf("job %s (pid %d) killed", id, pid))
 	return map[string]any{"killed": true}, nil

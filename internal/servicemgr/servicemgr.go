@@ -1,7 +1,14 @@
 // Package servicemgr abstracts "install/start/stop/uninstall a background
 // service that keeps `aw-remote-host bootstrap-workspace` running" across
-// the two platforms the BYOD onboarding chain targets: systemd (Linux) and
-// launchd (macOS, e.g. the macbook-fred e2e box — no systemd there).
+// the three platforms this CLI targets: systemd (Linux), launchd (macOS,
+// e.g. the macbook-fred e2e box — no systemd there) and Task Scheduler
+// (Windows, via schtasks).
+//
+// Windows only ever reaches this package for a LEAN link — the local
+// runtime a full `--with-workspace` provision stands up is podman plus a
+// Linux container image, neither of which exists there. What a Windows host
+// gets is the /link connection itself: remote exec, the fs_* verbs, process
+// listing. See the "Windows (lean link only)" section of the README.
 package servicemgr
 
 import (
@@ -53,8 +60,10 @@ func New(goos string) (Manager, error) {
 		return &systemdManager{}, nil
 	case "darwin":
 		return &launchdManager{}, nil
+	case "windows":
+		return &schtasksManager{}, nil
 	default:
-		return nil, fmt.Errorf("no service manager for GOOS=%q (supported: linux, darwin)", goos)
+		return nil, fmt.Errorf("no service manager for GOOS=%q (supported: linux, darwin, windows)", goos)
 	}
 }
 

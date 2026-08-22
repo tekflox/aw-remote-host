@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -126,6 +127,16 @@ func DefaultSpawner(ctx context.Context, target string) (PTY, error) {
 
 	f, err := pty.Start(cmd)
 	if err != nil {
+		if runtime.GOOS == "windows" {
+			// creack/pty compiles on Windows but every call is a stub
+			// returning ErrUnsupported — a real PTY there means ConPTY,
+			// which this build does not implement. Say that plainly: the
+			// bare wrapped error is "start pty (host): unsupported", which
+			// reads like a transient fault rather than a missing feature.
+			return nil, fmt.Errorf("interactive shell is not available on a Windows host: "+
+				"the PTY channel needs ConPTY, which this build does not implement yet. "+
+				"Use exec_start/exec_wait for one-shot commands instead (underlying error: %w)", err)
+		}
 		return nil, fmt.Errorf("start pty (%s): %w", resolved, err)
 	}
 	return &execPTY{cmd: cmd, f: f}, nil

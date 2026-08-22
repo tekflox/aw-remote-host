@@ -116,6 +116,11 @@ type Handler struct {
 // command/timeout/job_id the exec_* verbs take (see ops_exec.go), or the
 // path/offset/chunk the fs_* verbs take (see ops_fs.go).
 func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any, emit Emit) (any, error) {
+	if !workspaceRuntimeSupported && workspaceLifecycleVerbs[verb] {
+		return nil, fmt.Errorf("verb %q needs the local workspace runtime (podman + a Linux container image), "+
+			"which does not exist on this host — it is linked lean. "+
+			"exec_*, list_processes and fs_* are the verbs this host serves", verb)
+	}
 	switch verb {
 	case "stop":
 		return h.Stop(ctx, emit)
@@ -159,6 +164,31 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return nil, fmt.Errorf("unknown verb %q", verb)
 	}
 }
+
+// workspaceLifecycleVerbs are the verbs that drive the podman-managed
+// workspace container. On a host with no local runtime they can only ever
+// fail; the point of naming them is that they fail SAYING SO, instead of
+// bubbling up a bare "exec: podman: executable file not found in $PATH"
+// that reads like a broken PATH rather than a host that was never meant to
+// have podman in the first place. workspaceRuntimeSupported is the
+// build-tagged switch — see proc_unix.go / proc_windows.go.
+var workspaceLifecycleVerbs = map[string]bool{
+	"stop":        true,
+	"restart":     true,
+	"uninstall":   true,
+	"reinstall":   true,
+	"bootstrap":   true,
+	"update":      true,
+	"self-update": true,
+}
+
+// "health" is deliberately NOT in that list. It already degrades correctly
+// on its own — a failed `podman inspect` returns {"healthy": false,
+// "offline": true} rather than an error — and that is exactly the right
+// answer for a host with no workspace to report on. Erroring instead would
+// turn a lean host's honest "no workspace here" into a tunnel-level failure
+// on the control plane's dashboard. A lean LINUX host already behaves this
+// way today; Windows just inherits it.
 
 func (h *Handler) runner() Runner {
 	if h.Runner != nil {

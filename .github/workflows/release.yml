@@ -60,26 +60,39 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Build linux/amd64 + linux/arm64 + darwin/amd64 + darwin/arm64
+      - name: Build linux + darwin + windows (amd64 & arm64 each)
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p dist
-          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             os="${platform%/*}"
             arch="${platform#*/}"
-            GOOS=$os GOARCH=$arch go build \
-              -ldflags "-X main.version=${VERSION}" \
-              -o "dist/aw-remote-host" \
-              ./cmd/aw-remote-host
-            tar -czf "dist/aw-remote-host_${VERSION}_${os}_${arch}.tar.gz" -C dist aw-remote-host
-            rm dist/aw-remote-host
+            # Windows ships a .exe in a .zip: PowerShell's Expand-Archive
+            # reads zip natively, while tar.gz needs a third-party tool on
+            # anything older than Windows 10 1803. install.ps1 depends on
+            # this naming.
+            if [ "$os" = "windows" ]; then
+              GOOS=$os GOARCH=$arch go build \
+                -ldflags "-X main.version=${VERSION}" \
+                -o "dist/aw-remote-host.exe" \
+                ./cmd/aw-remote-host
+              (cd dist && zip -q "aw-remote-host_${VERSION}_${os}_${arch}.zip" aw-remote-host.exe)
+              rm dist/aw-remote-host.exe
+            else
+              GOOS=$os GOARCH=$arch go build \
+                -ldflags "-X main.version=${VERSION}" \
+                -o "dist/aw-remote-host" \
+                ./cmd/aw-remote-host
+              tar -czf "dist/aw-remote-host_${VERSION}_${os}_${arch}.tar.gz" -C dist aw-remote-host
+              rm dist/aw-remote-host
+            fi
           done
 
       - name: Checksums
         run: |
           cd dist
-          sha256sum *.tar.gz > checksums.txt
+          sha256sum *.tar.gz *.zip > checksums.txt
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -91,6 +104,7 @@ jobs:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/checksums.txt
 
       - name: Notify aw-backend release registry
