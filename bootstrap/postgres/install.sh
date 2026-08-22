@@ -27,11 +27,13 @@ POSTGRES_GID="999"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/publish.sh
 source "$SCRIPT_DIR/../lib/publish.sh"
+# shellcheck source=../lib/network.sh
+source "$SCRIPT_DIR/../lib/network.sh"
 mapfile -t PUBLISH_ARGS < <(publish_args postgres 5432 "${AW_POSTGRES_PUBLISH:-}")
 
 # Shared network so the workspace container reaches postgres by name (a BYOD
 # host has no aw-sandbox netns to piggyback on 127.0.0.1).
-podman network exists "$NETWORK_NAME" >/dev/null 2>&1 || podman network create "$NETWORK_NAME" >/dev/null
+ensure_network "$NETWORK_NAME"
 
 # A container left over from before the volume->host-dir move must be REPLACED,
 # not just started — otherwise a host bootstrapped earlier keeps its database

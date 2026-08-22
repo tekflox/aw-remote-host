@@ -23,10 +23,12 @@ REDIS_GID="999"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/publish.sh
 source "$SCRIPT_DIR/../lib/publish.sh"
+# shellcheck source=../lib/network.sh
+source "$SCRIPT_DIR/../lib/network.sh"
 mapfile -t PUBLISH_ARGS < <(publish_args redis 6379 "${AW_REDIS_PUBLISH:-}")
 
 # Shared network so the workspace container reaches redis by name.
-podman network exists "$NETWORK_NAME" >/dev/null 2>&1 || podman network create "$NETWORK_NAME" >/dev/null
+ensure_network "$NETWORK_NAME"
 
 if podman container exists "$CONTAINER_NAME"; then
   current_src="$(podman inspect "$CONTAINER_NAME" \

@@ -98,7 +98,12 @@ if [[ "$IMAGE" == localhost/* || "$IMAGE" == localhost:* || "$IMAGE" == 127.0.0.
 fi
 
 # Ensure the shared network exists (postgres/redis create it too — idempotent).
-podman network exists "$NETWORK_NAME" >/dev/null 2>&1 || podman network create "$NETWORK_NAME" >/dev/null
+# ensure_network also repairs a podman-3.x CNI config the installed plugins
+# would otherwise reject — see bootstrap/lib/network.sh.
+NETWORK_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/network.sh
+source "$NETWORK_LIB_DIR/../lib/network.sh"
+ensure_network "$NETWORK_NAME"
 
 # First-run seed: the repo is baked into the image at $CONTAINER_WORKDIR, but a
 # bind-mount over that path would MASK it with an empty host dir. So if the host
