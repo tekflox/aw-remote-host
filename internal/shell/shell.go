@@ -10,6 +10,11 @@
 // control planes older than the field) runs `podman exec -it
 // aw-remote-host-workspace`, "host" runs the shell right here, on the box
 // this process is running on. Bash with an `sh` fallback either way.
+//
+// How the terminal itself is created is per-platform and lives next door:
+// spawn_unix.go (creack/pty) and conpty_windows.go (Win32 ConPTY, built by
+// hand because creack/pty's Windows files are stubs). Both export the same
+// startPTY, so everything in this file is platform-agnostic.
 package shell
 
 import (
@@ -17,14 +22,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
-	"runtime"
-	"strings"
 	"sync"
-
-	"github.com/creack/pty"
-	"github.com/tekflox/aw-remote-host/internal/ops"
 )
 
 // PTY abstracts a spawned pseudo-terminal process so tests can inject a fake
@@ -35,29 +33,6 @@ type PTY interface {
 	io.Writer
 	Resize(cols, rows uint16) error
 	Close() error
-}
-
-// execPTY is the production PTY — a real podman-exec process attached to a
-// creack/pty master.
-type execPTY struct {
-	cmd *exec.Cmd
-	f   *os.File
-}
-
-func (e *execPTY) Read(p []byte) (int, error)  { return e.f.Read(p) }
-func (e *execPTY) Write(p []byte) (int, error) { return e.f.Write(p) }
-
-func (e *execPTY) Resize(cols, rows uint16) error {
-	return pty.Setsize(e.f, &pty.Winsize{Cols: cols, Rows: rows})
-}
-
-func (e *execPTY) Close() error {
-	_ = e.f.Close()
-	if e.cmd.Process != nil {
-		_ = e.cmd.Process.Kill()
-		_, _ = e.cmd.Process.Wait()
-	}
-	return nil
 }
 
 // Where a pty_open lands. These are two genuinely different machines, not a
@@ -89,67 +64,19 @@ func resolveTarget(target string) (string, error) {
 }
 
 // Spawner starts a new PTY-backed shell process on target. Overridable in
-// tests so they never touch a real podman/creack-pty.
+// tests so they never touch a real podman/pty.
 type Spawner func(ctx context.Context, target string) (PTY, error)
 
-// interactiveShell is the command both targets run: detect bash with
-// `command -v` (redirecting only the *probe's* output), then exec it WITHOUT
-// redirecting the shell's own stderr — an interactive bash writes its prompt
-// (PS1) and readline UI to stderr, so the old `exec bash 2>/dev/null` silently
-// discarded the prompt and the session looked dead until you typed a command
-// whose stdout happened to show. `exec` replaces the process but keeps fd
-// redirections, which is exactly why that redirection leaked into the shell.
-const interactiveShell = "command -v bash >/dev/null 2>&1 && exec bash || exec sh"
-
-// DefaultSpawner runs an interactive shell on target — inside the workspace
-// container via podman exec, or directly on this host.
-//
-// The host branch is NOT `podman exec` minus the podman: it is this process's
-// own environment, so it inherits whatever aw-remote-host was started with.
-// That makes TERM the one thing worth forcing — a shell spawned from a systemd
-// unit or a container entrypoint has no TERM at all, and bash then falls back
-// to `dumb`, which kills arrow keys, colour and every full-screen program
-// (vim, top) the interactive shell exists for.
+// DefaultSpawner resolves the target and hands off to the platform's own
+// startPTY — spawn_unix.go on POSIX, conpty_windows.go on Windows. The
+// resolution is deliberately shared: an unknown target must be rejected
+// identically everywhere, since it decides WHICH MACHINE a shell opens on.
 func DefaultSpawner(ctx context.Context, target string) (PTY, error) {
 	resolved, err := resolveTarget(target)
 	if err != nil {
 		return nil, err
 	}
-
-	var cmd *exec.Cmd
-	if resolved == TargetHost {
-		cmd = exec.CommandContext(ctx, "sh", "-c", interactiveShell)
-		cmd.Env = withTerm(os.Environ())
-	} else {
-		cmd = exec.CommandContext(ctx, "podman", "exec", "-it", ops.WorkspaceContainer,
-			"sh", "-c", interactiveShell)
-	}
-
-	f, err := pty.Start(cmd)
-	if err != nil {
-		if runtime.GOOS == "windows" {
-			// creack/pty compiles on Windows but every call is a stub
-			// returning ErrUnsupported — a real PTY there means ConPTY,
-			// which this build does not implement. Say that plainly: the
-			// bare wrapped error is "start pty (host): unsupported", which
-			// reads like a transient fault rather than a missing feature.
-			return nil, fmt.Errorf("interactive shell is not available on a Windows host: "+
-				"the PTY channel needs ConPTY, which this build does not implement yet. "+
-				"Use exec_start/exec_wait for one-shot commands instead (underlying error: %w)", err)
-		}
-		return nil, fmt.Errorf("start pty (%s): %w", resolved, err)
-	}
-	return &execPTY{cmd: cmd, f: f}, nil
-}
-
-// withTerm returns env with a usable TERM, leaving an existing one alone.
-func withTerm(env []string) []string {
-	for _, kv := range env {
-		if strings.HasPrefix(kv, "TERM=") && kv != "TERM=" {
-			return env
-		}
-	}
-	return append(env, "TERM=xterm-256color")
+	return startPTY(ctx, resolved)
 }
 
 // EmitFunc sends a pty_output frame for sessionID back over the /link

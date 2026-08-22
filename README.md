@@ -200,15 +200,27 @@ there. What a Windows machine gets is the `/link` connection itself:
 | Works | Does not |
 |---|---|
 | `exec_start` / `exec_status` / `exec_wait` / `exec_kill` | `stop` / `restart` / `reinstall` / `bootstrap` / `update` |
-| `list_processes` | `self-update` |
-| every `fs_*` verb (stat/list/mkdir/delete/read/write) | the interactive PTY shell |
+| `list_processes` | `self-update` (its rollback monitor is a `sh -c` script) |
+| every `fs_*` verb (stat/list/mkdir/delete/read/write) | a PTY on the `workspace` target — there is no container here |
+| the interactive PTY shell, via ConPTY | |
 | `health` (reports `offline: true` — there is no workspace to report on) | |
+
+Because `self-update` is refused, **updating a Windows host is manual**:
+re-run `install.ps1`, then `bootstrap-workspace --background` to re-register
+the Scheduled Task against the new binaries.
 
 The verbs in the right column are refused **by name** with an explanation,
 rather than failing with a bare "podman: executable file not found" that
 reads like a broken PATH (see `workspaceLifecycleVerbs` in
-`internal/ops/ops.go`). The PTY shell needs ConPTY, which this build does
-not implement — `exec_start` covers one-shot commands in the meantime.
+`internal/ops/ops.go`).
+
+The interactive shell is a real **ConPTY** pseudoconsole
+(`internal/shell/conpty_windows.go`), not an emulation: arrow keys, colour
+and full-screen programs work. It is hand-built on `CreatePseudoConsole` +
+`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` because `creack/pty` — which the POSIX
+side uses — ships Windows files that are stubs returning `ErrUnsupported`,
+and because `os/exec` cannot pass a process-thread attribute list. Needs
+Windows 10 1809 or newer. `pwsh` when installed, else `powershell.exe`.
 
 Install:
 
