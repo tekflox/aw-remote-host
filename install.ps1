@@ -70,6 +70,32 @@ try {
 
     Write-Host "aw-remote-host: installing to $installDir"
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+
+    # Windows locks a RUNNING executable, and on a linked host one of these
+    # is always running — the Scheduled Task is holding the /link connection
+    # open right now. Expand-Archive over it fails with a sharing violation,
+    # which is how "just re-run the installer to update" turns into a dead
+    # end you can only escape by stopping the task first.
+    #
+    # Renaming, however, is allowed on a running image: the open handle
+    # follows the file, the running process carries on untouched, and the
+    # name is freed for the new binary. The displaced file is deleted on the
+    # NEXT run, once nothing holds it any more.
+    foreach ($exe in @('aw-remote-host.exe', 'aw-remote-hostw.exe')) {
+        $target = Join-Path $installDir $exe
+        $stale = "$target.old"
+        if (Test-Path $stale) {
+            Remove-Item $stale -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $target) {
+            try {
+                Rename-Item -Path $target -NewName "$exe.old" -Force -ErrorAction Stop
+            } catch {
+                throw "aw-remote-host: could not move $target aside ($($_.Exception.Message)). Stop the Scheduled Task and retry: schtasks /End /TN aw-remote-host"
+            }
+        }
+    }
+
     # -Force so re-running over an existing install overwrites rather than
     # prompting — this script has to be safe to pipe into iex unattended.
     Expand-Archive -Path $zipPath -DestinationPath $installDir -Force

@@ -206,8 +206,18 @@ there. What a Windows machine gets is the `/link` connection itself:
 | `health` (reports `offline: true` — there is no workspace to report on) | |
 
 Because `self-update` is refused, **updating a Windows host is manual**:
-re-run `install.ps1`, then `bootstrap-workspace --background` to re-register
-the Scheduled Task against the new binaries.
+
+```powershell
+irm https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.ps1 | iex
+schtasks /End /TN aw-remote-host
+aw-remote-host bootstrap-workspace --background
+```
+
+The installer handles the running binary being locked — Windows forbids
+overwriting a running image but permits renaming one, so it moves the old
+exe to `.old` (cleaned up on the next run) rather than failing with a
+sharing violation. The task still has to be restarted to pick the new
+binary up, hence the last two lines.
 
 The verbs in the right column are refused **by name** with an explanation,
 rather than failing with a bare "podman: executable file not found" that
