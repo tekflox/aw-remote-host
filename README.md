@@ -215,8 +215,12 @@ aw-remote-host bootstrap-workspace --background
 
 The installer handles the running binary being locked — Windows forbids
 overwriting a running image but permits renaming one, so it moves the old
-exe to `.old` (cleaned up on the next run) rather than failing with a
-sharing violation. The task still has to be restarted to pick the new
+exe aside under a **timestamped** name rather than failing with a sharing
+violation. The timestamp matters: a fixed `.old` collides with a still-
+running predecessor from a previous update, and the rename then fails
+partway through and leaves the directory with no usable binary at all.
+Displaced copies are swept on later runs; anything still locked is left
+alone. The task still has to be restarted to pick the new
 binary up, hence the last two lines.
 
 The verbs in the right column are refused **by name** with an explanation,

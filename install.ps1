@@ -81,20 +81,40 @@ try {
     # follows the file, the running process carries on untouched, and the
     # name is freed for the new binary. The displaced file is deleted on the
     # NEXT run, once nothing holds it any more.
+    # The displaced name must be UNIQUE, not a fixed ".old".
+    #
+    # A fixed name looked fine and then destroyed a working install. The
+    # sequence: update once, so aw-remote-hostw.exe.old exists and the
+    # Scheduled Task is running THAT image (Windows keeps a renamed running
+    # binary alive under its new name). Update again: Remove-Item cannot
+    # delete the .old because it is locked by that live process, and
+    # -ErrorAction SilentlyContinue swallowed the failure; Rename-Item then
+    # failed with "Cannot create a file when that file already exists" —
+    # AFTER the first executable had already been renamed away. Expand-Archive
+    # never ran, and the install directory was left with no usable binary at
+    # all, on a machine reachable only through the process that binary
+    # supervises.
+    #
+    # A timestamped name can never collide, so a locked predecessor is simply
+    # left where it is rather than blocking the update.
+    $stamp = Get-Date -Format 'yyyyMMddHHmmss'
     foreach ($exe in @('aw-remote-host.exe', 'aw-remote-hostw.exe')) {
         $target = Join-Path $installDir $exe
-        $stale = "$target.old"
-        if (Test-Path $stale) {
-            Remove-Item $stale -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path $target) {
-            try {
-                Rename-Item -Path $target -NewName "$exe.old" -Force -ErrorAction Stop
-            } catch {
-                throw "aw-remote-host: could not move $target aside ($($_.Exception.Message)). Stop the Scheduled Task and retry: schtasks /End /TN aw-remote-host"
-            }
+        if (-not (Test-Path $target)) { continue }
+        try {
+            Rename-Item -Path $target -NewName "$exe.$stamp.old" -Force -ErrorAction Stop
+        } catch {
+            throw "aw-remote-host: could not move $target aside ($($_.Exception.Message)). Stop the Scheduled Task and retry: schtasks /End /TN aw-remote-host"
         }
     }
+
+    # Sweep displaced binaries from EARLIER runs, best-effort. Whatever is
+    # still locked stays; it is a few MB and the next run tries again. This
+    # runs before the extract so a failure here cannot leave the directory
+    # without a working binary.
+    Get-ChildItem -Path $installDir -Filter '*.old' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notlike "*.$stamp.old" } |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
 
     # -Force so re-running over an existing install overwrites rather than
     # prompting — this script has to be safe to pipe into iex unattended.
