@@ -27,6 +27,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/tcpproxy"
 	"github.com/tekflox/aw-remote-host/internal/tunnelproxy"
 	"github.com/tekflox/aw-remote-host/internal/updater"
+	"github.com/tekflox/aw-remote-host/internal/wsl"
 )
 
 // registerTimeout bounds how long bootstrap-workspace waits for the first
@@ -189,6 +190,37 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	}
 	runInBackground := bgMode // default (neither flag given) is foreground
 	provisionWorkspace := allowProvision && (*withWorkspace || *full)
+
+	// On Windows, "provision the workspace here" cannot mean what it means
+	// everywhere else — the workspace is a Linux container image, so there is
+	// nothing for the podman modules to install on this machine. It means
+	// "stand up a WSL2 distro and provision it in there", which is a wholly
+	// different path and takes over the whole command.
+	//
+	// The Windows machine itself stays a lean link (see
+	// internal/ops.workspaceRuntimeSupported); the distro becomes a second,
+	// Linux host of the same workspace, which the control plane models fine.
+	if provisionWorkspace && runtime.GOOS == "windows" {
+		if *plan {
+			fmt.Printf("[plan] would provision the workspace inside a WSL2 distro (%s):\n", wsl.DefaultDistro)
+			for _, step := range []string{
+				"update the WSL kernel",
+				"download the Ubuntu rootfs and import it as " + wsl.DefaultDistro,
+				"enable systemd inside it",
+				"install aw-remote-host inside it",
+				"run bootstrap-workspace --with-workspace in there (podman, postgres, redis, workspace)",
+				"install a systemd service inside it, and a Startup-folder keep-alive out here",
+			} {
+				fmt.Printf("[plan] wsl: %s\n", step)
+			}
+			return nil
+		}
+		return wsl.ProvisionWorkspace(wsl.Options{
+			Token:        *token,
+			ControlPlane: *controlPlane,
+			Log:          func(f string, a ...any) { fmt.Printf(f+"\n", a...) },
+		})
+	}
 
 	m, err := bootstrap.LoadEmbeddedManifest()
 	if err != nil {

@@ -265,11 +265,34 @@ Three Windows-specific things worth knowing:
 - **Killing a job kills its whole tree** (`taskkill /T /F`), the Windows
   stand-in for the process-group SIGKILL used on POSIX.
 
-If you want the *full* workspace runtime on a Windows machine, use **WSL2**
-instead: inside a WSL2 Ubuntu everything is ordinary Linux, so `install.sh`
-and `--with-workspace` work unmodified. Enable systemd (`[boot]
-systemd=true` in `/etc/wsl.conf`) and `loginctl enable-linger $USER` first,
-or the service will not survive your terminal closing.
+#### Running the workspace on a Windows machine
+
+`--with-workspace` on Windows does not try to provision this machine — it
+stands up a **WSL2 distro** and provisions the workspace in there, because
+the workspace is a Linux container image:
+
+```powershell
+aw-remote-host bootstrap-workspace --token awbs_... --with-workspace
+```
+
+That single command updates the WSL kernel, imports an Ubuntu rootfs as a
+distro named `aw-ubuntu`, enables systemd in it, installs the Linux
+aw-remote-host inside, provisions podman/postgres/redis/the workspace, then
+installs a systemd service in the distro and a Startup-folder keep-alive out
+on Windows so all of it returns at logon. `--plan` prints the steps without
+doing any of it. It is idempotent: an existing distro is reused, and the
+rootfs is cached.
+
+The result is TWO linked hosts for one workspace on one physical machine —
+the Windows box (lean: exec, fs, shell) and the distro (which runs the
+workspace). The control plane models that fine; `RemoteHost.workspace_slug`
+is a plain foreign key.
+
+Note the keep-alive: WSL shuts an idle distro down, so the Startup script
+holds a blocking command open rather than just booting the distro and
+exiting. Without it systemd and every container go down seconds after
+logon, while `wsl -l -v` reports Stopped and any diagnostic command you run
+quietly starts it again.
 
 ### macOS container runtime
 
