@@ -26,14 +26,32 @@ import (
 // importing over it would be destructive.
 const DefaultDistro = "aw-ubuntu"
 
-// RootfsURL is the official Ubuntu 22.04 WSL rootfs.
+// RootfsURL is the Ubuntu 24.04 (noble) WSL image.
 //
-// Note the filename: `-ubuntu22.04lts.rootfs.tar.gz`, NOT the `-wsl.rootfs`
-// form that older docs use — that one 404s. 24.04 (noble) would be
-// preferable, since it ships podman 4.x and skips the CNI repair in
-// bootstrap/lib/network.sh entirely, but Canonical no longer publishes a
-// noble rootfs at cloud-images.
-const RootfsURL = "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz"
+// **24.04 and not 22.04, and the difference is not cosmetic.** jammy ships
+// podman 3.4.4, which is CNI-era; noble ships podman 4.x, which uses
+// netavark. Provisioning on jammy hit three separate CNI failures in one
+// day, each presenting as something else entirely:
+//
+//  1. `podman network create` writes `"cniVersion": "1.0.0"` that jammy's
+//     own `firewall` plugin rejects, so every container start failed with
+//     `CNI network "aw-remote-host" not found` (see the repair in
+//     bootstrap/lib/network.sh — still needed for pre-existing hosts).
+//  2. An orphaned `dnsmasq` kept the network gateway address bound, so the
+//     `dnsname` plugin could not attach a container at all:
+//     `failed to create listening socket for 10.89.0.1: Address already in use`.
+//  3. Published ports stopped being bound on the host while the container
+//     itself was healthy — the workspace answered on the podman network and
+//     was unreachable on 127.0.0.1:9030, so the bootstrap's readiness probe
+//     timed out and stopped a container that was working fine, forever.
+//
+// netavark has none of these. bootstrap/manifest.json has asked for podman
+// 4.x from the start; jammy was simply the only rootfs that could be found
+// at the time.
+//
+// Served as a `.wsl` file, which despite the extension is a gzipped tar and
+// imports with `wsl --import` unchanged.
+const RootfsURL = "https://cdimages.ubuntu.com/ubuntu-wsl/noble/daily-live/current/noble-wsl-amd64.wsl"
 
 // decodeOutput converts wsl.exe's output to a normal Go string.
 //

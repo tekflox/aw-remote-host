@@ -116,7 +116,9 @@ func fetchRootfs(opts Options) (string, error) {
 	if err := os.MkdirAll(opts.RootDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir %s: %w", opts.RootDir, err)
 	}
-	path := filepath.Join(opts.RootDir, "ubuntu-rootfs.tar.gz")
+	// Name carries the release so switching bases (22.04 -> 24.04, see
+	// RootfsURL) does not silently reuse the previous one from cache.
+	path := filepath.Join(opts.RootDir, "ubuntu-noble-rootfs.tar.gz")
 
 	// A previous run may have been interrupted mid-download; a truncated
 	// tarball fails `wsl --import` with an unhelpful error, so treat
@@ -126,7 +128,7 @@ func fetchRootfs(opts Options) (string, error) {
 		return path, nil
 	}
 
-	opts.Log("wsl: downloading the Ubuntu rootfs (~325 MB)")
+	opts.Log("wsl: downloading the Ubuntu 24.04 rootfs (~370 MB)")
 	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Get(RootfsURL)
 	if err != nil {
