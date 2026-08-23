@@ -23,7 +23,9 @@ jobs:
       # to `go test`. publish.sh in particular guards the case that made
       # aw-remote-host uninstallable on any host already using 5432/6379.
       - name: bootstrap shell unit tests
-        run: bash tests/bootstrap/publish_test.sh
+        run: |
+          bash tests/bootstrap/publish_test.sh
+          bash tests/bootstrap/network_test.sh
       - name: shellcheck bootstrap scripts
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then

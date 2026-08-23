@@ -7,14 +7,19 @@
 # to inline the same `podman network exists || podman network create`, and all
 # three were equally broken by the problem below.
 
-# ensure_network creates the network if absent, then repairs the CNI config
-# version when this host needs it.
+# podmanMajor prints podman's major version, or nothing if it can't be read.
+podman_major() {
+  podman --version 2>/dev/null | awk '{print $3}' | cut -d. -f1
+}
+
+# repair_cni_config_version rewrites `"cniVersion": "1.0.0"` down to "0.4.0"
+# in every CNI conflist on this host, but ONLY on a podman older than 4.
 #
-# THE BUG THIS EXISTS FOR, observed on a real Ubuntu 22.04 host:
+# THE BUG THIS EXISTS FOR, observed twice on a real Ubuntu 22.04 host:
 # jammy ships podman 3.4.4, which still uses CNI (netavark arrived in podman
-# 4.x), and its `podman network create` writes `"cniVersion": "1.0.0"` into
-# /etc/cni/net.d/<name>.conflist. But jammy's containernetworking-plugins
-# only support up to 0.4.0, so the `firewall` plugin rejects the file:
+# 4.x), and its `podman network create` writes `"cniVersion": "1.0.0"`. But
+# jammy's containernetworking-plugins only support up to 0.4.0, so the
+# `firewall` plugin rejects the file:
 #
 #   Error validating CNI config file .../aw-remote-host.conflist:
 #     [plugin firewall does not support config version "1.0.0"]
@@ -24,47 +29,47 @@
 # `install failed: exit status 127`. The failure names the network, not the
 # version mismatch, so it reads like the create silently did nothing.
 #
-# manifest.json asks for podman 4.x precisely to avoid CNI, but a distro that
-# packages 3.x is exactly the case `4.x (distro-packaged)` cannot guarantee.
-# Rewriting the version is safe: 0.4.0 is what the installed plugins speak,
-# and nothing in the generated conflist uses a 1.0.0-only feature.
+# WHY THIS IS UNCONDITIONAL rather than "repair only if the network looks
+# broken": the first version of this fix guarded on `podman network inspect`
+# succeeding, reasoning that a usable network needs no repair. That guard
+# made the whole thing a no-op, because **inspect reads the conflist without
+# validating it against the installed plugins** — it happily returns the
+# rejected network. The mismatch only ever surfaces at container-start time,
+# far too late to react to. So there is no cheap runtime probe to gate on;
+# the podman major version IS the signal.
 #
-# Deliberately narrow: only touches files that declare 1.0.0, only when the
-# plugins are too old to accept it, and never on a netavark host (podman 4+
-# writes no conflist at all, so the loop simply finds nothing).
-ensure_network() {
-  local name="$1"
+# Scoped by version rather than by filename because the default `podman`
+# network's conflist has the same problem, and a container attached to any
+# rejected network fails the same way. On podman 4+ this loop finds nothing
+# at all — netavark writes no conflists — so the version check is belt and
+# braces rather than the only guard.
+#
+# 0.4.0 is safe: it is what the installed plugins speak, and nothing in a
+# generated conflist uses a 1.0.0-only feature.
+repair_cni_config_version() {
+  local major
+  major="$(podman_major)"
+  case "$major" in
+    '' | *[!0-9]*) return 0 ;;   # unreadable version — do not guess
+  esac
+  [ "$major" -lt 4 ] || return 0
 
-  podman network exists "$name" >/dev/null 2>&1 || podman network create "$name" >/dev/null
-
-  # If the network is already usable, there is nothing to repair. This is the
-  # netavark path and the already-patched path both.
-  if podman network inspect "$name" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  local repaired=0
   local conf
   for conf in /etc/cni/net.d/*.conflist "${HOME}/.config/cni/net.d/"*.conflist; do
     [ -f "$conf" ] || continue
     grep -q '"cniVersion"[[:space:]]*:[[:space:]]*"1\.0\.0"' "$conf" || continue
     if sed -i 's/"cniVersion"[[:space:]]*:[[:space:]]*"1\.0\.0"/"cniVersion": "0.4.0"/' "$conf" 2>/dev/null; then
-      echo "network: downgraded cniVersion 1.0.0 -> 0.4.0 in $conf (podman $(podman --version 2>/dev/null | awk '{print $3}') ships CNI configs its own plugins reject)"
-      repaired=1
+      echo "network: podman ${major}.x wrote a CNI config its own plugins reject — downgraded cniVersion 1.0.0 -> 0.4.0 in $conf"
     fi
   done
+}
 
-  if [ "$repaired" = "1" ]; then
-    # The network may have been created before the repair, in which case its
-    # conflist is now valid and podman can see it. Re-create only if it still
-    # cannot.
-    podman network inspect "$name" >/dev/null 2>&1 || \
-      podman network create "$name" >/dev/null 2>&1 || true
-  fi
+# ensure_network creates the network if absent, then repairs the CNI config
+# version. The repair runs AFTER the create on purpose: `network create` is
+# what writes the offending 1.0.0, so repairing first would fix nothing.
+ensure_network() {
+  local name="$1"
 
-  if ! podman network inspect "$name" >/dev/null 2>&1; then
-    echo "network: '$name' still not usable after CNI repair — containers will fail to start." >&2
-    echo "network: check 'podman network ls' and /etc/cni/net.d/*.conflist by hand." >&2
-    return 1
-  fi
+  podman network exists "$name" >/dev/null 2>&1 || podman network create "$name" >/dev/null
+  repair_cni_config_version
 }
