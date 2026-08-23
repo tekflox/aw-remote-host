@@ -4,13 +4,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 // LogPath is where the windowless Windows build sends everything it would
 // otherwise have printed to a console. Same directory as credentials.json
 // and state.json, so one folder holds everything this CLI owns.
 func logPath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", err
 	}

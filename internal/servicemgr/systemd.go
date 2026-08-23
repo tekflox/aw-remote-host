@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 // systemdUnitName is the single, fixed user unit name — unlike launchd,
@@ -44,7 +46,7 @@ func GenerateSystemdUnit(cfg Config) string {
 }
 
 func (m *systemdManager) Path(_ Config) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}

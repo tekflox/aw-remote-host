@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 // ModuleStatus is the detect->install->verify outcome for one module.
@@ -71,7 +73,7 @@ func runScript(ctx context.Context, path string, opts RunOptions) (string, error
 // if it exists on this machine — the runner's half of the dependency
 // propagation contract documented in bootstrap/lib/README.md.
 func podmanVendoredBinDir() (string, bool) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", false
 	}

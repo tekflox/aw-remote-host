@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 // State is the on-disk shape of ~/.aw-remote-host/state.json.
@@ -40,7 +42,7 @@ type State struct {
 
 // DefaultPath returns ~/.aw-remote-host/state.json.
 func DefaultPath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}

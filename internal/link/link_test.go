@@ -519,7 +519,6 @@ func TestPTYOpenForwardsTarget(t *testing.T) {
 	}
 }
 
-
 // The badge in aw-console reads both, and needs them on every register —
 // including a reconnect, and including when empty. An empty string is a real
 // state here (the host revoked its grants), not a missing field.

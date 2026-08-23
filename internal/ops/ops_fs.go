@@ -34,6 +34,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 const (
@@ -67,7 +69,7 @@ func expandPath(p string) (string, error) {
 		return "", fmt.Errorf("path is required")
 	}
 	if p == "~" || strings.HasPrefix(p, "~/") {
-		home, err := os.UserHomeDir()
+		home, err := homedir.Dir()
 		if err != nil {
 			return "", fmt.Errorf("resolve home dir: %w", err)
 		}
@@ -77,7 +79,7 @@ func expandPath(p string) (string, error) {
 		return filepath.Join(home, p[2:]), nil
 	}
 	if !filepath.IsAbs(p) {
-		home, err := os.UserHomeDir()
+		home, err := homedir.Dir()
 		if err != nil {
 			return "", fmt.Errorf("resolve home dir: %w", err)
 		}

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
@@ -70,7 +72,7 @@ func GenerateLaunchdPlist(cfg Config) (string, error) {
 }
 
 func launchdLogPath(slug string) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
@@ -78,7 +80,7 @@ func launchdLogPath(slug string) (string, error) {
 }
 
 func (m *launchdManager) Path(cfg Config) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}

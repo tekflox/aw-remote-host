@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode/utf16"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 // schtasksName is the single, fixed Scheduled Task name — same choice as
@@ -151,7 +153,7 @@ func utf16LEWithBOM(s string) []byte {
 }
 
 func (m *schtasksManager) Path(_ Config) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 // Credentials is the durable awlk_ host credential persisted after the
@@ -20,7 +22,7 @@ type Credentials struct {
 
 // DefaultCredentialsPath returns ~/.aw-remote-host/credentials.json.
 func DefaultCredentialsPath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}

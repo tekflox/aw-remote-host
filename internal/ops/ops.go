@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 	"github.com/tekflox/aw-remote-host/internal/hostpower"
 	"github.com/tekflox/aw-remote-host/internal/state"
 	"github.com/tekflox/aw-remote-host/internal/updater"
@@ -540,7 +541,7 @@ func dataHostDir(envVar, name string) (string, error) {
 	if dir := strings.TrimSpace(os.Getenv(envVar)); dir != "" {
 		return dir, nil
 	}
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
@@ -551,7 +552,7 @@ func workspaceHostDir() (string, error) {
 	if dir := strings.TrimSpace(os.Getenv("AW_WORKSPACE_HOST_DIR")); dir != "" {
 		return dir, nil
 	}
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}

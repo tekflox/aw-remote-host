@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 const (
@@ -32,7 +34,7 @@ type Pending struct {
 }
 
 func Dir() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
@@ -121,7 +123,7 @@ func InstallDirFor(currentPath string) string {
 	if currentPath != "" {
 		return filepath.Dir(currentPath)
 	}
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return ""
 	}

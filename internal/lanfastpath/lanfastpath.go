@@ -31,6 +31,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
 
 // DefaultPort is the high (non-privileged) TLS port the terminator binds.
@@ -68,7 +70,7 @@ func (c Config) target() string {
 // TLSDir returns ~/.aw-remote-host/tls — where the control plane drops (and
 // this host reads) the per-workspace cert + key delivered over /link.
 func TLSDir() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
