@@ -278,3 +278,38 @@ func TestSystemdPathIsNotSlugScoped(t *testing.T) {
 		t.Errorf("unexpected unit path: %q", pathA)
 	}
 }
+
+func TestGenerateSchtasksTaskXMLRunLevel(t *testing.T) {
+	base := Config{ExePath: `C:\x.exe`, ControlPlane: "https://y"}
+
+	// Unprivileged is the default and must stay the default: everything the
+	// lean link exists to do works without admin, and an install that
+	// silently demands it is the worse failure.
+	plain := GenerateSchtasksTaskXML(base)
+	if !strings.Contains(plain, "<RunLevel>LeastPrivilege</RunLevel>") {
+		t.Fatalf("default install must stay unprivileged:\n%s", plain)
+	}
+	if strings.Contains(plain, "HighestAvailable") {
+		t.Error("a default install must never ask for elevation")
+	}
+
+	elevated := base
+	elevated.Elevated = true
+	doc := GenerateSchtasksTaskXML(elevated)
+	if !strings.Contains(doc, "<RunLevel>HighestAvailable</RunLevel>") {
+		t.Fatalf("Elevated=true must raise the run level:\n%s", doc)
+	}
+	if strings.Contains(doc, "LeastPrivilege") {
+		t.Error("both run levels present — the template substituted the wrong slot")
+	}
+
+	// Order is load-bearing: Task Scheduler validates against a fixed
+	// sequence, and a RunLevel outside Principal is a hard rejection from
+	// schtasks /Create rather than a task that merely lacks rights.
+	if strings.Index(doc, "<RunLevel>") < strings.Index(doc, "<LogonType>") {
+		t.Error("RunLevel must follow LogonType inside Principal")
+	}
+	if strings.Index(doc, "<RunLevel>") > strings.Index(doc, "</Principals>") {
+		t.Error("RunLevel must stay inside Principals")
+	}
+}

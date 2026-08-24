@@ -51,7 +51,7 @@ const schtasksXMLTemplate = `<?xml version="1.0" encoding="UTF-16"?>
   <Principals>
     <Principal id="Author">
       <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
+      <RunLevel>%s</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -99,8 +99,24 @@ func GenerateSchtasksTaskXML(cfg Config) string {
 	if slug == "" {
 		slug = "unknown"
 	}
+	// HighestAvailable means "use the highest rights this account HAS" — for
+	// an admin account that is a full elevated token, and for a standard
+	// account it is the same LeastPrivilege the task would have had anyway.
+	// So it never turns a non-admin user into one; it only stops UAC from
+	// handing an admin a filtered token, which is what silently reduces the
+	// link to a standard-user process on a machine whose owner is an admin.
+	//
+	// Registering a HighestAvailable task itself requires elevation, so this
+	// path is only reachable from an already-elevated `bootstrap-workspace
+	// --elevated`; schtasks /Create otherwise fails with access denied,
+	// which is the honest answer.
+	runLevel := "LeastPrivilege"
+	if cfg.Elevated {
+		runLevel = "HighestAvailable"
+	}
 	return fmt.Sprintf(schtasksXMLTemplate,
-		xmlEscape(slug), schtasksName, xmlEscape(cfg.ExePath), xmlEscape(cfg.ControlPlane))
+		xmlEscape(slug), schtasksName, runLevel,
+		xmlEscape(cfg.ExePath), xmlEscape(cfg.ControlPlane))
 }
 
 // taskExePath prefers the windowless sibling binary — aw-remote-hostw.exe

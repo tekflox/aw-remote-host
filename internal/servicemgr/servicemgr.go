@@ -24,6 +24,21 @@ type Config struct {
 	Slug         string // workspace slug, known once /link has registered
 	ExePath      string // absolute path to the aw-remote-host binary
 	ControlPlane string
+	// Elevated asks the OS to run the link with administrative rights.
+	//
+	// Windows only today. The default is deliberately off: everything the
+	// lean link exists to do — exec, file transfer, ConPTY — works fine
+	// unprivileged, and an install that silently demands admin is a worse
+	// default than one that cannot restart a service.
+	//
+	// What it unlocks is the class of task that is NOT optional-extra but
+	// simply impossible without it, and which reads to a user as the tool
+	// being broken: restarting a Windows service, writing under
+	// C:\Program Files, editing another service's config. Diagnosing a
+	// remote desktop on 2026-08-24 hit all three in one session — the
+	// symptom each time was an "Access denied" buried in a command's
+	// output, not a refusal the caller could see coming.
+	Elevated bool
 }
 
 // Manager installs/starts/stops/uninstalls the background service that

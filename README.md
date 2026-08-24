@@ -190,6 +190,33 @@ itself out of the existing data volume.
   to `~/.aw-remote-host/aw-remote-host.log`. Inspect the task with
   `schtasks /Query /TN aw-remote-host /V /FO LIST`.
 
+  The task runs **unprivileged by default** (`RunLevel=LeastPrivilege`).
+  Everything the lean link exists to do — `exec_*`, file transfer, the
+  ConPTY shell — works fine that way, and an install that silently demands
+  admin is a worse default than one that cannot restart a service.
+
+  What that costs you is a specific class of task that is not an
+  optional extra but simply impossible, and which reads like the tool being
+  broken rather than a permission problem: **restarting a Windows service,
+  writing anywhere under `C:\Program Files`, editing another service's
+  config file.** The symptom is an `Access denied` buried in a command's
+  output — `Restart-Service` comes back `CouldNotStopService`, an ini write
+  reports success at the shell and changes nothing.
+
+  Pass **`--elevated`** to register the task with
+  `RunLevel=HighestAvailable` instead, from a PowerShell started with
+  *Run as administrator*:
+
+  ```powershell
+  aw-remote-host bootstrap-workspace --elevated --background
+  ```
+
+  `HighestAvailable` means "the highest rights this account **has**" — it
+  never promotes a standard user, it only stops UAC handing an
+  administrator a filtered token. Registering such a task itself requires
+  elevation, so `--elevated` refuses up front outside an elevated prompt
+  rather than failing halfway through `schtasks /Create`.
+
 ### Firewall management (needs a privileged install)
 
 This host can manage its own firewall (`internal/firewall`) — the control

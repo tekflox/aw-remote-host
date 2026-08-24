@@ -166,6 +166,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	fg := fs.Bool("fg", false, "alias for --foreground")
 	background := fs.Bool("background", false, "install and start a background service (launchd on macOS, systemd on Linux), then detach")
 	detach := fs.Bool("detach", false, "alias for --background")
+	elevated := fs.Bool("elevated", false, "Windows only: register the background task to run with administrative rights (RunLevel=HighestAvailable). Needs an elevated prompt to register — without it the link runs as a standard user, which is enough for exec/file/shell but cannot restart a Windows service or write under C:\\Program Files. Ignored on macOS/Linux.")
 	var withWorkspace, full *bool
 	if allowProvision {
 		withWorkspace = fs.Bool("with-workspace", false, "also install/start the full local runtime (podman, postgres+pgvector, redis, the aw-workspace container) — default is a LEAN link: register this machine and hold /link (enables exec_* + control-plane-driven \"bootstrap\") without provisioning anything locally. Re-run with this flag later (no --token needed once linked) to provision, or trigger it remotely via the control plane's own \"bootstrap\" verb (see README) — no need to re-run by hand.")
@@ -190,6 +191,20 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		return fmt.Errorf("--foreground and --background are mutually exclusive")
 	}
 	runInBackground := bgMode // default (neither flag given) is foreground
+
+	// Fail here, before anything touches the disk or the network. Letting an
+	// unelevated --elevated run get as far as schtasks /Create means the user
+	// waits through a full link only to lose it to an "access denied" from a
+	// tool they did not invoke — the failure has to name itself at the point
+	// the mistake was made.
+	if *elevated {
+		if runtime.GOOS != "windows" {
+			return fmt.Errorf("--elevated is Windows-only (this is %s); on macOS/Linux the service already runs with the rights it needs", runtime.GOOS)
+		}
+		if !isElevated() {
+			return fmt.Errorf("--elevated needs an elevated prompt: re-run this from a PowerShell started with \"Run as administrator\"")
+		}
+	}
 	provisionWorkspace := allowProvision && (*withWorkspace || *full)
 
 	// On Windows, "provision the workspace here" cannot mean what it means
@@ -481,7 +496,10 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	}
 
 	if runInBackground {
-		svcCfg := servicemgr.Config{Slug: reg.slug, ExePath: resolveExePath(), ControlPlane: *controlPlane}
+		svcCfg := servicemgr.Config{
+			Slug: reg.slug, ExePath: resolveExePath(),
+			ControlPlane: *controlPlane, Elevated: *elevated,
+		}
 		if err := installAndStartService(svcCfg); err != nil {
 			return err
 		}
