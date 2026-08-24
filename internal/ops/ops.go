@@ -111,11 +111,13 @@ type Handler struct {
 // Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|"update"|
 // "self-update"|"uninstall"|"health"|"exec_start"|"exec_status"|"exec_wait"|
 // "exec_kill"|"list_processes"|"fs_stat"|"fs_list"|"fs_mkdir"|"fs_delete"|
-// "fs_read_chunk"|"fs_write_chunk") — the switchboard link.go's cmd-frame
-// handling calls into. args carries optional per-verb parameters such as the
-// exact aw-workspace image version to install for workspace updates, the shell
-// command/timeout/job_id the exec_* verbs take (see ops_exec.go), or the
-// path/offset/chunk the fs_* verbs take (see ops_fs.go).
+// "fs_read_chunk"|"fs_write_chunk"|"firewall_apply"|"firewall_status") — the
+// switchboard link.go's cmd-frame handling calls into. args carries optional
+// per-verb parameters such as the exact aw-workspace image version to
+// install for workspace updates, the shell command/timeout/job_id the
+// exec_* verbs take (see ops_exec.go), the path/offset/chunk the fs_* verbs
+// take (see ops_fs.go), or the rules/lockdown/revision firewall_apply takes
+// (see ops_firewall.go).
 func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any, emit Emit) (any, error) {
 	if !workspaceRuntimeSupported && workspaceLifecycleVerbs[verb] {
 		return nil, fmt.Errorf("verb %q needs the local workspace runtime (podman + a Linux container image), "+
@@ -161,6 +163,10 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.FsReadChunk(ctx, args)
 	case "fs_write_chunk":
 		return h.FsWriteChunk(ctx, args)
+	case "firewall_apply":
+		return h.FirewallApply(ctx, args, emit)
+	case "firewall_status":
+		return h.FirewallStatus(ctx)
 	default:
 		return nil, fmt.Errorf("unknown verb %q", verb)
 	}

@@ -190,6 +190,48 @@ itself out of the existing data volume.
   to `~/.aw-remote-host/aw-remote-host.log`. Inspect the task with
   `schtasks /Query /TN aw-remote-host /V /FO LIST`.
 
+### Firewall management (needs a privileged install)
+
+This host can manage its own firewall (`internal/firewall`) — the control
+plane pushes a persisted rule set over `/link` as a `firewall_apply` frame,
+and this process turns it into real `nft`/`iptables` state, full-state and
+idempotent every time. **The daemon itself runs without root or admin
+rights by design** (see `internal/lanfastpath`'s `DefaultPort` comment —
+the whole reason the LAN fast-path uses 8443 instead of 443 is that a
+typical linked account has no passwordless sudo), so on a default install
+`iptables -N`/`nft add table` fail with `EPERM` and firewall management
+reports itself unavailable — honestly, not silently:
+
+```json
+{"backend": "iptables", "privileged": false,
+ "privileged_reason": "aw-remote-host is not running as root and no NOPASSWD sudoers entry exists for iptables/nft — see this repo's README for the privileged-install prerequisite."}
+```
+
+That `privileged_reason` is exactly what the console shows next to this
+host to explain why it can't apply firewall rules — nothing here tries to
+escalate privilege on its own, and nothing pretends a rule took effect when
+it didn't (a UI listing rules that were never actually applied is worse
+than the feature being absent).
+
+**To make firewall management work on a given host**, this process needs to
+be able to run `nft`/`iptables` as root — either of:
+
+- Run the linked service as root (a system-level unit instead of the
+  default per-user one), or
+- Add a **NOPASSWD** `sudoers.d` entry scoped to exactly `nft`/`iptables`
+  for the account this process runs as, and have it invoke them via `sudo`.
+
+There is no first-class flag for this yet (v1 tracks the *probe*, not the
+*grant* — compare `--host-power`, which is the analogous opt-in for
+`/dev/kvm`); until then, granting it is a manual step on the host itself.
+`Probe()` re-checks on every `firewall_apply`/`firewall_status` call (never
+cached), so a host that gains a NOPASSWD entry later starts reporting
+`privileged: true` on its very next call with no restart needed.
+
+v1 is **Linux-only** on purpose — macOS and Windows always report
+`backend: "unsupported"` (still gracefully, never an error) rather than
+guessing at a `pf`/`netsh` implementation.
+
 ### Windows (lean link only)
 
 A Windows host is **always a lean link** — and that is a property of the
@@ -329,6 +371,7 @@ internal/link/          WS client that dials wss://<control-plane>/link, credent
 internal/bootstrap/     Manifest loader + embedded-script extraction + detect/install/verify orchestration
 internal/servicemgr/    Per-OS background service manager (systemd on Linux, launchd on macOS, schtasks on Windows)
 internal/ops/proc_*.go  Per-OS process control: which shell runs a command, process-group setup, tree kill
+internal/firewall/      firewall_apply/firewall_status verbs: nft/iptables backends, privilege probe, self-heal cache
 internal/state/         Local state (generated Postgres password, last-known workspace slug)
 bootstrap/embed.go      go:embed of manifest.json + lib/ + every module's scripts into the binary
 bootstrap/manifest.json Pinned module list (name, version, image digest or package, verify command)

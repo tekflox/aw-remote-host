@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
+	"github.com/tekflox/aw-remote-host/internal/firewall"
 	"github.com/tekflox/aw-remote-host/internal/hostpower"
 	"github.com/tekflox/aw-remote-host/internal/lanfastpath"
 	"github.com/tekflox/aw-remote-host/internal/link"
@@ -362,6 +363,16 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	// (workspace slug) are only known once OnRegistered fires, which the
 	// Run loop guarantees happens before pump() can see any cmd frame.
 	opsHandler := &ops.Handler{}
+
+	// Reapply whatever firewall state this host last had BEFORE dialing
+	// /link — a host that reboots without network should come back up
+	// firewalled, not wide open until the control plane happens to
+	// reconnect (Card B instructions). Best-effort: a no-op when this host
+	// has never had a rule applied, and never fatal — a self-heal failure
+	// must not block this process from linking at all.
+	if err := firewall.SelfHeal(ctx, ops.DefaultRunner); err != nil {
+		fmt.Fprintf(os.Stderr, "firewall: self-heal failed (continuing): %v\n", err)
+	}
 
 	go func() {
 		runDone <- c.Run(ctx, credPath, link.RunCallbacks{
