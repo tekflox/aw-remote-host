@@ -3,6 +3,7 @@ package firewall
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -76,21 +77,30 @@ func TestNftApply_LoadsConntrackModuleFirst(t *testing.T) {
 	}
 }
 
-func TestNftApply_PropagatesModprobeFailure(t *testing.T) {
+func TestNftApply_ModprobeFailureIsBestEffort(t *testing.T) {
 	r := newFakeRunner()
 	r.on("modprobe: FATAL: Module nft_ct not found in directory /lib/modules/7.0.0-22-generic", "modprobe", "nft_ct")
 	r.fail(errors.New("exit status 1"), "modprobe", "nft_ct")
 	b := nftBackend{runner: r}
 
-	err := b.Apply(context.Background(), nil, false)
-	if err == nil {
-		t.Fatalf("expected Apply to fail when modprobe nft_ct fails")
+	if err := b.Apply(context.Background(), nil, false); err != nil {
+		t.Fatalf("expected Apply to succeed despite modprobe failing (best-effort), got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "nft_ct") || !strings.Contains(err.Error(), "not found in directory") {
-		t.Fatalf("expected the real modprobe stderr in the error, got: %v", err)
+	if calls := r.callsWithPrefix("add", "table"); len(calls) != 1 {
+		t.Fatalf("expected Apply to continue past the modprobe failure and create the table, got %v", calls)
 	}
-	if calls := r.callsWithPrefix("add", "table"); len(calls) != 0 {
-		t.Fatalf("expected Apply to bail out before touching nft state when modprobe fails, got %v", calls)
+}
+
+func TestNftApply_ModprobeExecNotFoundIsBestEffort(t *testing.T) {
+	r := newFakeRunner()
+	r.fail(&exec.Error{Name: "modprobe", Err: exec.ErrNotFound}, "modprobe", "nft_ct")
+	b := nftBackend{runner: r}
+
+	if err := b.Apply(context.Background(), nil, false); err != nil {
+		t.Fatalf("expected Apply to succeed when the modprobe binary itself is missing (container host), got: %v", err)
+	}
+	if calls := r.callsWithPrefix("add", "table"); len(calls) != 1 {
+		t.Fatalf("expected Apply to continue and create the table, got %v", calls)
 	}
 }
 

@@ -42,12 +42,11 @@ func (b nftBackend) Probe(ctx context.Context) (string, bool, string, error) {
 
 func (b nftBackend) Apply(ctx context.Context, rules []Rule, lockdown bool) error {
 	// buildRuleset's baseline always opens with a `ct state
-	// ESTABLISHED,RELATED` match, so nft_ct has to be loaded before the
-	// very first rule of the very first Apply on a host — see
-	// ensureConntrackModule's own comment for why this can't be skipped.
-	if err := b.ensureConntrackModule(ctx); err != nil {
-		return err
-	}
+	// ESTABLISHED,RELATED` match, so this tries to get nft_ct loaded before
+	// the very first rule of the very first Apply on a host — see
+	// ensureConntrackModule's own comment for why its failure is never
+	// fatal here.
+	b.ensureConntrackModule(ctx)
 
 	ruleset := buildRuleset(rules, lockdown)
 
@@ -71,27 +70,30 @@ func (b nftBackend) Apply(ctx context.Context, rules []Rule, lockdown bool) erro
 	return nil
 }
 
-// ensureConntrackModule loads nft_ct — the kernel module nftables' native
-// `ct` expression needs, distinct from nf_conntrack/xt_conntrack (which
-// iptables-legacy/docker already load, and which do NOT satisfy nft's own
-// `ct` expression). On a fresh/minimal host that has never used nftables
-// conntrack matching before, nft_ct is simply not loaded, and every rule
-// using `ct state` — including the baseline — fails with a bare "exit
-// status 1" that gives no hint a kernel module is missing (2026-08-25 card:
-// reproduced on a real host, fixed instantly by a manual `modprobe nft_ct`).
+// ensureConntrackModule best-effort loads nft_ct — the kernel module
+// nftables' native `ct` expression needs, distinct from
+// nf_conntrack/xt_conntrack (which iptables-legacy/docker already load, and
+// which do NOT satisfy nft's own `ct` expression). On a fresh/minimal
+// bare-metal host that has never used nftables conntrack matching before,
+// nft_ct is simply not loaded, and every rule using `ct state` — including
+// the baseline — fails with a bare "exit status 1" that gives no hint a
+// kernel module is missing (2026-08-25 card, fixed by a manual `modprobe
+// nft_ct`).
 //
-// modprobe is idempotent — loading an already-loaded or kernel-builtin
-// module is a no-op success — so this call is safe on every Apply, not just
-// the first one on a given host, and never disrupts a host that already has
-// nft_ct loaded. A genuine failure (module not present for this kernel,
-// needs a different package, no permission to load kernel modules) is
-// propagated with its real output instead of being swallowed, so the next
-// person to hit this doesn't have to rediscover it over SSH.
-func (b nftBackend) ensureConntrackModule(ctx context.Context) error {
-	if out, err := b.runner.Run(ctx, "modprobe", "nft_ct"); err != nil {
-		return fmt.Errorf("load kernel module nft_ct: %w (%s)", err, strings.TrimSpace(out))
-	}
-	return nil
+// Its own failure is deliberately NOT propagated (2026-08-25 regression: it
+// used to be, and that broke every host that runs aw-remote-host inside a
+// Docker container — those have no modprobe binary at all, not by
+// accident but structurally, since a container can't load kernel modules
+// and shares whatever the HOST kernel already has loaded; the error was a
+// bare "exec: modprobe: executable file not found in $PATH" that left the
+// chain completely empty, not even the baseline). modprobe is idempotent
+// where it does exist — loading an already-loaded or kernel-builtin module
+// is a no-op success — so this call is still worth attempting on every
+// Apply for the bare-metal hosts that actually need it. Whether nft_ct
+// ended up available is instead proven by the `ct state` rule itself right
+// after: THAT failure is what Apply treats as fatal.
+func (b nftBackend) ensureConntrackModule(ctx context.Context) {
+	b.runner.Run(ctx, "modprobe", "nft_ct")
 }
 
 func (b nftBackend) Status(ctx context.Context) (State, error) {
