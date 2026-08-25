@@ -3,6 +3,7 @@ package firewall
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +58,55 @@ func TestNftApply_PropagatesFlushFailure(t *testing.T) {
 
 	if err := b.Apply(context.Background(), nil, false); err == nil {
 		t.Fatalf("expected Apply to fail when the chain flush itself fails")
+	}
+}
+
+func TestNftApply_LoadsConntrackModuleFirst(t *testing.T) {
+	r := newFakeRunner()
+	b := nftBackend{runner: r}
+
+	if err := b.Apply(context.Background(), nil, false); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if calls := r.callsWithPrefix("nft_ct"); len(calls) != 1 {
+		t.Fatalf("expected modprobe nft_ct to run exactly once, got %v", r.calls)
+	}
+	if len(r.calls) == 0 || r.calls[0][0] != "modprobe" || r.calls[0][1] != "nft_ct" {
+		t.Fatalf("expected modprobe nft_ct to be the FIRST command run, got %v", r.calls)
+	}
+}
+
+func TestNftApply_PropagatesModprobeFailure(t *testing.T) {
+	r := newFakeRunner()
+	r.on("modprobe: FATAL: Module nft_ct not found in directory /lib/modules/7.0.0-22-generic", "modprobe", "nft_ct")
+	r.fail(errors.New("exit status 1"), "modprobe", "nft_ct")
+	b := nftBackend{runner: r}
+
+	err := b.Apply(context.Background(), nil, false)
+	if err == nil {
+		t.Fatalf("expected Apply to fail when modprobe nft_ct fails")
+	}
+	if !strings.Contains(err.Error(), "nft_ct") || !strings.Contains(err.Error(), "not found in directory") {
+		t.Fatalf("expected the real modprobe stderr in the error, got: %v", err)
+	}
+	if calls := r.callsWithPrefix("add", "table"); len(calls) != 0 {
+		t.Fatalf("expected Apply to bail out before touching nft state when modprobe fails, got %v", calls)
+	}
+}
+
+func TestNftApply_PropagatesRuleApplyStderr(t *testing.T) {
+	r := newFakeRunner()
+	stderr := "Error: Could not process rule: No such file or directory\nadd rule inet aw_fw AW-FW-IN ct state established,related accept\n                             ^^^^^^^^"
+	r.on(stderr, "nft", "add", "rule", nftFamily, nftTable, ChainIn, "ct", "state", "established,related", "accept")
+	r.fail(errors.New("exit status 1"), "nft", "add", "rule", nftFamily, nftTable, ChainIn, "ct", "state", "established,related", "accept")
+	b := nftBackend{runner: r}
+
+	err := b.Apply(context.Background(), nil, false)
+	if err == nil {
+		t.Fatalf("expected Apply to fail when nft add rule fails")
+	}
+	if !strings.Contains(err.Error(), "No such file or directory") {
+		t.Fatalf("expected the real nft stderr (not just the exit code) in the error, got: %v", err)
 	}
 }
 

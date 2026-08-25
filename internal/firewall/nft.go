@@ -41,10 +41,18 @@ func (b nftBackend) Probe(ctx context.Context) (string, bool, string, error) {
 }
 
 func (b nftBackend) Apply(ctx context.Context, rules []Rule, lockdown bool) error {
+	// buildRuleset's baseline always opens with a `ct state
+	// ESTABLISHED,RELATED` match, so nft_ct has to be loaded before the
+	// very first rule of the very first Apply on a host — see
+	// ensureConntrackModule's own comment for why this can't be skipped.
+	if err := b.ensureConntrackModule(ctx); err != nil {
+		return err
+	}
+
 	ruleset := buildRuleset(rules, lockdown)
 
-	if _, err := b.runner.Run(ctx, "nft", "add", "table", nftFamily, nftTable); err != nil {
-		return fmt.Errorf("create table %s %s: %w", nftFamily, nftTable, err)
+	if out, err := b.runner.Run(ctx, "nft", "add", "table", nftFamily, nftTable); err != nil {
+		return fmt.Errorf("create table %s %s: %w (%s)", nftFamily, nftTable, err, strings.TrimSpace(out))
 	}
 
 	for _, chainSpec := range []struct{ name, hook string }{
@@ -55,10 +63,33 @@ func (b nftBackend) Apply(ctx context.Context, rules []Rule, lockdown bool) erro
 			return err
 		}
 		for _, r := range ruleset {
-			if _, err := b.runner.Run(ctx, "nft", nftRuleArgs(chainSpec.name, r)...); err != nil {
-				return fmt.Errorf("apply rule to %s: %w", chainSpec.name, err)
+			if out, err := b.runner.Run(ctx, "nft", nftRuleArgs(chainSpec.name, r)...); err != nil {
+				return fmt.Errorf("apply rule to %s: %w (%s)", chainSpec.name, err, strings.TrimSpace(out))
 			}
 		}
+	}
+	return nil
+}
+
+// ensureConntrackModule loads nft_ct — the kernel module nftables' native
+// `ct` expression needs, distinct from nf_conntrack/xt_conntrack (which
+// iptables-legacy/docker already load, and which do NOT satisfy nft's own
+// `ct` expression). On a fresh/minimal host that has never used nftables
+// conntrack matching before, nft_ct is simply not loaded, and every rule
+// using `ct state` — including the baseline — fails with a bare "exit
+// status 1" that gives no hint a kernel module is missing (2026-08-25 card:
+// reproduced on a real host, fixed instantly by a manual `modprobe nft_ct`).
+//
+// modprobe is idempotent — loading an already-loaded or kernel-builtin
+// module is a no-op success — so this call is safe on every Apply, not just
+// the first one on a given host, and never disrupts a host that already has
+// nft_ct loaded. A genuine failure (module not present for this kernel,
+// needs a different package, no permission to load kernel modules) is
+// propagated with its real output instead of being swallowed, so the next
+// person to hit this doesn't have to rediscover it over SSH.
+func (b nftBackend) ensureConntrackModule(ctx context.Context) error {
+	if out, err := b.runner.Run(ctx, "modprobe", "nft_ct"); err != nil {
+		return fmt.Errorf("load kernel module nft_ct: %w (%s)", err, strings.TrimSpace(out))
 	}
 	return nil
 }
@@ -84,8 +115,8 @@ func (b nftBackend) Status(ctx context.Context) (State, error) {
 func (b nftBackend) ensureChain(ctx context.Context, name, hook string) error {
 	spec := fmt.Sprintf("{ type filter hook %s priority %s; policy accept; }", hook, nftPriority)
 	_, _ = b.runner.Run(ctx, "nft", "add", "chain", nftFamily, nftTable, name, spec)
-	if _, err := b.runner.Run(ctx, "nft", "flush", "chain", nftFamily, nftTable, name); err != nil {
-		return fmt.Errorf("flush chain %s: %w", name, err)
+	if out, err := b.runner.Run(ctx, "nft", "flush", "chain", nftFamily, nftTable, name); err != nil {
+		return fmt.Errorf("flush chain %s: %w (%s)", name, err, strings.TrimSpace(out))
 	}
 	return nil
 }
