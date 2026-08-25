@@ -116,6 +116,8 @@ commit `753214a`) only takes effect on the target machine once the
 aw-remote-host bootstrap-workspace --token <token> [--with-workspace] [--plan] [--yes] [--foreground|--background] [--control-plane https://api.aw.tekflox.com]
 aw-remote-host status [--plan]
 aw-remote-host vpn --login-server <headscale-url> [--authkey <key>] [--hostname <name>] [--advertise-exit-node] [--accept-dns] [--plan]
+aw-remote-host vpn use-exit <node> [--expect-egress <ip>] [--exclude <cidrs>] [--deadman 2m] [--confirm-timeout 45s] [--persist-across-reboot] [--plan]
+aw-remote-host vpn clear-exit [--plan]
 aw-remote-host unlink [--plan] [--stop-containers]
 aw-remote-host version
 ```
@@ -264,7 +266,7 @@ v1 is **Linux-only** on purpose — macOS and Windows always report
 `backend: "unsupported"` (still gracefully, never an error) rather than
 guessing at a `pf`/`netsh` implementation.
 
-### Mesh membership — `aw-remote-host vpn` (phase 1)
+### Mesh membership — `aw-remote-host vpn`
 
 This host can join **the tenant's own mesh**, so the machines behind one
 account can reach each other, and so one of them can later serve as the
@@ -285,17 +287,16 @@ The `vpn` module is **opt-in**: it is in `bootstrap/manifest.json` with
 runs it. Joining a network is a decision the machine's owner makes, not a
 side effect of provisioning a workspace.
 
-**What phase 1 deliberately does not do:** select an exit node, or change
-this machine's default route in any other way. The `/link` tunnel is the
-only remote-management path a linked host has, so a default route pointed at
-a mesh that is down takes the means of fixing it down with the machine — the
-same shape as the outage recorded in `commands.go`'s
-`bootstrapWorkspaceSelfHeal` comment. `--advertise-exit-node` is inside the
-line because *advertising* provably does not change the advertiser's own
-routing (confirmed on real hardware, 2026-08-25); it also does nothing at all
-until a headscale admin approves the route, which `status` says out loud.
-`--accept-routes` and `--accept-dns` are both forced **off**, overriding
-tailscale's own defaults, for the same reason.
+**Enrolling never changes this machine's default route.** Neither does
+`--advertise-exit-node`: *advertising* provably does not change the
+advertiser's own routing (confirmed on real hardware, 2026-08-25), and it
+does nothing at all until a headscale admin approves the route, which
+`status` says out loud. `--accept-routes` and `--accept-dns` are both forced
+**off**, overriding tailscale's own defaults.
+
+Moving the default route is a separate, explicit command — see
+"[Using another node as the exit gate](#using-another-node-as-the-exit-gate)"
+below.
 
 Eligibility is probed and **refused with a reason**, in the same spirit as
 `--host-power` and the firewall probe above — a host that cannot really do
@@ -329,6 +330,44 @@ network*, behind the same public IP, were measured relaying through Madrid
 because one of them is WSL2 and sits behind a second layer of NAT. A relay is
 a normal outcome, not a rare fallback, and without this line "it works, but
 every packet goes to Madrid and back" is invisible.
+
+### Using another node as the exit gate
+
+```bash
+aw-remote-host vpn use-exit aw-baremetal --plan          # gate + exclusions, changes nothing
+aw-remote-host vpn use-exit aw-baremetal                 # THIS MOVES THE DEFAULT ROUTE
+aw-remote-host vpn clear-exit                            # and back
+```
+
+This routes the machine's traffic — and, because every container NATs out
+through it, every container's traffic with it — through `<node>`. It is the
+one command in this repo that can take a host off the internet **and remove
+the means of putting it back**, so the safety machinery is the feature:
+
+- **The control plane and every attached network stay outside the tunnel.**
+  Installed as `ip rule … lookup main` at priority 5260, which beats
+  tailscale's catch-all at 5270. Pointing at the *main* table is what makes a
+  leftover exclusion inert rather than a black hole — the difference from
+  the `ip rule from 172.18.0.5 lookup 51821` that left a container on this
+  very infrastructure with no internet for two days, silently. If the control
+  plane cannot even be resolved, the command **refuses** rather than moving
+  the route without pinning it.
+- **A dead-man's switch is armed before anything changes**, in its own
+  session so it outlives whatever armed it, and is stood down only *after*
+  egress has been confirmed. Kill the tool mid-flight and the route still
+  comes back.
+- **Egress is confirmed, not assumed.** The real public IP is fetched through
+  the new route (fresh connections — a pooled one would answer from the old
+  path) and must match `--expect-egress`, or have changed. Anything else is
+  reverted and reported as a failure. "The interface is up" proves nothing.
+- **A boot guard clears the selection at reboot**, because the selection
+  survives a reboot and the exclusions do not — coming back up with one and
+  not the other is the lockout arriving on its own.
+
+`status` then reports which gate is in force, what the **real** egress IP is,
+what is pinned outside the tunnel, and every leftover state in between.
+Full detail, limits and the end-to-end measurements are in
+[`bootstrap/vpn/README.md`](bootstrap/vpn/README.md).
 
 ### Windows (lean link only)
 
@@ -470,7 +509,8 @@ internal/bootstrap/     Manifest loader + embedded-script extraction + detect/in
 internal/servicemgr/    Per-OS background service manager (systemd on Linux, launchd on macOS, schtasks on Windows)
 internal/ops/proc_*.go  Per-OS process control: which shell runs a command, process-group setup, tree kill
 internal/firewall/      firewall_apply/firewall_status verbs: nft/iptables backends, privilege probe, self-heal cache
-internal/vpn/           Mesh (tailscale/headscale): eligibility probe, status/prefs readers
+internal/vpn/           Mesh (tailscale/headscale): eligibility probe, status/prefs
+                        readers, exit-gate selection, route exclusions, dead-man's switch
 internal/state/         Local state (generated Postgres password, last-known workspace slug, mesh enrolment)
 bootstrap/embed.go      go:embed of manifest.json + lib/ + every module's scripts into the binary
 bootstrap/manifest.json Pinned module list (name, version, image digest or package, source, optional, verify command)

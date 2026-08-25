@@ -88,8 +88,9 @@ Commands:
   vpn                   Join this machine to the tenant's mesh (headscale).
                         Opt-in — never run by a plain bootstrap. Installs
                         tailscale, enrols the node, and can ADVERTISE it as
-                        an exit node. It never selects one and never changes
-                        this machine's default route.
+                        an exit node. Enrolling never changes this machine's
+                        default route; the two subcommands below do.
+%s
   unlink                Disconnect this machine from the control plane
   version               Print the client version
 
@@ -137,5 +138,5 @@ Flags (vpn):
 
 unlink also stops and uninstalls the background service (launchd/systemd),
 if one was installed.
-`, defaultControlPlane)
+`, vpnExitUsage, defaultControlPlane)
 }

@@ -1,7 +1,14 @@
 # `vpn` — join this host to the tenant's mesh
 
 Installs tailscale and enrols this machine in **the tenant's own headscale**,
-optionally offering it as an exit gate.
+optionally offering it as an exit gate — and, since phase 2, selecting one.
+
+| Command | Touches the default route? |
+|---|---|
+| `aw-remote-host vpn --login-server=…` | no — enrolment only (phase 1) |
+| `aw-remote-host vpn --advertise-exit-node` | no — *offering* is not *using* |
+| **`aw-remote-host vpn use-exit <node>`** | **yes** — see "Selecting an exit gate" |
+| `aw-remote-host vpn clear-exit` | yes, back to normal |
 
 This module is **opt-in** (`"optional": true` in `bootstrap/manifest.json`).
 A plain `bootstrap-workspace --with-workspace` never runs it: joining a
@@ -9,14 +16,15 @@ network is a decision the machine's owner makes, not a side effect of
 provisioning a workspace. It runs when something names it — the
 `aw-remote-host vpn` command, or a control-plane bootstrap that asks for it.
 
-## What it does, and the line it does not cross
+## What the bootstrap module does, and the line it does not cross
 
-It installs the client, starts the daemon, runs `tailscale up` against the
-login server you give it, and — if asked — adds `--advertise-exit-node`.
+The module — `install.sh`/`verify.sh`, the thing a control-plane bootstrap
+runs — installs the client, starts the daemon, runs `tailscale up` against
+the login server you give it, and, if asked, adds `--advertise-exit-node`.
 
 It **never selects an exit node**, and nothing it does changes this
-machine's default route. That is phase 2, and the boundary is not
-bureaucratic:
+machine's default route. Selecting one is a separate, explicit command
+(below), and that boundary is not bureaucratic:
 
 > The `/link` tunnel is the only remote-management path a BYOD host has. If
 > the default route moves onto a mesh that is misconfigured or whose exit
@@ -93,6 +101,135 @@ prevents is silent. Without root, tailscaled can still start with
 network interface. A host installed that way looks enrolled and carries none
 of its own traffic. On that same machine `tailscale set` answers `Access
 denied: checkprefs access denied`.
+
+## Selecting an exit gate (phase 2)
+
+```
+aw-remote-host vpn use-exit <node> [--expect-egress <ip>] [--exclude a,b] \
+                                   [--deadman 2m] [--confirm-timeout 45s] [--plan]
+aw-remote-host vpn clear-exit
+```
+
+This moves the machine's default route — and, because every container NATs
+out through it, every container's traffic with it — onto `<node>`. It is the
+dangerous half of this module, so **the safety mechanism is the feature**.
+The ordering below is the deliverable; the `tailscale set` in the middle is
+the easy part.
+
+1. **Measure egress before.** There is otherwise nothing to compare against.
+2. **Arm a dead-man's switch, before touching anything.** A detached
+   `sh -c 'sleep N; tailscale set --exit-node=; …'` in its own session
+   (`SysProcAttr.Setsid` — it has to outlive the session that armed it, which
+   is the session most likely to be killed by the route change it guards).
+   Every later failure — a gate that does not forward, a confirmation that
+   hangs, this process being `kill -9`ed — still ends with the route back.
+   It is the **tool's** job, never the caller's.
+3. **Pin the exclusions**, control plane first.
+4. **Move the route** — `tailscale set --exit-node=<ip>
+   --exit-node-allow-lan-access=true --accept-dns=false`.
+5. **Confirm through the new route**: fetch the real public IP, and check the
+   control plane still answers.
+6. **Revert anything unconfirmed** — and only *then* stand the switch down.
+
+### The exclusions, and why they are shaped this way
+
+| Prefix | Why |
+|---|---|
+| the control plane's address (`api.aw.tekflox.com`) | the only remote-management path. **Not optional** — if it cannot even be resolved, `use-exit` refuses rather than moving the route without it |
+| every directly attached IPv4 network | that is the LAN prefix (`internal/lanfastpath` depends on it) *and* every podman/docker bridge, in one sweep that cannot drift as new bridges appear |
+| whatever `--exclude` names | the things only the operator knows: a NAS on a routed subnet, a jump host |
+
+They are installed as `ip rule add to <prefix> lookup main priority 5260`.
+Two details carry the whole safety property:
+
+- **5260 beats tailscale's catch-all at 5270.** Measured on `aw-baremetal`,
+  2026-08-25: tailscale's rules live at 5210/5230/5250 (fwmark, its own
+  packets only) and 5270 (`from all lookup 52`). 5260 is consulted first.
+- **They point at the *main* table, never at a table the tunnel owns.** A
+  leftover exclusion is therefore **inert** — "send this prefix to the main
+  table" is what an unconfigured machine already does. Compare the recorded
+  accident on this infrastructure: `ip rule from 172.18.0.5 lookup 51821`
+  pointed into a table whose gateway had ceased to exist, and a container had
+  no internet **for two days, silently**, surviving restarts because the rule
+  lived on the host. Nobody was alerted; it surfaced when a deploy failed.
+  The mechanism here is chosen so that failing to clean up cannot do that.
+
+### Confirming, rather than assuming
+
+"The interface is up" proves nothing. After the switch, `use-exit` fetches
+this host's real public IP (fresh connections, keep-alives disabled — a
+pooled connection would answer from the *old* path) and requires either:
+
+- `--expect-egress <ip>`: an exact match with the gate's known public
+  address; or
+- no flag: that the address **changed**.
+
+An unchanged address with no `--expect-egress` is treated as a failure and
+reverted. There are legitimate topologies where a correct switch produces the
+same address — a gate that NATs to the public IP the client already used —
+and `--expect-egress` is how you say so up front. The control plane is
+re-checked at the same time: internet without a management path is still a
+lockout.
+
+### The boot guard
+
+An exit-node selection is a tailscale **preference** and survives a reboot.
+The `ip rule` exclusions are runtime state and **do not**. A machine that
+rebooted with the first and without the second would come back with its
+default route on the mesh and nothing holding the control plane outside it —
+the lockout, arriving on its own, after everyone stopped watching.
+
+So `use-exit` installs `aw-vpn-exit-clear.service`, a oneshot that clears the
+selection at boot. This deliberately makes the selection non-persistent, and
+restores the escape hatch this repo already established in
+`tools/host-firewall/aw-firewall-apply.sh`, which does not persist across a
+reboot on purpose. `--persist-across-reboot` opts out and prints why you
+probably should not.
+
+### Known limits, stated rather than discovered
+
+- **The control-plane exclusion is a DNS pin taken at selection time.** A
+  control plane that moves behind a rotating address goes stale; re-run
+  `use-exit` (or `clear-exit`) if it does. `status` prints what is actually
+  pinned.
+- **A container bridge created *after* `use-exit` is not excluded.** The
+  sweep runs once. Re-run `use-exit` after adding a network.
+- **IPv4 only.** The exclusions and the default-route move are both IPv4;
+  IPv6 is not claimed rather than half-supported.
+- **Linux only**, for the same reason phase 1 refuses exit-node advertising
+  off Linux: `ip rule` is where the safety lives.
+
+### What `status` reports
+
+Everything above is read back **from the machine**, not from `state.json` —
+the case that hurts is exactly the one where the two disagree:
+
+```
+vpn: route exclusions in force (outside the tunnel): 65.109.66.88, 10.88.0.0/16, 172.17.0.0/16
+vpn: EXIT NODE IN FORCE — this machine's default route goes through aw-baremetal (100.64.0.1)
+vpn: default route for 1.1.1.1 leaves via tailscale0
+vpn: REAL public egress IP: 65.109.66.88 (measured via https://api.ipify.org)
+```
+
+and it speaks up about the leftover states rather than only the good ones —
+exclusions with no selection behind them, a selection with no exclusions, a
+dead-man's switch that already fired, a boot guard that is missing.
+
+### Measured end to end (disposable node, 2026-08-25)
+
+A throwaway systemd container enrolled as `aw-vpn-lab` (100.64.0.5) against
+the live `headscale.aw.tekflox.com`, using `aw-baremetal` as the gate:
+
+| Proof | Result |
+|---|---|
+| default route moves | `ip route get 1.1.1.1` went `via 172.17.0.1 dev eth0` → `dev tailscale0 table 52` |
+| a **container** on that host follows | forwarded lookup `from 10.88.0.4 iif podman0` went `dev eth0` → `dev tailscale0`; its bytes crossed `tailscale0` |
+| `/link` survives | `ip route get 65.109.66.88` stayed on `eth0`; 3×`HTTP 200` from `/api/health`, and `wss://…/link` answered (a token rejection, not a connect failure) with the gate in force |
+| unconfirmed switch reverts | with no `--expect-egress` the IP could not change, so the tool reverted itself and exited non-zero |
+| **the dead-man's switch fires** | the tool was `SIGKILL`ed mid-confirmation; ~20s later (`--deadman=25s`) the exclusions were gone, the selection cleared, the route back on `eth0` and the internet working — with a log line saying so |
+
+The node, the container, the image and the ephemeral pre-auth key were all
+removed afterwards. Same standard as phase 1.
 
 ## Verify
 

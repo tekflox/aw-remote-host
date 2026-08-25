@@ -62,6 +62,22 @@ type VPNState struct {
 	AdvertiseExit bool   `json:"advertise_exit,omitempty"`
 	// EnrolledAt is RFC3339, for a status line that can say how old this is.
 	EnrolledAt string `json:"enrolled_at,omitempty"`
+	// ExitNode is the gate `vpn use-exit` last confirmed, and ExitNodeIP its
+	// mesh address. Written only AFTER egress was confirmed through the new
+	// route — an attempt that was reverted leaves nothing here, so this file
+	// never claims a selection that did not survive its own confirmation.
+	//
+	// As with AdvertiseExit, this is a record, not a source of truth. What is
+	// actually in force is read live from `tailscale debug prefs` by `status`,
+	// because the case that hurts is exactly the one where the two disagree.
+	ExitNode   string `json:"exit_node,omitempty"`
+	ExitNodeIP string `json:"exit_node_ip,omitempty"`
+	// ExitSelectedAt is RFC3339.
+	ExitSelectedAt string `json:"exit_selected_at,omitempty"`
+	// ExitExclusions is the prefix list that was pinned outside the tunnel
+	// when the gate was selected, kept for reporting. `status` lists what the
+	// kernel actually has rather than this, and compares the two.
+	ExitExclusions []string `json:"exit_exclusions,omitempty"`
 }
 
 // DefaultPath returns ~/.aw-remote-host/state.json.

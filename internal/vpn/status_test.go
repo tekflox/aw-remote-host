@@ -146,6 +146,44 @@ func TestParseStatusOfflinePeerHasNoPath(t *testing.T) {
 	}
 }
 
+// `tailscale debug prefs` records a selected exit node as ExitNodeID and, on
+// a real selection made by `vpn use-exit` (lab node, 2026-08-25), left
+// ExitNodeIP EMPTY. Without the peer's stable node id there is nothing to
+// match that against, and `status` reported the gate as "1" — then wrongly
+// accused state.json of disagreeing with the machine.
+func TestParseStatusCarriesPeerNodeIDs(t *testing.T) {
+	s, err := ParseStatus(readFixture(t, "status-baremetal.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Peer{}
+	for _, p := range s.Peers {
+		byName[p.Name] = p
+	}
+	if got := byName["aw-surface-wsl"].ID; got != "2" {
+		t.Fatalf("aw-surface-wsl ID = %q, want 2 (the capture's value)", got)
+	}
+	if got := byName["aw-mac"].DNSName; got != "aw-mac.mesh.aw.tekflox.com" {
+		t.Fatalf("peer DNSName should have its trailing dot stripped like Self's, got %q", got)
+	}
+}
+
+func TestParsePrefsCarriesTheSelectedGate(t *testing.T) {
+	p, err := ParsePrefs([]byte(`{"ControlURL":"https://headscale.aw.tekflox.com","ExitNodeID":"1","ExitNodeIP":"","ExitNodeAllowLANAccess":true,"CorpDNS":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The shape that actually comes back from a live selection: an id and no
+	// IP. UsesExitNode has to be true off the id alone, or `status` would say
+	// nothing at all while the default route is on the mesh.
+	if !p.UsesExitNode || p.ExitNodeID != "1" || p.ExitNodeIP != "" {
+		t.Fatalf("got %+v", p)
+	}
+	if !p.ExitNodeAllowLANAccess {
+		t.Fatal("ExitNodeAllowLANAccess must be read — with it off, the host's own LAN is inside the tunnel")
+	}
+}
+
 func TestParseStatusRejectsGarbage(t *testing.T) {
 	if _, err := ParseStatus([]byte("not json")); err == nil {
 		t.Fatal("expected an error")

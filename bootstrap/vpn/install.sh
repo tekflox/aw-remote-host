@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Install tailscale and enrol this node in the tenant's headscale. Idempotent.
 #
-# PHASE 1 ONLY. This script joins a mesh and may OFFER this node as an exit
+# ENROLMENT ONLY. This script joins a mesh and may OFFER this node as an exit
 # gate. It never selects one, and it never changes this machine's default
 # route — see bootstrap/vpn/README.md for why that boundary is drawn in ink.
+# Selecting a gate is `aw-remote-host vpn use-exit`, a deliberate command with
+# exclusions, a dead-man's switch and a confirmation step; a bootstrap module
+# that could strand the host it is provisioning would be exactly backwards.
 #
 # Input, all by environment variable like every other module:
 #   AW_VPN_LOGIN_SERVER    required — the tenant's headscale, e.g.
@@ -122,9 +125,10 @@ UP_ARGS=(
   #                           reaches changes destination.
   #   --accept-dns          : off unless AW_VPN_ACCEPT_DNS opts in (see header).
   "--accept-routes=false"
-  # Never --exit-node. Selecting an exit node is phase 2 and it is the step
-  # that can strand a host: the /link tunnel is the only remote-management
-  # path, so a broken default route takes the fix down with the machine.
+  # Never --exit-node. Selecting an exit node is the step that can strand a
+  # host — the /link tunnel is the only remote-management path, so a broken
+  # default route takes the fix down with the machine — and it belongs to
+  # `aw-remote-host vpn use-exit`, which owns the safety machinery for it.
   "--reset"
 )
 

@@ -37,10 +37,21 @@ const (
 
 // Peer is one other node in the tenant mesh.
 type Peer struct {
-	Name   string
-	IPs    []string
-	OS     string
-	Online bool
+	Name string
+	// ID is tailscale's stable node id — "1", "2", ... as headscale hands
+	// them out. It is carried because `tailscale debug prefs` records a
+	// selected exit node as ExitNodeID and quite often leaves ExitNodeIP
+	// empty, so this is the only field a selection can be matched back to a
+	// name through. Measured on the lab node 2026-08-25, where the first
+	// version of this reported the exit gate as "1".
+	ID string
+	// DNSName is the peer's fully-qualified mesh name, trailing dot stripped.
+	// Carried so `vpn use-exit` can accept the name a human copied out of a
+	// status listing, whichever of the two forms that was.
+	DNSName string
+	IPs     []string
+	OS      string
+	Online  bool
 	// Active is tailscale's own "there is traffic on this path right now".
 	// It matters for reading Path honestly: an idle peer's Relay is the DERP
 	// region it WOULD use, not one it is measurably using.
@@ -126,6 +137,7 @@ type tsCurrentTailnet struct {
 }
 
 type tsPeer struct {
+	ID             string   `json:"ID"`
 	HostName       string   `json:"HostName"`
 	DNSName        string   `json:"DNSName"`
 	OS             string   `json:"OS"`
@@ -177,7 +189,9 @@ func ParseStatus(data []byte) (Status, error) {
 
 func peerFrom(p *tsPeer) Peer {
 	out := Peer{
+		ID:         p.ID,
 		Name:       p.HostName,
+		DNSName:    strings.TrimSuffix(p.DNSName, "."),
 		IPs:        p.TailscaleIPs,
 		OS:         p.OS,
 		Online:     p.Online,
@@ -224,13 +238,14 @@ func FetchStatus(ctx context.Context, r Runner) (Status, error) {
 
 // tsPrefs mirrors the fields of `tailscale debug prefs` this package reads.
 type tsPrefs struct {
-	ControlURL      string   `json:"ControlURL"`
-	Hostname        string   `json:"Hostname"`
-	AdvertiseRoutes []string `json:"AdvertiseRoutes"`
-	ExitNodeIP      string   `json:"ExitNodeIP"`
-	ExitNodeID      string   `json:"ExitNodeID"`
-	RouteAll        bool     `json:"RouteAll"`
-	CorpDNS         bool     `json:"CorpDNS"`
+	ControlURL             string   `json:"ControlURL"`
+	Hostname               string   `json:"Hostname"`
+	AdvertiseRoutes        []string `json:"AdvertiseRoutes"`
+	ExitNodeIP             string   `json:"ExitNodeIP"`
+	ExitNodeID             string   `json:"ExitNodeID"`
+	ExitNodeAllowLANAccess bool     `json:"ExitNodeAllowLANAccess"`
+	RouteAll               bool     `json:"RouteAll"`
+	CorpDNS                bool     `json:"CorpDNS"`
 }
 
 // Prefs is the subset of this node's tailscale preferences that says what it
@@ -243,11 +258,21 @@ type Prefs struct {
 	// headscale admin, which is a real state a host can sit in indefinitely.
 	AdvertisesExit bool
 	// UsesExitNode is whether this node has SELECTED an exit node — i.e. its
-	// default route goes through the mesh. Phase 1 never sets this; it is
-	// read so `status` can say plainly when something else did, because that
-	// is the one setting on this host that can cut it off from the control
-	// plane.
+	// default route goes through the mesh. Phase 1 never sets this; phase 2's
+	// `vpn use-exit` does, and `status` reads it live rather than trusting
+	// state.json, because this is the one setting on this host that can cut
+	// it off from the control plane and the dangerous case is precisely the
+	// one where something OTHER than this binary set it.
 	UsesExitNode bool
+	// ExitNodeIP / ExitNodeID are which gate is in force. ExitNodeIP is
+	// usually the useful one; ExitNodeID is tailscale's stable node id and is
+	// what remains populated when the peer has since gone away, which is a
+	// state worth being able to report rather than blank.
+	ExitNodeIP string
+	ExitNodeID string
+	// ExitNodeAllowLANAccess is whether the LAN stays reachable while the
+	// default route is on the mesh.
+	ExitNodeAllowLANAccess bool
 	// AcceptsRoutes / AcceptsDNS are the other two settings that change this
 	// machine's behaviour rather than just its membership.
 	AcceptsRoutes bool
@@ -261,11 +286,14 @@ func ParsePrefs(data []byte) (Prefs, error) {
 		return Prefs{}, fmt.Errorf("parse tailscale prefs: %w", err)
 	}
 	p := Prefs{
-		LoginServer:   strings.TrimSuffix(raw.ControlURL, "/"),
-		Hostname:      raw.Hostname,
-		UsesExitNode:  raw.ExitNodeIP != "" || raw.ExitNodeID != "",
-		AcceptsRoutes: raw.RouteAll,
-		AcceptsDNS:    raw.CorpDNS,
+		LoginServer:            strings.TrimSuffix(raw.ControlURL, "/"),
+		Hostname:               raw.Hostname,
+		UsesExitNode:           raw.ExitNodeIP != "" || raw.ExitNodeID != "",
+		ExitNodeIP:             raw.ExitNodeIP,
+		ExitNodeID:             raw.ExitNodeID,
+		ExitNodeAllowLANAccess: raw.ExitNodeAllowLANAccess,
+		AcceptsRoutes:          raw.RouteAll,
+		AcceptsDNS:             raw.CorpDNS,
 	}
 	for _, route := range raw.AdvertiseRoutes {
 		if route == "0.0.0.0/0" || route == "::/0" {

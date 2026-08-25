@@ -15,13 +15,29 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/vpn"
 )
 
-// runVPN is the "vpn" command: enrol this machine in the tenant's mesh.
+// runVPN is the "vpn" command: enrol this machine in the tenant's mesh, and
+// (phase 2) select or clear the exit gate its default route goes through.
 //
 // It is a separate command rather than a flag on bootstrap-workspace because
 // the vpn module is opt-in (bootstrap.Module.Optional) — joining a network is
 // a decision the machine's owner makes, not a side effect of provisioning a
-// workspace.
+// workspace. The two route-changing verbs are subcommands rather than flags
+// on the enrolment for the same reason, one level down: enrolling is safe and
+// selecting a gate is the step that can strand the machine, so they should not
+// be a typo apart.
 func runVPN(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "use-exit":
+			return runVPNUseExit(args[1:])
+		case "clear-exit":
+			return runVPNClearExit(args[1:])
+		}
+	}
+	return runVPNEnroll(args)
+}
+
+func runVPNEnroll(args []string) error {
 	fs := flag.NewFlagSet("vpn", flag.ContinueOnError)
 	loginServer := fs.String("login-server", "", "the tenant's headscale control plane, e.g. https://headscale.aw.tekflox.com (required)")
 	authKey := fs.String("authkey", "", "a headscale pre-auth key — required for a first enrolment, ignored once this node is already up against the same login server")
@@ -217,12 +233,13 @@ func reportVPNStatus(ctx context.Context, st *state.State) {
 		fmt.Println("vpn: exit node was REQUESTED at enrolment but this node is not advertising one — re-run 'aw-remote-host vpn --advertise-exit-node'")
 	}
 
-	if prefsErr == nil && prefs.UsesExitNode {
-		// Phase 1 never sets this. If it is on, something else did, and it is
-		// the one setting on this box that can cut it off from the control
-		// plane — so it gets said out loud rather than left to be discovered.
-		fmt.Println("vpn: WARNING — this host has an exit node SELECTED, so its default route goes through the mesh. Nothing in this module sets that.")
-	}
+	// Phase 2: which gate is in force, what the REAL egress IP is, what is
+	// pinned outside the tunnel, and whether a revert is pending. Reported
+	// unconditionally — including when nothing is selected — because the
+	// dangerous states are the leftover ones, and a status that only speaks
+	// up when it has good news is how they stay invisible.
+	reportExitStatus(ctx, prefs, prefsErr, st)
+
 	if prefsErr == nil && !SameOrEmpty(prefs.LoginServer, stateLoginServer(st)) {
 		fmt.Printf("vpn: NOTE — this node answers to %s, but local state records %s\n",
 			prefs.LoginServer, stateLoginServer(st))

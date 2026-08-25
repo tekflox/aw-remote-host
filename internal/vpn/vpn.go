@@ -3,17 +3,17 @@
 // own headscale, and the reader that reports what an enrolled node is
 // actually doing.
 //
-// Phase 1 only, per .tmp/vpn-design/vpn-exit-node-design.md (2026-08-23) and
-// the card that scoped it: install the client, enrol the node, and OPTIONALLY
-// advertise it as an exit node. Nothing here selects an exit node, and
-// nothing here touches this machine's default route. That is phase 2 and it
-// is the dangerous half — the /link tunnel is the only remote-management path
-// a BYOD host has, so a broken default route takes down the means of fixing
-// it along with the machine (the same accident already documented in
-// cmd/aw-remote-host/commands.go's bootstrapWorkspaceSelfHeal call site).
-// `--advertise-exit-node` is safe to include because it provably does NOT
-// change the advertiser's own routing — confirmed on the production
-// bare-metal on 2026-08-25.
+// This file is the ENROLMENT half: install the client, enrol the node, and
+// OPTIONALLY advertise it as an exit node. Nothing in it selects an exit node
+// and nothing in it touches this machine's default route. That half lives in
+// exit.go, deadman.go and bootguard.go, behind an explicit `vpn use-exit`
+// command, because it is the dangerous one — the /link tunnel is the only
+// remote-management path a BYOD host has, so a broken default route takes
+// down the means of fixing it along with the machine (the same accident
+// already documented in cmd/aw-remote-host/commands.go's
+// bootstrapWorkspaceSelfHeal call site). `--advertise-exit-node` is safe to
+// include here because it provably does NOT change the advertiser's own
+// routing — confirmed on the production bare-metal on 2026-08-25.
 //
 // The probe is why this is a Go package and not just a shell script. It is
 // modelled on internal/hostpower.Resolve(): a request is not a grant, and the
@@ -56,8 +56,8 @@ const (
 	EnvHostname = "AW_VPN_HOSTNAME"
 	// EnvAdvertiseExit ("1"/"true"/"yes") offers this node as an exit node.
 	// Offering is not being used: a headscale admin still has to approve the
-	// 0.0.0.0/0 route before any peer can select it, and selecting it is
-	// phase 2 regardless.
+	// 0.0.0.0/0 route before any peer can select it, and selecting it is a
+	// separate, deliberate command on the client side either way.
 	EnvAdvertiseExit = "AW_VPN_ADVERTISE_EXIT"
 	// EnvAcceptDNS ("1"/"true"/"yes") opts INTO MagicDNS. Off by default, and
 	// that default is deliberate: accepting DNS rewrites the host's resolver,
