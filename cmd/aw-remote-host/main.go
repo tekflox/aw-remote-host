@@ -47,6 +47,8 @@ func main() {
 		err = runBootstrapWorkspace(args)
 	case "status":
 		err = runStatus(args)
+	case "vpn":
+		err = runVPN(args)
 	case "unlink":
 		err = runUnlink(args)
 	case "version":
@@ -83,6 +85,11 @@ Commands:
                         --with-workspace to also provision the local
                         runtime (now or later — see below).
   status                Show link + bootstrap status
+  vpn                   Join this machine to the tenant's mesh (headscale).
+                        Opt-in — never run by a plain bootstrap. Installs
+                        tailscale, enrols the node, and can ADVERTISE it as
+                        an exit node. It never selects one and never changes
+                        this machine's default route.
   unlink                Disconnect this machine from the control plane
   version               Print the client version
 
@@ -113,6 +120,20 @@ Flags (link, bootstrap-workspace, status, unlink):
                     Linux — then detach; the service itself runs with
                     --foreground.
   --stop-containers (unlink) also stop the podman containers this host started
+
+Flags (vpn):
+  --login-server    the tenant's headscale, e.g. https://headscale.aw.tekflox.com
+                    (required — never defaulted: one headscale per tenant)
+  --authkey         a headscale pre-auth key, for a first enrolment
+  --hostname        node name in the mesh (default: this machine's hostname)
+  --advertise-exit-node
+                    offer this node as an exit gate. Advertising does not
+                    change this machine's own routing, and a headscale admin
+                    still has to approve the route before any peer can use it.
+  --accept-dns      accept MagicDNS (off by default — it rewrites this host's
+                    resolver)
+  --plan            print the eligibility verdict and what would run, and
+                    change nothing
 
 unlink also stops and uninstalls the background service (launchd/systemd),
 if one was installed.

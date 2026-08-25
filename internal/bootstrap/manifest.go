@@ -17,12 +17,29 @@ import (
 
 // Module describes one installable component from bootstrap/manifest.json.
 type Module struct {
-	Name          string `json:"name"`
-	Version       string `json:"version"`
-	Image         string `json:"image,omitempty"`
-	Digest        string `json:"digest,omitempty"`
-	Package       string `json:"package,omitempty"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Image   string `json:"image,omitempty"`
+	Digest  string `json:"digest,omitempty"`
+	Package string `json:"package,omitempty"`
+	// Source discloses where a package comes from when it is NOT the distro's
+	// own repositories — the root README's transparency contract promises
+	// "nothing is fetched from an undisclosed source", so a module that runs
+	// an upstream installer has to name it here rather than only in a script.
+	Source        string `json:"source,omitempty"`
 	VerifyCommand string `json:"verify_command"`
+	// Optional marks a module that a plain bootstrap must NOT run — it only
+	// happens when something asks for it by name (Manifest.Only).
+	//
+	// Every module up to now was infrastructure the workspace cannot run
+	// without, so "in the manifest" and "install it" meant the same thing.
+	// The vpn module broke that: enrolling a machine in a network is a
+	// decision its owner makes, not a side effect of provisioning a
+	// workspace, and it needs inputs (a login server, a pre-auth key) that no
+	// ordinary bootstrap has. Without this flag, adding it to the manifest
+	// would make every --with-workspace run try to install tailscale and then
+	// fail the whole bootstrap on the missing key.
+	Optional bool `json:"optional,omitempty"`
 }
 
 // Manifest is the top-level bootstrap/manifest.json document.
@@ -127,6 +144,9 @@ func installDetail(mod Module) string {
 		return fmt.Sprintf("pull %s@%s", mod.Image, mod.Digest)
 	}
 	if mod.Package != "" {
+		if mod.Source != "" {
+			return fmt.Sprintf("install package %s from %s", mod.Package, mod.Source)
+		}
 		return fmt.Sprintf("install package %s", mod.Package)
 	}
 	return fmt.Sprintf("install %s %s", mod.Name, mod.Version)

@@ -25,6 +25,14 @@
       "version": "latest",
       "image": "ghcr.io/fredericowu/aw-workspace",
       "verify_command": "bootstrap/workspace/verify.sh"
+    },
+    {
+      "name": "vpn",
+      "version": "tailscale (stable, upstream installer)",
+      "package": "tailscale",
+      "source": "https://tailscale.com/install.sh",
+      "optional": true,
+      "verify_command": "bootstrap/vpn/verify.sh"
     }
   ]
 }

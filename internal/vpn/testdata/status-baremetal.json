@@ -1,0 +1,177 @@
+{
+  "Version": "1.102.3-t9329c3677-ga522f65e9",
+  "TUN": true,
+  "BackendState": "Running",
+  "HaveNodeKey": true,
+  "AuthURL": "",
+  "TailscaleIPs": [
+    "100.64.0.1",
+    "fd7a:115c:a1e0::1"
+  ],
+  "Self": {
+    "ID": "1",
+    "NodeID": 1,
+    "PublicKey": "nodekey:25b84c43898cff59dcded29956108235fb14a02e764b6511c573a63226d07c3c",
+    "HostName": "aw-baremetal",
+    "DNSName": "aw-baremetal.mesh.aw.tekflox.com.",
+    "OS": "linux",
+    "UserID": 1,
+    "TailscaleIPs": [
+      "100.64.0.1",
+      "fd7a:115c:a1e0::1"
+    ],
+    "AllowedIPs": [
+      "0.0.0.0/0",
+      "100.64.0.1/32",
+      "::/0",
+      "fd7a:115c:a1e0::1/128"
+    ],
+    "Addrs": [
+      "65.109.66.88:41641",
+      "10.8.0.1:41641",
+      "10.89.0.1:41641",
+      "172.17.0.1:41641",
+      "172.18.0.1:41641",
+      "172.19.0.1:41641",
+      "172.20.0.1:41641",
+      "172.21.0.1:41641",
+      "[2a01:4f9:5a:42ea::2]:41641"
+    ],
+    "CurAddr": "",
+    "Relay": "hel",
+    "PeerRelay": "",
+    "RxBytes": 0,
+    "TxBytes": 0,
+    "Created": "2026-08-25T00:41:20.407280368Z",
+    "LastWrite": "0001-01-01T00:00:00Z",
+    "LastSeen": "0001-01-01T00:00:00Z",
+    "LastHandshake": "0001-01-01T00:00:00Z",
+    "Online": true,
+    "ExitNode": false,
+    "ExitNodeOption": true,
+    "Active": false,
+    "PeerAPIURL": [
+      "http://100.64.0.1:58436",
+      "http://[fd7a:115c:a1e0::1]:59780"
+    ],
+    "TaildropTarget": 0,
+    "NoFileSharingReason": "",
+    "Capabilities": [
+      "HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508",
+      "default-auto-update",
+      "https://tailscale.com/cap/file-sharing",
+      "https://tailscale.com/cap/is-admin",
+      "https://tailscale.com/cap/ssh"
+    ],
+    "CapMap": {
+      "default-auto-update": [
+        false
+      ],
+      "https://tailscale.com/cap/file-sharing": [],
+      "https://tailscale.com/cap/is-admin": [],
+      "https://tailscale.com/cap/ssh": []
+    },
+    "InNetworkMap": true,
+    "InMagicSock": false,
+    "InEngine": false
+  },
+  "Health": [],
+  "MagicDNSSuffix": "mesh.aw.tekflox.com",
+  "CurrentTailnet": {
+    "Name": "headscale.aw.tekflox.com",
+    "MagicDNSSuffix": "mesh.aw.tekflox.com",
+    "MagicDNSEnabled": true
+  },
+  "CertDomains": null,
+  "ExtraRecords": null,
+  "Peer": {
+    "nodekey:c423880124ab2bb7a0374382286aaa1653aa26be532f6888cc880d09e1991e55": {
+      "ID": "3",
+      "NodeID": 3,
+      "PublicKey": "nodekey:c423880124ab2bb7a0374382286aaa1653aa26be532f6888cc880d09e1991e55",
+      "HostName": "aw-mac",
+      "DNSName": "aw-mac.mesh.aw.tekflox.com.",
+      "OS": "macOS",
+      "UserID": 1,
+      "TailscaleIPs": [
+        "100.64.0.3",
+        "fd7a:115c:a1e0::3"
+      ],
+      "AllowedIPs": [
+        "100.64.0.3/32",
+        "fd7a:115c:a1e0::3/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mad",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2026-08-25T07:40:41.741247793Z",
+      "LastWrite": "2026-08-25T09:42:44.245969294+02:00",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.0.3:34152",
+        "http://[fd7a:115c:a1e0::3]:34984"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false
+    },
+    "nodekey:f74de67ddd6ea9604377bc7aaf624f042035ebc400602f28b69dd4c2eb63765b": {
+      "ID": "2",
+      "NodeID": 2,
+      "PublicKey": "nodekey:f74de67ddd6ea9604377bc7aaf624f042035ebc400602f28b69dd4c2eb63765b",
+      "HostName": "aw-surface-wsl",
+      "DNSName": "aw-surface-wsl.mesh.aw.tekflox.com.",
+      "OS": "linux",
+      "UserID": 1,
+      "TailscaleIPs": [
+        "100.64.0.2",
+        "fd7a:115c:a1e0::2"
+      ],
+      "AllowedIPs": [
+        "100.64.0.2/32",
+        "fd7a:115c:a1e0::2/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mad",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2026-08-25T00:42:07.767092003Z",
+      "LastWrite": "2026-08-25T02:43:36.120106602+02:00",
+      "LastSeen": "2026-08-25T07:37:22.523411681Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.0.2:46590",
+        "http://[fd7a:115c:a1e0::2]:47166"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false
+    }
+  },
+  "User": {
+    "1": {
+      "ID": 1,
+      "LoginName": "fredericowu",
+      "DisplayName": "fredericowu"
+    }
+  },
+  "ClientVersion": null
+}

@@ -246,12 +246,12 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	if *plan {
 		if provisionWorkspace {
 			fmt.Printf("[plan] would link to %s as this machine, then run:\n", *controlPlane)
-			for _, a := range bootstrap.Plan(m) {
+			for _, a := range bootstrap.Plan(m.Default()) {
 				fmt.Printf("[plan] %s: %s — %s\n", a.Module, a.Step, a.Detail)
 			}
 		} else {
 			fmt.Printf("[plan] would link to %s as this machine (lean: no local provisioning — use 'bootstrap-workspace --with-workspace' to also run):\n", *controlPlane)
-			for _, a := range bootstrap.Plan(m) {
+			for _, a := range bootstrap.Plan(m.Default()) {
 				fmt.Printf("[plan] (skipped — lean %s) %s: %s — %s\n", cmdName, a.Module, a.Step, a.Detail)
 			}
 		}
@@ -341,7 +341,9 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	// control-plane-driven "bootstrap" verb (src/api/placement/
 	// remote_host_driver.py) don't need any module installed locally first.
 	if provisionWorkspace {
-		infra := m.Except("workspace")
+		// Default() drops the opt-in modules (vpn): provisioning a workspace
+		// must never also enrol the machine in a network.
+		infra := m.Default().Except("workspace")
 		infraOpts := bootstrap.RunOptions{
 			ExtractDir: extractDir,
 			Env:        []string{"AW_POSTGRES_PASSWORD=" + st.PostgresPassword},
@@ -652,6 +654,7 @@ func runStatus(args []string) error {
 		fmt.Printf("workspace: %s\n", st.WorkspaceSlug)
 	}
 	reportHostPowerStatus(st.HostPower)
+	reportVPNStatus(context.Background(), st)
 
 	if mgr, mgrErr := servicemgr.Default(); mgrErr != nil {
 		fmt.Printf("service: no supported service manager (%v)\n", mgrErr)
@@ -683,7 +686,10 @@ func runStatus(args []string) error {
 	ctx := context.Background()
 	opts := bootstrap.RunOptions{ExtractDir: extractDir, Env: []string{"AW_POSTGRES_PASSWORD=" + st.PostgresPassword}}
 	allOK := true
-	for _, mod := range m.Modules {
+	// Default(), not Modules: an opt-in module this host never asked for is
+	// not "not healthy", it is absent on purpose. reportVPNStatus above
+	// already says what is true about the vpn module on this machine.
+	for _, mod := range m.Default().Modules {
 		ok, out := bootstrap.Detect(ctx, mod, opts)
 		if ok {
 			fmt.Printf("%s: healthy\n", mod.Name)

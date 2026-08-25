@@ -21,7 +21,11 @@ ever run it. That is the whole transparency contract:
   [`bootstrap/manifest.json`](bootstrap/manifest.json) — container images
   by exact SHA-256 digest (not a mutable tag), OS packages by name via your
   distro's own package manager. Nothing is fetched from an undisclosed
-  source.
+  source. Exactly one module — the opt-in `vpn` one — installs from an
+  upstream vendor's own installer instead, because tailscale ships in no
+  distro's repositories; that installer is named in the manifest's `source`
+  field, `--plan` prints it, and all it does is add tailscale's signed apt/dnf
+  repository before handing back to your package manager.
 - **What binds where:** every container a bootstrap module starts
   (Postgres, Redis) binds to `127.0.0.1` only. Nothing here is reachable
   from your network or the internet.
@@ -111,6 +115,7 @@ commit `753214a`) only takes effect on the target machine once the
 ```sh
 aw-remote-host bootstrap-workspace --token <token> [--with-workspace] [--plan] [--yes] [--foreground|--background] [--control-plane https://api.aw.tekflox.com]
 aw-remote-host status [--plan]
+aw-remote-host vpn --login-server <headscale-url> [--authkey <key>] [--hostname <name>] [--advertise-exit-node] [--accept-dns] [--plan]
 aw-remote-host unlink [--plan] [--stop-containers]
 aw-remote-host version
 ```
@@ -259,6 +264,72 @@ v1 is **Linux-only** on purpose — macOS and Windows always report
 `backend: "unsupported"` (still gracefully, never an error) rather than
 guessing at a `pf`/`netsh` implementation.
 
+### Mesh membership — `aw-remote-host vpn` (phase 1)
+
+This host can join **the tenant's own mesh**, so the machines behind one
+account can reach each other, and so one of them can later serve as the
+others' exit gate. The client is stock tailscale; the control plane is a
+**headscale instance per tenant** — never a shared one, because two
+headscales do not federate, which makes tenant isolation a property of the
+topology rather than of getting an ACL right.
+
+```bash
+aw-remote-host vpn --plan            # eligibility verdict only, changes nothing
+aw-remote-host vpn \
+  --login-server https://headscale.<tenant>.example \
+  --authkey hskey-auth-... [--advertise-exit-node]
+```
+
+The `vpn` module is **opt-in**: it is in `bootstrap/manifest.json` with
+`"optional": true`, so a plain `bootstrap-workspace --with-workspace` never
+runs it. Joining a network is a decision the machine's owner makes, not a
+side effect of provisioning a workspace.
+
+**What phase 1 deliberately does not do:** select an exit node, or change
+this machine's default route in any other way. The `/link` tunnel is the
+only remote-management path a linked host has, so a default route pointed at
+a mesh that is down takes the means of fixing it down with the machine — the
+same shape as the outage recorded in `commands.go`'s
+`bootstrapWorkspaceSelfHeal` comment. `--advertise-exit-node` is inside the
+line because *advertising* provably does not change the advertiser's own
+routing (confirmed on real hardware, 2026-08-25); it also does nothing at all
+until a headscale admin approves the route, which `status` says out loud.
+`--accept-routes` and `--accept-dns` are both forced **off**, overriding
+tailscale's own defaults, for the same reason.
+
+Eligibility is probed and **refused with a reason**, in the same spirit as
+`--host-power` and the firewall probe above — a host that cannot really do
+this has to say why, not fail quietly:
+
+```
+vpn: host is darwin/arm64, uid 503 (no root, no passwordless sudo)
+vpn: NOT eligible — `sudo -n true` fails for this user, so `sudo tailscaled
+     install-system-daemon` cannot run. macOS needs that system daemon: without
+     it tailscaled has no privileged helper, and `tailscale set`/`tailscale up`
+     fail with "Access denied: checkprefs access denied".
+```
+
+That refusal is not hypothetical. Without root, tailscaled can still start
+with `--tun=userspace-networking`, which yields a SOCKS5/HTTP proxy and
+**not** a network interface — so a host "installed" that way reports success
+and carries none of its own traffic. See `bootstrap/vpn/README.md` for the
+full eligibility table and `internal/vpn` for the probe.
+
+`status` reports the node, its mesh IP, and for each peer whether the path is
+**direct or relayed**:
+
+```
+vpn: node aw-vpn-phase1-test (100.64.0.4) online on tailnet headscale.aw.tekflox.com
+vpn:   peer aw-baremetal    100.64.0.1   idle, no direct path established — would relay via DERP(hel)  [offers exit node]
+vpn:   peer aw-mac          100.64.0.3   idle, no direct path established — would relay via DERP(mad)
+```
+
+The direct/relay distinction earns its place: two nodes on the *same home
+network*, behind the same public IP, were measured relaying through Madrid
+because one of them is WSL2 and sits behind a second layer of NAT. A relay is
+a normal outcome, not a rare fallback, and without this line "it works, but
+every packet goes to Madrid and back" is invisible.
+
 ### Windows (lean link only)
 
 A Windows host is **always a lean link** — and that is a property of the
@@ -393,16 +464,17 @@ across separate `bootstrap.Run()` calls.
 ## Repository layout
 
 ```
-cmd/aw-remote-host/     Go CLI entrypoint (bootstrap-workspace, status, unlink, version)
+cmd/aw-remote-host/     Go CLI entrypoint (bootstrap-workspace, status, vpn, unlink, version)
 internal/link/          WS client that dials wss://<control-plane>/link, credential persistence, reconnect loop
 internal/bootstrap/     Manifest loader + embedded-script extraction + detect/install/verify orchestration
 internal/servicemgr/    Per-OS background service manager (systemd on Linux, launchd on macOS, schtasks on Windows)
 internal/ops/proc_*.go  Per-OS process control: which shell runs a command, process-group setup, tree kill
 internal/firewall/      firewall_apply/firewall_status verbs: nft/iptables backends, privilege probe, self-heal cache
-internal/state/         Local state (generated Postgres password, last-known workspace slug)
+internal/vpn/           Mesh (tailscale/headscale): eligibility probe, status/prefs readers
+internal/state/         Local state (generated Postgres password, last-known workspace slug, mesh enrolment)
 bootstrap/embed.go      go:embed of manifest.json + lib/ + every module's scripts into the binary
-bootstrap/manifest.json Pinned module list (name, version, image digest or package, verify command)
-bootstrap/lib/          Shared dependency-resolution helpers (deps.sh) sourced by module install.sh scripts
+bootstrap/manifest.json Pinned module list (name, version, image digest or package, source, optional, verify command)
+bootstrap/lib/          Shared helpers sourced by module scripts (deps.sh, network.sh, publish.sh, vpn.sh)
 bootstrap/<module>/     One dir per module: README.md, install.sh, verify.sh
 install.sh              Root installer (Linux/macOS): pinned binary download + checksum verify
 install.ps1             Root installer (Windows): same contract, PowerShell + zip

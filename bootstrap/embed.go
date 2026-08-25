@@ -7,5 +7,11 @@ package assets
 
 import "embed"
 
-//go:embed manifest.json lib podman postgres redis workspace
+// The module list is explicit, not a wildcard, so adding a module directory
+// without adding it here compiles cleanly and then fails at runtime with
+// "script not found" on the target machine. TestEveryManifestModuleIsEmbedded
+// in internal/bootstrap guards that, because the failure otherwise only shows
+// up on a host, not in CI.
+//
+//go:embed manifest.json lib podman postgres redis workspace vpn
 var FS embed.FS

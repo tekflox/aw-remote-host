@@ -38,6 +38,30 @@ type State struct {
 	//
 	// Empty on every host that never opted in, which is the default.
 	HostPower []string `json:"host_power,omitempty"`
+	// VPN records this host's enrolment in the tenant mesh. Nil on every host
+	// that never ran the vpn module, which is the default.
+	VPN *VPNState `json:"vpn,omitempty"`
+}
+
+// VPNState is what the vpn bootstrap module needs to remember between runs:
+// which control plane this node answers to, what it registered as, and
+// whether it was asked to offer itself as an exit gate.
+//
+// The pre-auth key is deliberately NOT here. It is a credential that is
+// single-use by default and is consumed by `tailscale up`; storing it would
+// leave a secret on disk that buys nothing, since a re-run of an already
+// enrolled node needs no key at all.
+//
+// AdvertiseExit is the REQUEST, in the same sense as HostPower above — what
+// the operator asked for. Whether the mesh honours it is a separate question
+// with a separate answer (headscale has to approve the 0.0.0.0/0 route), read
+// live from the node in `status` rather than frozen here.
+type VPNState struct {
+	LoginServer   string `json:"login_server,omitempty"`
+	NodeName      string `json:"node_name,omitempty"`
+	AdvertiseExit bool   `json:"advertise_exit,omitempty"`
+	// EnrolledAt is RFC3339, for a status line that can say how old this is.
+	EnrolledAt string `json:"enrolled_at,omitempty"`
 }
 
 // DefaultPath returns ~/.aw-remote-host/state.json.

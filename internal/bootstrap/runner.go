@@ -170,8 +170,21 @@ func (m *Manifest) Except(names ...string) *Manifest {
 	return out
 }
 
+// Default returns the modules a plain bootstrap runs — everything that is
+// not opt-in. Callers that mean "all the modules this host is supposed to
+// have" want this, not the raw manifest; see Module.Optional.
+func (m *Manifest) Default() *Manifest {
+	out := &Manifest{}
+	for _, mod := range m.Modules {
+		if !mod.Optional {
+			out.Modules = append(out.Modules, mod)
+		}
+	}
+	return out
+}
+
 // Only returns a Manifest containing just the named modules, in manifest
-// order.
+// order. It ignores Optional on purpose — naming a module IS the opt-in.
 func (m *Manifest) Only(names ...string) *Manifest {
 	want := make(map[string]bool, len(names))
 	for _, n := range names {
