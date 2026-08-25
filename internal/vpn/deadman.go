@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/homedir"
@@ -147,11 +146,10 @@ func Arm(spec ArmSpec) (*Deadman, error) {
 	cmd := exec.Command("sh", "-c", spec.revertScript())
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	// Setsid is the whole point — see the file header. Without it the revert
-	// dies with the session that armed it, which is precisely the session
-	// most likely to be killed by the route change it is guarding.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
+	// Detached into its own session — see the file header. Without that the
+	// revert dies with the session that armed it, which is precisely the
+	// session most likely to be killed by the route change it is guarding.
+	if err := startDetached(cmd); err != nil {
 		return nil, fmt.Errorf("arm dead-man's switch: %w", err)
 	}
 	// Deliberately never Wait()ed: this process is expected to outlive the
@@ -168,7 +166,7 @@ func Arm(spec ArmSpec) (*Deadman, error) {
 		// Kill it rather than leave a revert running that nothing knows how
 		// to stand down — an unrecorded switch would fire under a confirmed,
 		// working selection.
-		_ = syscall.Kill(-d.PID, syscall.SIGKILL)
+		_ = killGroup(d.PID)
 		return nil, err
 	}
 	return d, nil
@@ -231,9 +229,9 @@ func Disarm() (bool, error) {
 	}
 	killed := false
 	if d.PID > 0 && processIsDeadman(d.PID) {
-		// Negative PID: the process group. Setsid made the child its own
-		// group leader, so this takes the sh and the sleep it is blocked in.
-		if err := syscall.Kill(-d.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		// The process GROUP, not the process: the child leads its own group,
+		// so this takes the sh and the sleep it is blocked in together.
+		if err := killGroup(d.PID); err != nil {
 			return false, fmt.Errorf("stand down dead-man's switch (pid %d): %w", d.PID, err)
 		}
 		killed = true
