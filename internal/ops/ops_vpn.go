@@ -59,6 +59,33 @@ func (t tailscaleRunner) Run(ctx context.Context, name string, args ...string) (
 	return t.inner.Run(ctx, name, args...)
 }
 
+// probeEligibility answers "could this host join the mesh, and if not why" —
+// vpn.Resolve over a fresh vpn.Probe. A var so a test can pin a verdict rather
+// than depending on whatever machine runs `go test`, which is the exact
+// dependency the Host/Resolve split exists to avoid.
+var probeEligibility = func() vpn.Eligibility { return vpn.Resolve(vpn.Probe()) }
+
+// eligibilityPayload renders the verdict for the control plane.
+//
+// It rides on vpn_status rather than on a verb of its own because the
+// Networking screen asks it in the same breath as "is this host on the mesh":
+// that screen used to say root and /dev/net/tun were "not reported by any API
+// yet", and the probe has answered both — with a written sentence — since
+// v0.1.51.
+//
+// `enroll_refusal` is a complete sentence and is meant to be shown verbatim.
+// A screen that renders its own generic reason next to a `false` throws away
+// the only part of this that tells a human what to fix.
+func eligibilityPayload(e vpn.Eligibility) map[string]any {
+	return map[string]any{
+		"can_enroll":         e.CanEnroll,
+		"enroll_refusal":     e.EnrollRefusal,
+		"can_advertise_exit": e.CanAdvertiseExit,
+		"exit_refusal":       e.ExitRefusal,
+		"installer":          e.Installer,
+	}
+}
+
 // VPNStatus reports this host's mesh membership — what the Networking screen
 // renders. Read-only: it runs `tailscale status`, `tailscale debug prefs` and
 // one `tailscale ping` per online peer, and changes nothing.
@@ -72,13 +99,20 @@ func (t tailscaleRunner) Run(ctx context.Context, name string, args ...string) (
 //
 // Response keys are snake_case like every other verb's; the control plane
 // maps them onto the UI's shape rather than this host guessing at it.
+//
+// `eligibility` is on EVERY path out of here, including the two that report no
+// mesh at all — a host with no tailscale is precisely the one whose reader
+// wants to know whether it could have it.
 func (h *Handler) VPNStatus(ctx context.Context) (map[string]any, error) {
+	eligibility := eligibilityPayload(probeEligibility())
+
 	bin := lookupTailscale()
 	if bin == "" {
 		return map[string]any{
-			"installed": false,
-			"running":   false,
-			"reason":    "the tailscale CLI is not installed on this host",
+			"installed":   false,
+			"running":     false,
+			"reason":      "the tailscale CLI is not installed on this host",
+			"eligibility": eligibility,
 		}, nil
 	}
 	runner := tailscaleRunner{inner: h.runner(), bin: bin}
@@ -86,13 +120,15 @@ func (h *Handler) VPNStatus(ctx context.Context) (map[string]any, error) {
 	status, err := vpn.FetchStatus(ctx, runner)
 	if err != nil {
 		return map[string]any{
-			"installed": true,
-			"running":   false,
-			"reason":    "could not read tailscale status: " + err.Error(),
+			"installed":   true,
+			"running":     false,
+			"reason":      "could not read tailscale status: " + err.Error(),
+			"eligibility": eligibility,
 		}, nil
 	}
 
 	out := map[string]any{
+		"eligibility":   eligibility,
 		"installed":     true,
 		"running":       status.Running(),
 		"backend_state": status.BackendState,

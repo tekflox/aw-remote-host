@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/tekflox/aw-remote-host/internal/vpn"
 )
 
 // Fixtures below are trimmed from REAL output captured 2026-08-25 on the
@@ -284,5 +286,105 @@ func TestVPNStatusReportsAnUnresolvableExitGateRatherThanBlankingIt(t *testing.T
 	}
 	if data["exit_node"] != "99" {
 		t.Fatalf("exit_node = %v, want the raw id 99", data["exit_node"])
+	}
+}
+
+// withEligibility pins the verdict for one test. The real Probe() reads the
+// machine running `go test`, and "is this box root with /dev/net/tun and
+// systemd" is exactly the thing that differs between a CI runner, a laptop
+// and the container this is meant to describe.
+func withEligibility(t *testing.T, h vpn.Host) {
+	t.Helper()
+	original := probeEligibility
+	probeEligibility = func() vpn.Eligibility { return vpn.Resolve(h) }
+	t.Cleanup(func() { probeEligibility = original })
+}
+
+// The `aw` host, measured 2026-08-25: linux/amd64 running as root with
+// /dev/net/tun, inside a container where systemd is not PID 1. The verdict
+// AND its sentence have to reach the control plane — a bare `false` next to a
+// generic reason is what the Networking screen was already doing off `os`
+// alone, and it is what this carries the sentence to replace.
+func TestVPNStatusCarriesTheEligibilityVerdictAndItsSentence(t *testing.T) {
+	withTailscale(t, tailscaleBin)
+	withEligibility(t, vpn.Host{OS: "linux", Arch: "amd64", UID: 0, HasTUN: true})
+	h := &Handler{Runner: meshRunner()}
+
+	data, err := h.VPNStatus(context.Background())
+	if err != nil {
+		t.Fatalf("VPNStatus: %v", err)
+	}
+	el, ok := data["eligibility"].(map[string]any)
+	if !ok {
+		t.Fatalf("eligibility is %T, want map[string]any", data["eligibility"])
+	}
+	if el["can_enroll"] != false {
+		t.Fatalf("can_enroll = %v, want false — systemd is not managing this host", el["can_enroll"])
+	}
+	refusal, _ := el["enroll_refusal"].(string)
+	if !strings.Contains(refusal, "/run/systemd/system does not exist") {
+		t.Fatalf("enroll_refusal = %q, want the probe's own systemd sentence", refusal)
+	}
+	// A host that cannot join at all cannot be a gate either, and it says so
+	// rather than leaving the second verdict unexplained.
+	if el["can_advertise_exit"] != false {
+		t.Fatalf("can_advertise_exit = %v, want false", el["can_advertise_exit"])
+	}
+	if exit, _ := el["exit_refusal"].(string); exit == "" {
+		t.Fatal("can_advertise_exit=false with no exit_refusal — the refusal must carry a reason")
+	}
+}
+
+// The host most in need of this answer is the one with no tailscale on it:
+// "could I install it here" is the whole question, and the early return used
+// to be the one path out of the verb that said nothing about it.
+func TestVPNStatusReportsEligibilityWithoutTailscaleInstalled(t *testing.T) {
+	withTailscale(t, "")
+	withEligibility(t, vpn.Host{OS: "linux", Arch: "amd64", UID: 0, HasTUN: true, HasSystemd: true})
+	h := &Handler{Runner: newFakeRunner()}
+
+	data, err := h.VPNStatus(context.Background())
+	if err != nil {
+		t.Fatalf("VPNStatus: %v", err)
+	}
+	el, ok := data["eligibility"].(map[string]any)
+	if !ok {
+		t.Fatalf("eligibility is %T, want map[string]any", data["eligibility"])
+	}
+	if el["can_enroll"] != true {
+		t.Fatalf("can_enroll = %v, want true — root, tun and systemd are all present", el["can_enroll"])
+	}
+	if refusal, _ := el["enroll_refusal"].(string); refusal != "" {
+		t.Fatalf("enroll_refusal = %q, want empty on an eligible host", refusal)
+	}
+	if el["installer"] != vpn.InstallerUpstreamScript {
+		t.Fatalf("installer = %v, want %q", el["installer"], vpn.InstallerUpstreamScript)
+	}
+}
+
+// A read failure is about tailscale, not about whether this host could run
+// it. Dropping the verdict on that path would report "unknown" about a
+// machine the probe just answered for.
+func TestVPNStatusKeepsTheVerdictWhenTheStatusReadFails(t *testing.T) {
+	withTailscale(t, tailscaleBin)
+	withEligibility(t, vpn.Host{OS: "darwin", Arch: "arm64", UID: 503})
+	r := newFakeRunner()
+	r.fail(fmt.Errorf("exit status 1"), tailscaleBin, "status", "--json")
+	r.on("failed to connect to local tailscaled", tailscaleBin, "status", "--json")
+	h := &Handler{Runner: r}
+
+	data, err := h.VPNStatus(context.Background())
+	if err != nil {
+		t.Fatalf("VPNStatus: %v", err)
+	}
+	el, ok := data["eligibility"].(map[string]any)
+	if !ok {
+		t.Fatalf("eligibility is %T, want map[string]any", data["eligibility"])
+	}
+	if el["can_enroll"] != false {
+		t.Fatalf("can_enroll = %v, want false — Mac.Home has no Homebrew prefix it can write", el["can_enroll"])
+	}
+	if refusal, _ := el["enroll_refusal"].(string); !strings.Contains(refusal, "Homebrew") {
+		t.Fatalf("enroll_refusal = %q, want the macOS reason", refusal)
 	}
 }
