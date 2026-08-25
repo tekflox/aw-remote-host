@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -13,6 +14,10 @@ import (
 // scripted output/errors per command name, so tests never touch a real
 // podman/curl/df binary.
 type fakeRunner struct {
+	// mu guards calls: vpn_status pings its peers concurrently (see
+	// vpn.MeasurePaths), so a verb can reach this Runner from several
+	// goroutines at once and an unguarded append is a real race under -race.
+	mu      sync.Mutex
 	calls   [][]string
 	outputs map[string]string // "name arg1 arg2" -> output
 	errs    map[string]error  // "name arg1 arg2" -> error
@@ -35,6 +40,8 @@ func (f *fakeRunner) fail(err error, name string, args ...string) {
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	call := append([]string{name}, args...)
 	f.calls = append(f.calls, call)
 	k := f.key(name, args...)

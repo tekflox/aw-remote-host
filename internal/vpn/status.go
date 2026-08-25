@@ -61,6 +61,15 @@ type Peer struct {
 	Relay string
 	// DirectAddr is the peer-to-peer endpoint when Path is PathDirect.
 	DirectAddr string
+	// Measured is whether Path came from an actual `tailscale ping` rather
+	// than from the status JSON. It carries the honesty of the whole field:
+	// an idle peer's status reading is a guess (see ping.go), and a consumer
+	// that cannot tell a guess from a measurement will present one as the
+	// other.
+	Measured bool
+	// Latency is the round trip `tailscale ping` printed ("217ms"), and is
+	// only ever set when Measured is true.
+	Latency string
 	// OffersExit is tailscale's ExitNodeOption: advertised AND approved by
 	// the control plane. An advertised-but-unapproved node reads false here,
 	// which is the honest answer — until a headscale admin approves the
@@ -89,6 +98,21 @@ func (p Peer) PathDescription() string {
 		}
 		return "no path known"
 	}
+}
+
+// Via renders just the "through what" half of the path — "DERP(mad)" when
+// relayed, the endpoint when direct, "" when no path is known. Separate from
+// PathDescription because a screen shows the kind and the route as two
+// different things (a badge and a caption), where a log line wants one
+// sentence.
+func (p Peer) Via() string {
+	switch p.Path {
+	case PathDirect:
+		return p.DirectAddr
+	case PathRelay:
+		return "DERP(" + p.Relay + ")"
+	}
+	return ""
 }
 
 // Status is what this node reports about its own mesh membership.
