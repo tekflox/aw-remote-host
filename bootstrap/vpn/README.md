@@ -10,10 +10,41 @@ optionally offering it as an exit gate — and, since phase 2, selecting one.
 | **`aw-remote-host vpn use-exit <node>`** | **yes** — see "Selecting an exit gate" |
 | `aw-remote-host vpn clear-exit` | yes, back to normal |
 
+## Offering a node that is already on the mesh
+
+`--advertise-exit-node` above is an ENROLMENT flag: it decides, once, at the
+moment a machine joins. A node already on the mesh had no way to start
+offering, and the consequence was concrete — on 2026-08-26 this tenant's mesh
+had exactly one gate, the only node anyone had thought to ask for at join
+time, and the Networking screen's picker was correct to list nothing else.
+
+**`vpn_advertise_exit`** (`internal/ops/ops_vpn_advertise.go`, `{"advertise":
+true|false}`) is that missing half. It enables kernel forwarding, proves it by
+reading the sysctls back, then advertises — and measures this host's own route
+to the internet either side, because *offering is not using* and an invariant
+nobody measures is a comment.
+
+It is **only half of a gate**. `offers_exit` in its reply is tailscale's
+`ExitNodeOption` — advertised AND approved — and is normally `false` right
+after a successful advertise. That is not a failure; it is the control plane's
+turn. aw-backend's `POST /remote-hosts/{id}/exit-offer` does both halves and
+**withdraws this one if its own fails**, because a node advertising a route
+nobody approved looks armed and forwards nothing.
+
+A **WSL2 distro may now serve as a gate**, where it used to be refused
+outright (`internal/vpn.Resolve`, and `bootstrap/lib/vpn.sh` in the same
+breath — the two must agree or the module never converges). "Never measured"
+is not "does not work", and the refusal left the only machine that could be a
+second gate permanently out. The cost travels with the permission instead, as
+`exit_warning`: everything routed through it leaves via the Windows host's NAT
+and, since it cannot hole-punch from behind that extra layer, through a public
+relay.
+
 Each of the two route-changing commands also has a `/link` verb, so the same
 thing can be asked for from the Networking screen instead of over SSH:
 `vpn_use_exit` and `vpn_clear_exit` (`internal/ops/ops_vpn_exit.go`), beside
-the read-only `vpn_status` and the enrolment-only `vpn_bootstrap`. They call
+the read-only `vpn_status`, the enrolment-only `vpn_bootstrap` and the
+route-preserving `vpn_advertise_exit` above. They call
 **the same `internal/vpn.UseExit`** the command does — the ordering below is
 the safety mechanism, and a second copy of it reachable only from the control
 plane would be the copy nobody exercises by hand.

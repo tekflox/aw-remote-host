@@ -112,7 +112,7 @@ type Handler struct {
 // "self-update"|"uninstall"|"health"|"exec_start"|"exec_status"|"exec_wait"|
 // "exec_kill"|"list_processes"|"fs_stat"|"fs_list"|"fs_mkdir"|"fs_delete"|
 // "fs_read_chunk"|"fs_write_chunk"|"firewall_apply"|"firewall_status"|
-// "vpn_status"|"vpn_bootstrap"|"vpn_use_exit"|
+// "vpn_status"|"vpn_bootstrap"|"vpn_advertise_exit"|"vpn_use_exit"|
 // "vpn_clear_exit"|"vpn_public_ip") — the
 // switchboard link.go's cmd-frame handling calls into. args carries optional
 // per-verb parameters such as the exact aw-workspace image version to
@@ -173,6 +173,8 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.VPNStatus(ctx)
 	case "vpn_bootstrap":
 		return h.VPNBootstrap(ctx, args, emit)
+	case "vpn_advertise_exit":
+		return h.VPNAdvertiseExit(ctx, args, emit)
 	case "vpn_use_exit":
 		return h.VPNUseExit(ctx, args, emit)
 	case "vpn_clear_exit":
