@@ -1,21 +1,44 @@
 // Phase 2 of the vpn module as a library: selecting an exit gate, which moves
-// this machine's default route onto the mesh, and clearing it again.
+// THIS HOST'S CONTAINERS onto the mesh — and never the host itself — and
+// clearing it again.
+//
+// THE INVARIANT, which was inverted on 2026-08-26 after the first real apply
+// took a Mac off the internet:
+//
+//   - the CONTAINERS' public IP MUST change. That is the feature.
+//   - the HOST's public IP MUST NOT change. That is a hard assertion, and a
+//     host whose address moved is a FAILED APPLY that reverts, however healthy
+//     the container's egress looks.
+//   - the confirmation checks BOTH, because either alone is a half-measure:
+//     container-changed-only hides a host that moved too, host-unchanged-only
+//     proves nothing happened at all.
 //
 // The ordering in UseExit is the deliverable, not the `tailscale set` call in
 // the middle of it. Read it as a sequence and every step is there to close one
 // way of ending up with a machine that has no internet and no way to be told
 // to stop:
 //
-//	measure egress BEFORE      -> or there is nothing to compare against
+//	measure BOTH egresses      -> the host's, which must hold, and the
+//	                              containers', which must move. Same function
+//	                              measures the "after", or the pair proves
+//	                              nothing
 //	arm the dead-man's switch  -> BEFORE anything changes, so every later
 //	                              failure, including this process being
-//	                              killed, still ends with the route restored
-//	pin the exclusions         -> control plane first, then every attached
-//	                              network; refuse if the control plane cannot
-//	                              even be resolved
-//	move the route
-//	confirm through the NEW route
+//	                              killed, still ends with the routes restored
+//	install the rules          -> host bypass FIRST, so the machine's own
+//	                              egress is claimed before tailscale's
+//	                              catch-all exists; then the mesh-preserve
+//	                              rule, the exclusions, and the container
+//	                              networks last
+//	select the gate
+//	confirm BOTH halves
 //	revert on anything unconfirmed, and only THEN stand the switch down
+//
+// With the host untouched, the dead-man's switch is no longer the only thing
+// between this and a bricked machine — remote management cannot be lost by an
+// apply that behaves. It is kept because an apply that MISbehaves is exactly
+// what it is for, and its job is now to clean up rules rather than to rescue a
+// host.
 //
 // The failure this defends against is not hypothetical. On this project's own
 // bare-metal, days before this was written, a leftover policy-routing rule
@@ -41,50 +64,66 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/state"
 )
 
-// HostRouteScopeRefusal is why selecting a gate refuses today, and it is
-// deliberately UNCONDITIONAL — not a check on which host is asking.
-//
-// The invariant this feature was built on was backwards. Everything below
-// moves THIS MACHINE's default route (`ip rule ... lookup 52`, applied `from
-// all`), so the host and its containers both leave through the gate. What was
-// actually wanted is the containers' egress moving and the HOST's public IP
-// staying exactly where it is — the host address is now the thing that must
-// NOT change, and a host whose IP moved is a failed apply however good the
-// container's egress looks.
-//
-// The cost of the old shape is not theoretical: it took a Mac off the internet
-// on the first real apply, and the same verb is reachable against a bare metal
-// running production (agents-platform-multitenant, aw-backend, ~15
-// aw-custom-*), where moving the host route is destructive. So until the
-// per-container-network rules exist, the honest behaviour is to refuse rather
-// than to keep offering a destructive action with a dead-man's switch behind
-// it. Routing the whole machine is not a degraded mode of this feature; under
-// the corrected invariant it IS the bug.
-//
-// ClearExit is deliberately NOT gated by this. It is the way OFF a gate, and
-// an undo that refuses is one that fails exactly when it is most needed —
-// including for the hosts that took a selection before this refusal landed.
-const HostRouteScopeRefusal = "`vpn use-exit` moves this MACHINE's default route, and every container on it, out through the gate — but the only egress that should move is the containers'. The host's own public IP must not change. Until container-scoped routing exists this verb refuses, rather than keep offering a change that can take a production machine off the internet. `vpn clear-exit` still works, so a host already on a gate can be taken off one."
-
-// ErrHostRouteScope is HostRouteScopeRefusal as an error, so a caller can tell
+// ErrScopeRefused marks the refusals that are about WHAT THIS VERB IS FOR
+// rather than about whether a request was well formed, so a caller can tell
 // "this tool will not do this at all" apart from "this host could not".
-var ErrHostRouteScope = errors.New(HostRouteScopeRefusal)
-
-// hostRouteScopeRefused is the switch the refusal hangs on, and it stays true
-// until UseExit routes container networks instead of the machine.
 //
-// A var rather than a bare unconditional return so the sequence beneath it
-// stays reachable from its own tests. That ordering — measure, arm, pin, move,
-// confirm, revert — is the safety mechanism, and it is what the
-// container-scoped rewrite will inherit; letting it sit unexercised behind a
-// refusal for however long that takes is how a rewrite starts from a sequence
-// nobody has run in months. Tests flip it with withHostRouteScopeAllowed.
-var hostRouteScopeRefused = true
+// The refusal it stands for used to be unconditional. Between 2026-08-26 and
+// this change, `vpn use-exit` refused every host outright, because the shape
+// it had moved THIS MACHINE's default route (`ip rule ... lookup 52`, applied
+// `from all`) and took a Mac off the internet on the first real apply. That
+// refusal is lifted here for exactly one path — the container-scoped one, in
+// which the host bypass at priority 5265 holds the machine's own egress still
+// and only container networks are routed. It stands, unchanged, everywhere a
+// host's route would still move: on darwin, where there is no container
+// network out here to key a rule on, and on any host with no container
+// runtime, where the only thing left to route would be the machine.
+//
+// ClearExit is deliberately NOT gated by any of this. It is the way OFF a
+// gate, and an undo that refuses is one that fails exactly when it is most
+// needed — including for the hosts that took a selection before this landed.
+var ErrScopeRefused = errors.New("this host cannot have its containers routed without routing the host itself")
 
-// HostScopeRefused reports whether selecting a gate is refused outright. The
-// layers above ask before they build a spec, so their caller gets the reason
-// instead of a generic failure from somewhere deep in the sequence.
-func HostScopeRefused() bool { return hostRouteScopeRefused }
+// ScopeRefusal reports why this host cannot be routed container-scoped, or ""
+// when it can. Two halves, cheapest first:
+//
+//   - the STATIC half, from the OS alone: darwin's containers live inside a VM
+//     whose traffic is already NATed by the time macOS sees it, so there is
+//     nothing out here to key a rule on. No probe changes that.
+//   - the LIVE half, from the machine: is there a container runtime that
+//     answers, and does it define a network with an IPv4 subnet? A host with
+//     none cannot host a routed container, and the honest answer is to say so
+//     rather than to fall back to routing the machine.
+//
+// The layers above call this before they build a spec, so their caller gets
+// the reason instead of a generic failure from somewhere deep in the sequence.
+func ScopeRefusal(ctx context.Context, r Runner) string {
+	host := Probe()
+	platform, err := platformForOS(host.OS)
+	if err != nil {
+		return err.Error()
+	}
+	if refusal := platform.containerScopeRefusal(); refusal != "" {
+		return refusal
+	}
+	// The same privilege bargain the rest of the sequence makes. A container
+	// runtime routinely refuses an unprivileged caller, and reporting "no
+	// runtime" for what is really "no permission" would send an operator to
+	// install something they already have.
+	privileged := PrivilegedRunner{Inner: r, Sudo: host.OS != "darwin" && host.UID != 0}
+	runtime, err := DetectContainerRuntime(ctx, privileged)
+	if err != nil {
+		return err.Error()
+	}
+	networks, err := ContainerNetworks(ctx, privileged, runtime)
+	if err != nil {
+		return err.Error()
+	}
+	if len(networks) == 0 {
+		return fmt.Sprintf("%s answers on this host but defines no network with an IPv4 subnet, so there is no container traffic to route. %s", runtime.Name, NoContainerNetworkRefusal)
+	}
+	return ""
+}
 
 const (
 	// DefaultDeadmanTimeout is the proven value from the manual run on
@@ -201,14 +240,25 @@ type UseExitPlan struct {
 	// Narration is what --plan should print for the commands this platform
 	// would really run, so the preview cannot drift from the implementation.
 	Narration []string
-	// Refusal is HostRouteScopeRefusal, carried on the plan so that a preview
-	// cannot be mistaken for an actionable confirmation. Planning stays
-	// available while the refusal stands — it changes nothing by construction,
-	// and it is the only way to see what this host's exclusion set really
-	// resolves to, which is the input to re-deriving that set for the
-	// container-scoped model. But every consumer of a plan gets told, in the
-	// same sentence UseExit would fail with, that applying it is refused.
+	// Refusal is why applying this plan is refused, and "" when it is not.
+	// Carried on the plan so a preview cannot be mistaken for an actionable
+	// confirmation: planning stays available even on a host that is refused,
+	// because it changes nothing by construction and it is the only way to
+	// read what that host really resolves to.
 	Refusal string
+
+	// Runtime, Networks and ProbeNetwork are the container half of the plan:
+	// which engine answered, every network it defines with an IPv4 subnet, and
+	// the one the egress probe will run on. All three are reported because a
+	// gate that routes the wrong networks and a gate that routes none look
+	// identical from the confirmation alone.
+	Runtime      ContainerRuntime
+	Networks     []ContainerNetwork
+	ProbeNetwork string
+	// Routes is exactly what will be installed — the container rules and the
+	// exclusions together. --plan prints it, ApplyRoutes consumes it, and
+	// there is no second derivation in between that could disagree.
+	Routes RoutePlan
 
 	platform exitPlatform
 	runner   PrivilegedRunner
@@ -260,22 +310,70 @@ func PlanUseExit(ctx context.Context, spec UseExitSpec) (*UseExitPlan, error) {
 		return nil, err
 	}
 
+	// The STATIC half of the scope refusal, ahead of planExclusions because a
+	// platform that can never route containers must answer with THAT rather
+	// than with whatever its exclusion planner objects to first. On darwin,
+	// `--exclude` raises its own error, and a Mac told "--exclude cannot be
+	// honoured here" is a Mac whose owner drops the flag and tries again.
+	if refusal := platform.containerScopeRefusal(); refusal != "" {
+		return &UseExitPlan{
+			Eligibility: elig,
+			Gate:        peer,
+			GateIP:      FirstMeshV4(peer.IPs),
+			Narration:   platform.planNarration(FirstMeshV4(peer.IPs)),
+			Refusal:     refusal,
+			platform:    platform,
+			runner:      runner,
+		}, nil
+	}
+
 	exclusions, err := platform.planExclusions(spec.ControlPlane, spec.Exclude, DefaultResolver)
 	if err != nil {
 		return nil, err
 	}
 
-	return &UseExitPlan{
+	plan := &UseExitPlan{
 		Eligibility:   elig,
 		Gate:          peer,
 		GateIP:        FirstMeshV4(peer.IPs),
 		Exclusions:    exclusions,
 		Manageability: platform.manageability(exclusions.ControlPlaneHost),
 		Narration:     platform.planNarration(FirstMeshV4(peer.IPs)),
-		Refusal:       HostRouteScopeRefusal,
 		platform:      platform,
 		runner:        runner,
-	}, nil
+	}
+
+	// The LIVE half. Discovered from the runtime rather than from the interface
+	// table, and keyed on the network's CIDR rather than on any container's own
+	// address — containers.go's header has the outage that each of those two
+	// choices is a reaction to.
+	//
+	// A refusal here is carried on the plan rather than raised as an error, so
+	// a --plan on a refused host still prints WHY, next to the exclusion set
+	// that host really resolves to. UseExit turns the same field into a hard
+	// stop.
+	plan.Runtime, err = DetectContainerRuntime(ctx, runner)
+	if err != nil {
+		plan.Refusal = err.Error()
+		return plan, nil
+	}
+	plan.Networks, err = ContainerNetworks(ctx, runner, plan.Runtime)
+	if err != nil {
+		return nil, err
+	}
+	if len(plan.Networks) == 0 {
+		plan.Refusal = fmt.Sprintf("%s answers on this host but defines no network with an IPv4 subnet, so there is no container traffic to route. %s", plan.Runtime.Name, NoContainerNetworkRefusal)
+		return plan, nil
+	}
+	plan.ProbeNetwork = PickProbeNetwork(plan.Runtime, plan.Networks)
+	for _, subnet := range ContainerSubnets(plan.Networks) {
+		plan.Routes.Containers = append(plan.Routes.Containers, ContainerRoute{
+			Prefix:   subnet,
+			Networks: NetworksFor(plan.Networks, subnet),
+		})
+	}
+	plan.Routes.Exclusions = exclusions.Exclusions
+	return plan, nil
 }
 
 // UseExitResult is what a switch attempt measured, whether it worked or not.
@@ -287,12 +385,35 @@ type UseExitResult struct {
 	Gate       string      `json:"gate"`
 	GateIP     string      `json:"gate_ip"`
 	Exclusions []Exclusion `json:"exclusions"`
+	// Containers is which prefixes were routed, and which networks they are.
+	// A confirmed gate that routed the wrong networks is a real outcome and
+	// this is the only place it is visible.
+	Containers []ContainerRoute `json:"containers"`
+	Runtime    string           `json:"runtime,omitempty"`
 
+	// THE HOST HALF. These two are supposed to be the SAME address, and
+	// HostHeld is the assertion. EgressBefore/EgressAfter keep their names
+	// from when this host was the thing being routed, because every consumer
+	// already reads them as "this machine's egress" and that is still exactly
+	// what they are — what changed is that they are now expected to match.
 	EgressBefore    string `json:"egress_before"`
 	EgressBeforeVia string `json:"egress_before_via"`
 	EgressAfter     string `json:"egress_after"`
 	EgressAfterVia  string `json:"egress_after_via"`
-	Expected        string `json:"expected_egress,omitempty"`
+	// HostHeld is the proof the machine was left alone. HostMoved is the
+	// failed apply — a host whose address moved must revert even when the
+	// containers look perfect, and a caller must be able to tell that from a
+	// gate that merely did not work.
+	HostHeld  bool `json:"host_held"`
+	HostMoved bool `json:"host_moved"`
+
+	// THE CONTAINER HALF. These two are supposed to DIFFER, from each other
+	// and from the host's address. Their divergence from EgressAfter is the
+	// evidence the gate worked.
+	ContainerEgressBefore ContainerEgressResult `json:"container_egress_before"`
+	ContainerEgressAfter  ContainerEgressResult `json:"container_egress_after"`
+
+	Expected string `json:"expected_egress,omitempty"`
 
 	DefaultDevice  string `json:"default_device"`
 	ControlPlaneOK bool   `json:"control_plane_ok"`
@@ -323,36 +444,43 @@ type UseExitResult struct {
 // failed switch that has already been reverted is a normal, safe outcome, and
 // the caller still wants the evidence.
 func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitResult, error) {
-	// BEFORE the plan, and before anything is measured, armed or moved. This
-	// is the innermost of the layers that refuse this today — the /link verb,
-	// the CLI and the control plane each refuse earlier and with a better
-	// message for their own caller, but they are all reachable past, and a
-	// refusal that lives only in them is one a future caller walks around.
-	// Costing nothing (no DNS, no tailscale call, no probe) is the point: the
-	// cheapest possible answer to a request that must not be served.
-	if hostRouteScopeRefused {
-		progress.emit("error", HostRouteScopeRefusal)
-		return UseExitResult{Reason: HostRouteScopeRefusal}, ErrHostRouteScope
-	}
-
 	spec = spec.withDefaults()
 
 	plan, err := PlanUseExit(ctx, spec)
 	if err != nil {
 		return UseExitResult{}, err
 	}
+	// The innermost of the layers that refuse a host whose route would have to
+	// move — the /link verb and the CLI each refuse earlier and with a better
+	// message for their own caller, but they are all reachable past, and a
+	// refusal that lives only in them is one a future caller walks around.
+	// Nothing has been measured, armed or moved at this point: PlanUseExit is
+	// read-only by construction, which is the same property that lets --plan
+	// keep working on a host that is refused.
+	if plan.Refusal != "" {
+		progress.emit("error", plan.Refusal)
+		return UseExitResult{Reason: plan.Refusal}, fmt.Errorf("%w: %s", ErrScopeRefused, plan.Refusal)
+	}
+
 	res := UseExitResult{
 		Gate:          plan.Gate.Name,
 		GateIP:        plan.GateIP,
 		Exclusions:    plan.Exclusions.Exclusions,
+		Containers:    plan.Routes.Containers,
+		Runtime:       plan.Runtime.Name,
 		Expected:      spec.ExpectEgress,
 		Manageability: plan.Manageability,
 	}
 	runner := plan.runner
 
 	progress.emit("info", "exit gate %s (%s), path %s", plan.Gate.Name, plan.GateIP, plan.Gate.PathDescription())
+	progress.emit("info", "these CONTAINER networks move onto the gate — and nothing else does:")
+	for _, c := range plan.Routes.Containers {
+		progress.emit("info", fmt.Sprintf("  %-20s %s", c.Prefix, strings.Join(c.Networks, ", ")))
+	}
+	progress.emit("info", "this MACHINE's own egress is pinned to the main routing table and must not change.")
 	if len(plan.Exclusions.Exclusions) > 0 {
-		progress.emit("info", "these prefixes stay OUTSIDE the tunnel:")
+		progress.emit("info", "these prefixes stay OUTSIDE the tunnel, for the containers too:")
 		for _, e := range plan.Exclusions.Exclusions {
 			progress.emit("info", fmt.Sprintf("  %-20s %s", e.Prefix, e.Reason))
 		}
@@ -361,17 +489,31 @@ func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitR
 		progress.emit("warning", plan.Manageability)
 	}
 
-	// Baseline. Without it there is nothing to compare against, so a switch
-	// could not be confirmed at all — unless the caller stated what the gate
-	// should present, in which case the "after" measurement stands alone.
-	if egress, err := PublicIP(ctx); err == nil {
-		res.EgressBefore = egress.IP
-		res.EgressBeforeVia = egress.Via
-		progress.emit("info", "egress before the switch: %s (via %s)", egress.IP, egress.Via)
+	// TWO baselines, and the host's is the one that is not optional.
+	//
+	// The host's address is what the confirmation asserts held, so without it
+	// there is no way to prove the machine was left alone — and "the container
+	// moved" on its own is precisely the half-measure the corrected invariant
+	// rules out. --expect-egress cannot stand in for it either: it says what
+	// the CONTAINER should present and says nothing about the host.
+	egress, err := PublicIP(ctx)
+	if err != nil {
+		return res, fmt.Errorf("could not measure this host's own public IP before the change, so there would be no way to prove afterwards that the machine's egress did not move — refusing to touch anything: %w", err)
+	}
+	res.EgressBefore = egress.IP
+	res.EgressBeforeVia = egress.Via
+	progress.emit("info", "host egress before (must NOT change): %s (via %s)", egress.IP, egress.Via)
+
+	// The container's baseline is measured the same way it will be measured
+	// afterwards, by the same function, on the same network. A before and an
+	// after produced by two different methods would prove nothing.
+	res.ContainerEgressBefore = MeasureContainerEgress(ctx, runner, plan.Runtime, plan.ProbeNetwork)
+	if res.ContainerEgressBefore.IP != "" {
+		progress.emit("info", "container egress before (MUST change): %s (via %s, on network %s)", res.ContainerEgressBefore.IP, res.ContainerEgressBefore.Via, res.ContainerEgressBefore.Network)
 	} else if spec.ExpectEgress == "" {
-		return res, fmt.Errorf("could not measure this host's public IP before the switch, and no expected egress was given, so the switch could not be confirmed either way: %w", err)
+		return res, fmt.Errorf("could not measure container egress before the change (%s), and no expected egress was given, so the result could not be confirmed either way", res.ContainerEgressBefore.Error)
 	} else {
-		progress.emit("warning", "could not measure egress before the switch (%v); confirmation will rest entirely on the expected egress %s", err, spec.ExpectEgress)
+		progress.emit("warning", "could not measure container egress before the change (%s); confirmation will rest entirely on the expected egress %s", res.ContainerEgressBefore.Error, spec.ExpectEgress)
 	}
 
 	// ARM FIRST. Everything below this line can fail, hang, or be killed, and
@@ -388,19 +530,35 @@ func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitR
 	res.DeadmanExpiresAt = armed.ExpiresAt
 	progress.emit("info", "dead-man's switch ARMED (pid %d) — this selection reverts itself at %s unless this run confirms it", armed.PID, armed.ExpiresAt)
 
-	if err := plan.platform.applyExclusions(ctx, runner, plan.Exclusions.Exclusions); err != nil {
-		res.Reverted, res.DeadmanStillArmed = revertAfterFailure(ctx, runner, plan.platform, "the route exclusions could not be installed", progress)
+	// The rules go in BEFORE the selection, and ApplyRoutes puts the host
+	// bypass in first within that. By the time `tailscale set` installs its own
+	// `from all lookup 52` at priority 5270, this machine's own traffic has
+	// already been claimed by `from all lookup main` at 5265 — so there is no
+	// window, not even a momentary one, in which the host could take the gate.
+	if err := plan.platform.applyRoutes(ctx, runner, plan.Routes); err != nil {
+		res.Reverted, res.DeadmanStillArmed = revertAfterFailure(ctx, runner, plan.platform, "the routing rules could not be installed", progress)
 		return res, err
 	}
 	if err := SetExitNode(ctx, runner, plan.GateIP); err != nil {
 		res.Reverted, res.DeadmanStillArmed = revertAfterFailure(ctx, runner, plan.platform, "the exit node could not be selected", progress)
 		return res, err
 	}
-	progress.emit("info", "default route now points at %s — confirming egress (up to %s)...", plan.Gate.Name, spec.ConfirmTimeout)
+	progress.emit("info", "container networks now point at %s — confirming BOTH halves (up to %s): that container egress moved, and that this machine's did not...", plan.Gate.Name, spec.ConfirmTimeout)
 
-	confirm := confirmWithRetries(ctx, runner, plan.platform, res.EgressBefore, spec.ExpectEgress, spec.ControlPlane, spec.ConfirmTimeout, progress)
-	res.EgressAfter = confirm.Observed
-	res.EgressAfterVia = confirm.ObservedVia
+	confirm := confirmWithRetries(ctx, runner, confirmSpec{
+		platform:     plan.platform,
+		runtime:      plan.Runtime,
+		network:      plan.ProbeNetwork,
+		hostBefore:   res.EgressBefore,
+		container:    res.ContainerEgressBefore,
+		expected:     spec.ExpectEgress,
+		controlPlane: spec.ControlPlane,
+	}, spec.ConfirmTimeout, progress)
+	res.EgressAfter = confirm.HostAfter
+	res.EgressAfterVia = confirm.HostAfterVia
+	res.HostHeld = confirm.HostHeld
+	res.HostMoved = confirm.HostMoved
+	res.ContainerEgressAfter = confirm.ContainerAfter
 	res.DefaultDevice = confirm.DefaultDevice
 	res.ControlPlaneOK = confirm.ControlPlaneOK
 	res.Confirmed = confirm.OK
@@ -410,6 +568,14 @@ func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitR
 	}
 
 	if !confirm.OK {
+		if confirm.HostMoved {
+			// Named separately because it is not the same event. A gate that
+			// does not forward is a feature failing; a host whose address
+			// moved is this machine having been changed in the one way it must
+			// never be, and whoever is watching needs to read that sentence
+			// rather than infer it from two addresses.
+			progress.emit("error", "REVERTING — THIS MACHINE'S OWN EGRESS MOVED. That is a failed apply regardless of what the containers are doing, and it is the exact failure this verb was rewritten to make impossible.")
+		}
 		progress.emit("warning", "REVERTING — an exit node that cannot be confirmed is the failure this command exists to prevent, not a partial success.")
 		if err := revert(ctx, runner, plan.platform, progress); err != nil {
 			res.DeadmanStillArmed = true
@@ -460,6 +626,11 @@ type ClearExitSpec struct {
 // ClearExitResult reports what was undone, and — measured, not assumed —
 // where traffic goes now.
 type ClearExitResult struct {
+	// ExclusionsRemoved counts every rule removed at every priority this
+	// module owns, not only the `to ... lookup main` exclusions the name comes
+	// from. The name and its JSON key are kept because the control plane and
+	// the UI already read them, and renaming a field to be tidier is not worth
+	// a screen that silently shows nothing.
 	ExclusionsRemoved int    `json:"exclusions_removed"`
 	DeadmanStoodDown  bool   `json:"deadman_stood_down"`
 	Egress            string `json:"egress"`
@@ -468,6 +639,11 @@ type ClearExitResult struct {
 	// the clear. Reported rather than swallowed: "cleared, and still broken"
 	// must not render as "cleared".
 	EgressError string `json:"egress_error,omitempty"`
+	// ContainerEgress is the other half of the undo. Clearing a gate is
+	// supposed to bring the two addresses back together, so reporting only the
+	// host's would leave the one question this verb is asked — did my
+	// containers come back — answered by inference.
+	ContainerEgress ContainerEgressResult `json:"container_egress"`
 }
 
 // ClearExit clears the selection, removes the exclusions and the boot guard,
@@ -512,14 +688,28 @@ func ClearExit(ctx context.Context, spec ClearExitSpec, progress Progress) (Clea
 	}
 
 	// Say where traffic goes now, measured rather than assumed — the same
-	// standard the selection is held to.
+	// standard the selection is held to, and for both halves, because "the
+	// host is fine" was never the question a clear is asked.
 	if egress, err := PublicIP(ctx); err == nil {
 		res.Egress = egress.IP
 		res.EgressVia = egress.Via
-		progress.emit("info", "exit node cleared — egress is now %s (via %s)", egress.IP, egress.Via)
+		progress.emit("info", "exit node cleared — host egress is now %s (via %s)", egress.IP, egress.Via)
 	} else {
 		res.EgressError = err.Error()
 		progress.emit("warning", "exit node cleared, but this host still cannot reach the internet: %v", err)
+	}
+	// Best-effort, and never a reason to fail the undo: a host that has since
+	// lost its container runtime still needs its rules taken off.
+	if runtime, err := DetectContainerRuntime(ctx, runner); err == nil {
+		networks, _ := ContainerNetworks(ctx, runner, runtime)
+		res.ContainerEgress = MeasureContainerEgress(ctx, runner, runtime, PickProbeNetwork(runtime, networks))
+		if res.ContainerEgress.IP != "" {
+			progress.emit("info", "container egress is now %s (via %s, on network %s) — with no gate in force this should match the host's", res.ContainerEgress.IP, res.ContainerEgress.Via, res.ContainerEgress.Network)
+		} else {
+			progress.emit("warning", "the gate is cleared but container egress could not be measured: %s", res.ContainerEgress.Error)
+		}
+	} else {
+		res.ContainerEgress = ContainerEgressResult{Error: err.Error()}
 	}
 
 	return res, clearExitState()
@@ -573,12 +763,20 @@ func revertAfterFailure(ctx context.Context, r Runner, plat exitPlatform, what s
 // install the route and the first packets have to find their way through DERP
 // or a direct path that may not be up yet. Retrying is not optimism — a
 // failure here reverts, so a false negative costs a working feature.
-func confirmWithRetries(ctx context.Context, r Runner, plat exitPlatform, baseline, expected, controlPlane string, timeout time.Duration, progress Progress) ConfirmResult {
+func confirmWithRetries(ctx context.Context, r Runner, spec confirmSpec, timeout time.Duration, progress Progress) ConfirmResult {
 	deadline := time.Now().Add(timeout)
 	var last ConfirmResult
 	for attempt := 1; ; attempt++ {
-		last = confirmEgress(ctx, r, plat, baseline, expected, controlPlane)
+		last = confirmContainerScoped(ctx, r, spec)
 		if last.OK || time.Now().After(deadline) {
+			return last
+		}
+		// A host whose address moved does not get retried. Retrying is for a
+		// gate that has not finished coming up; this is a machine that is
+		// already in the state the whole sequence exists to prevent, and every
+		// extra second spent optimistically re-measuring is a second it stays
+		// there.
+		if last.HostMoved {
 			return last
 		}
 		progress.emit("info", "  attempt %d not confirmed yet (%s) — retrying", attempt, last.Reason)

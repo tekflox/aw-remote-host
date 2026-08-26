@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -295,20 +296,43 @@ func TestInstallLaunchdBootGuardIsIdempotent(t *testing.T) {
 	}
 }
 
-// Linux behaviour must be byte-for-byte what it was before the platform seam
-// existed. This is the regression that would matter: the production
-// bare-metal and every linked Linux host go through this path.
-func TestLinuxPlatformStillInstallsTheSameIPRules(t *testing.T) {
+// The Linux platform installs the real rule set: the exclusions it always
+// did, plus the two that make the scope correct. This is the path the
+// production bare-metal and every linked Linux host go through.
+func TestLinuxPlatformInstallsTheContainerScopedRules(t *testing.T) {
 	r := newRecordingRunner()
-	r.answer("ip rule del priority 5260", noRule, errors.New("exit status 2"))
-	err := linuxExit{ipPath: "/usr/sbin/ip"}.applyExclusions(context.Background(), r, []Exclusion{
-		{Prefix: "65.109.66.88/32", Reason: "control plane"},
+	nothingToClear(r)
+	err := linuxExit{ipPath: "/usr/sbin/ip"}.applyRoutes(context.Background(), r, RoutePlan{
+		Containers: []ContainerRoute{{Prefix: "10.89.0.0/24", Networks: []string{"aw-remote-host"}}},
+		Exclusions: []Exclusion{{Prefix: "65.109.66.88/32", Reason: "control plane"}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(r.calls, "\n"), "ip rule add to 65.109.66.88/32 lookup main priority 5260") {
-		t.Fatalf("calls = %v", r.calls)
+	joined := strings.Join(r.calls, "\n")
+	for _, want := range []string{
+		"ip rule add to 65.109.66.88/32 lookup main priority 5260",
+		"ip rule add from 10.89.0.0/24 lookup 52 priority 5261",
+		"ip rule add from all lookup main priority 5265",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in:\n%s", want, joined)
+		}
+	}
+}
+
+// The dead-man's switch runs when nothing else did, so its cleanup has to
+// cover every priority — including the container rules, which are the ones
+// that point into the tunnel's table.
+func TestTheDeadmanScriptSweepsEveryPriority(t *testing.T) {
+	script := linuxExit{ipPath: "/usr/sbin/ip"}.revertExclusionsScript(PrivilegedRunner{Sudo: true})
+	for _, p := range routePriorities {
+		if !strings.Contains(script, fmt.Sprintf("rule del priority %d", p)) {
+			t.Fatalf("priority %d is installed but the dead-man's switch would leave it behind:\n%s", p, script)
+		}
+	}
+	if !strings.Contains(script, "sudo -n /usr/sbin/ip") {
+		t.Fatalf("the switch runs with no Runner to wrap it, so the privilege has to be spelled into the script:\n%s", script)
 	}
 }
 

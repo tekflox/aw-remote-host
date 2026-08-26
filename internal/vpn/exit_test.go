@@ -91,8 +91,19 @@ func TestPlanExclusionsPinsControlPlaneFirst(t *testing.T) {
 	if plan.Exclusions[0].Prefix != "65.109.66.88/32" {
 		t.Fatalf("the control plane must be the first exclusion, got %+v", plan.Exclusions)
 	}
-	if !strings.Contains(plan.Exclusions[0].Reason, "remote-management") {
+	// RE-DERIVED under container-scoped routing rather than inherited: the
+	// host's route no longer moves, so this is no longer the anti-lockout pin.
+	// It is here because a CONTAINER's traffic to the control plane would
+	// otherwise leave through the gate, and the reason has to say so — a
+	// justification that no longer holds is how an exclusion set outlives the
+	// model it was built for.
+	if !strings.Contains(plan.Exclusions[0].Reason, "this host's own path rather than through the gate") {
 		t.Fatalf("reason = %q", plan.Exclusions[0].Reason)
+	}
+	for _, e := range plan.Exclusions[1:] {
+		if !strings.Contains(e.Reason, "container-to-LAN") {
+			t.Fatalf("an attached-network exclusion must justify itself as container traffic, got %q", e.Reason)
+		}
 	}
 	// The podman subnet and the LAN prefix, the two the card names
 	// explicitly (internal/lanfastpath depends on the second).
@@ -162,64 +173,153 @@ func hasPrefix(p ExclusionPlan, want string) bool {
 	return false
 }
 
-// Exclusions are installed as "send this prefix to the MAIN table", never as
-// a rule pointing into a table the tunnel owns. That choice is what makes a
-// leftover rule inert instead of a black hole — the recorded accident on this
-// infrastructure was `ip rule from 172.18.0.5 lookup 51821`, pointing at a
-// table whose gateway had ceased to exist.
-func TestApplyExclusionsAlwaysLooksUpMain(t *testing.T) {
+// nothingToClear scripts the kernel's "no such rule" for every priority this
+// module owns, so a test's pre-clear terminates instead of looping 64 times
+// against a runner that cheerfully succeeds at everything.
+func nothingToClear(r *recordingRunner) {
+	for _, p := range routePriorities {
+		r.answer(fmt.Sprintf("ip rule del priority %d", p), noRule, errors.New("exit status 2"))
+	}
+}
+
+func containerRoutes(prefixes ...string) []ContainerRoute {
+	var out []ContainerRoute
+	for _, p := range prefixes {
+		out = append(out, ContainerRoute{Prefix: p, Networks: []string{"net-" + p}})
+	}
+	return out
+}
+
+// THE INVARIANT, as a command sequence. Only container networks may be sent
+// into the tunnel's table, and the machine's own traffic must be claimed for
+// the main table BEFORE anything else is installed — the window in which the
+// host could take the gate has to be zero, not small.
+func TestApplyRoutesPinsTheHostBeforeItRoutesAnything(t *testing.T) {
 	r := newRecordingRunner()
-	r.answer("ip rule del priority 5260", noRule, errors.New("exit status 2"))
-	if err := ApplyExclusions(context.Background(), r, []Exclusion{
-		{Prefix: "65.109.66.88/32"}, {Prefix: "10.89.0.0/24"},
-	}); err != nil {
+	nothingToClear(r)
+	err := ApplyRoutes(context.Background(), r, RoutePlan{
+		Containers: containerRoutes("10.89.0.0/24", "10.88.0.0/16"),
+		Exclusions: []Exclusion{{Prefix: "65.109.66.88/32"}, {Prefix: "192.168.1.0/24"}},
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	wantAdds := []string{
-		"ip rule add to 65.109.66.88/32 lookup main priority 5260",
-		"ip rule add to 10.89.0.0/24 lookup main priority 5260",
+
+	// The pre-clear comes first, and the first thing INSTALLED is the bypass.
+	firstAdd := ""
+	for _, c := range r.calls {
+		if strings.Contains(c, "rule add") {
+			firstAdd = c
+			break
+		}
 	}
-	for _, want := range wantAdds {
+	wantBypass := fmt.Sprintf("ip rule add from all lookup main priority %d", hostBypassPriority)
+	if firstAdd != wantBypass {
+		t.Fatalf("first rule installed was %q, want the host bypass %q — anything else leaves a window where this machine's own egress could take the gate", firstAdd, wantBypass)
+	}
+	if !strings.HasPrefix(r.calls[0], "ip rule del priority") {
+		t.Fatalf("first call was %q, want a pre-clear: two overlapping generations of rules is the leftover state this design refuses to create", r.calls[0])
+	}
+
+	for _, want := range []string{
+		wantBypass,
+		fmt.Sprintf("ip rule add to %s lookup 52 priority %d", meshPrefix, meshPreservePriority),
+		fmt.Sprintf("ip rule add to 65.109.66.88/32 lookup main priority %d", exclusionPriority),
+		fmt.Sprintf("ip rule add from 10.89.0.0/24 lookup 52 priority %d", containerRoutePriority),
+		fmt.Sprintf("ip rule add from 10.88.0.0/16 lookup 52 priority %d", containerRoutePriority),
+	} {
 		if !called(r, want) {
 			t.Fatalf("missing %q in %v", want, r.calls)
 		}
 	}
+
+	// The heart of it: nothing that is not a container network may be sent
+	// into table 52 by a `from` rule. A `from all lookup 52` here would be the
+	// old, wrong shape of this whole feature reappearing.
+	routed := map[string]bool{"10.89.0.0/24": true, "10.88.0.0/16": true}
 	for _, c := range r.calls {
-		if strings.Contains(c, "rule add") && !strings.Contains(c, "lookup main") {
-			t.Fatalf("an exclusion must never point anywhere but the main table: %q", c)
+		fields := strings.Fields(c)
+		if !strings.Contains(c, "rule add") || !strings.Contains(c, "lookup 52") {
+			continue
 		}
-	}
-	// Cleared before applying: two overlapping generations of exclusion is
-	// exactly the leftover state this design refuses to create.
-	if r.calls[0] != "ip rule del priority 5260" {
-		t.Fatalf("first call was %q, want the pre-clear", r.calls[0])
+		for i, f := range fields {
+			if f == "from" && !routed[fields[i+1]] {
+				t.Fatalf("only container networks may be routed into the tunnel's table; %q routes %q", c, fields[i+1])
+			}
+		}
 	}
 }
 
-func TestApplyExclusionsRollsBackAPartialSet(t *testing.T) {
+// A container rule keyed on an individual address is the aw-console outage
+// (`ip rule from 172.18.0.5 lookup 51821`): container IPs are ephemeral AND
+// recycled, so the rule silently starts applying to a different container.
+// Every routed source must be a network.
+func TestApplyRoutesNeverRoutesASingleContainerAddress(t *testing.T) {
 	r := newRecordingRunner()
-	r.answer("ip rule del priority 5260", noRule, errors.New("exit status 2"))
-	r.answer("ip rule add to 10.89.0.0/24 lookup main priority 5260", "RTNETLINK answers: Operation not permitted", errors.New("exit status 2"))
-	err := ApplyExclusions(context.Background(), r, []Exclusion{
-		{Prefix: "65.109.66.88/32"}, {Prefix: "10.89.0.0/24"},
+	nothingToClear(r)
+	if err := ApplyRoutes(context.Background(), r, RoutePlan{Containers: containerRoutes("172.18.0.0/16")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range r.calls {
+		if !strings.Contains(c, "rule add") || !strings.Contains(c, "lookup 52") {
+			continue
+		}
+		fields := strings.Fields(c)
+		for i, f := range fields {
+			if f != "from" {
+				continue
+			}
+			source := fields[i+1]
+			if source == "all" {
+				continue
+			}
+			if strings.HasSuffix(source, "/32") || !strings.Contains(source, "/") {
+				t.Fatalf("%q routes a host address, not a network — that is the rule shape that took a container off the internet for two days", c)
+			}
+		}
+	}
+}
+
+func TestApplyRoutesRollsBackAPartialSet(t *testing.T) {
+	r := newRecordingRunner()
+	nothingToClear(r)
+	r.answer(fmt.Sprintf("ip rule add from 10.89.0.0/24 lookup 52 priority %d", containerRoutePriority), "RTNETLINK answers: Operation not permitted", errors.New("exit status 2"))
+	err := ApplyRoutes(context.Background(), r, RoutePlan{
+		Containers: containerRoutes("10.89.0.0/24"),
+		Exclusions: []Exclusion{{Prefix: "65.109.66.88/32"}},
 	})
 	if err == nil {
 		t.Fatal("expected the failure to propagate")
 	}
-	// A half-applied set is worse than none: it reads as though the
-	// management path is pinned when the failed rule may be the pin.
+	// A half-applied set is worse than none: it reads as though the host is
+	// pinned when the failed rule may be the pin.
 	dels := 0
 	for _, c := range r.calls {
-		if c == "ip rule del priority 5260" {
+		if c == fmt.Sprintf("ip rule del priority %d", hostBypassPriority) {
 			dels++
 		}
 	}
 	if dels < 2 {
-		t.Fatalf("a failed apply must roll back, calls: %v", r.calls)
+		t.Fatalf("a failed apply must roll back every priority it owns, calls: %v", r.calls)
 	}
 }
 
-func TestClearExclusionsStopsOnTheKernelsNoSuchRule(t *testing.T) {
+// A cleanup that knows about only some of the priorities is how a rule outlives
+// the intent that created it — and one of them points into the tunnel's table.
+func TestClearRoutesSweepsEveryPriorityThisModuleInstalls(t *testing.T) {
+	r := newRecordingRunner()
+	nothingToClear(r)
+	if _, err := clearRouteRules(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range routePriorities {
+		if !called(r, fmt.Sprintf("ip rule del priority %d", p)) {
+			t.Fatalf("priority %d was installed but never swept: %v", p, r.calls)
+		}
+	}
+}
+
+func TestClearRoutesStopsOnTheKernelsNoSuchRule(t *testing.T) {
 	// Two rules present, then the kernel's "no such file".
 	calls := 0
 	stub := runnerFunc(func(_ context.Context, name string, args ...string) (string, error) {
@@ -229,7 +329,7 @@ func TestClearExclusionsStopsOnTheKernelsNoSuchRule(t *testing.T) {
 		}
 		return noRule, errors.New("exit status 2")
 	})
-	removed, err := clearIPRuleExclusions(context.Background(), stub)
+	removed, err := clearRulesAtPriority(context.Background(), stub, exclusionPriority)
 	if err != nil {
 		t.Fatalf("the kernel's 'no such rule' is the loop's exit condition, not a failure: %v", err)
 	}
@@ -238,11 +338,11 @@ func TestClearExclusionsStopsOnTheKernelsNoSuchRule(t *testing.T) {
 	}
 }
 
-func TestClearExclusionsPropagatesARealError(t *testing.T) {
+func TestClearRoutesPropagatesARealError(t *testing.T) {
 	stub := runnerFunc(func(context.Context, string, ...string) (string, error) {
 		return "RTNETLINK answers: Operation not permitted", errors.New("exit status 2")
 	})
-	if _, err := clearIPRuleExclusions(context.Background(), stub); err == nil {
+	if _, err := clearRouteRules(context.Background(), stub); err == nil {
 		t.Fatal("a permission error is not 'there were none left'")
 	}
 }
@@ -262,32 +362,71 @@ func called(r *recordingRunner, want string) bool {
 	return false
 }
 
-// Verbatim `ip rule show` from aw-baremetal, 2026-08-25, with two exclusions
-// added — the priorities tailscale really uses, not an approximation.
+// Verbatim `ip rule show` from the Surface, 2026-08-26 (tailscale's own
+// priorities, not an approximation), with this module's full container-scoped
+// set added at the priorities it really installs.
 const ipRuleShowWithExclusions = `0:	from all lookup local
 5210:	from all fwmark 0x80000/0xff0000 lookup main
 5230:	from all fwmark 0x80000/0xff0000 lookup default
 5250:	from all fwmark 0x80000/0xff0000 unreachable
+5259:	from all to 100.64.0.0/10 lookup 52
 5260:	from all to 65.109.66.88 lookup main
 5260:	from all to 10.89.0.0/24 lookup main
+5261:	from 10.89.0.0/24 lookup 52
+5265:	from all lookup main
 5270:	from all lookup 52
 32766:	from all lookup main
 32767:	from all lookup default`
 
-func TestParseExclusionRulesReadsBackWhatIsInForce(t *testing.T) {
-	got := parseExclusionRules(ipRuleShowWithExclusions)
-	if len(got) != 2 || got[0] != "65.109.66.88" || got[1] != "10.89.0.0/24" {
-		t.Fatalf("got %v", got)
+func TestParseRouteRulesReadsBackWhatIsInForce(t *testing.T) {
+	got := parseRouteRules(ipRuleShowWithExclusions)
+	want := []string{
+		"from all to 100.64.0.0/10 lookup 52",
+		"from all to 65.109.66.88 lookup main",
+		"from all to 10.89.0.0/24 lookup main",
+		"from 10.89.0.0/24 lookup 52",
+		"from all lookup main",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rule %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// Verbatim, not summarised into bare prefixes: under container-scoped
+	// routing the DIRECTION of a rule is its whole meaning, and `from
+	// 10.89.0.0/24 lookup 52` (into the tunnel) and `to 10.89.0.0/24 lookup
+	// main` (out of it) would collapse into the same string.
+	if got[2] == got[3] {
+		t.Fatal("a rule's direction must survive being read back")
 	}
 }
 
-// 5260 has to sit ABOVE tailscale's catch-all at 5270, or the exclusions are
-// never consulted and the control plane goes into the tunnel with everything
-// else. This is the single number the whole safety property rests on.
-func TestExclusionPriorityBeatsTailscalesCatchAll(t *testing.T) {
+// THE PRIORITY ORDER IS THE DESIGN. Every one of these comparisons is a
+// separate failure if it inverts, and none of them is visible from the running
+// system until something is already routed wrong.
+func TestPriorityOrderIsTheWholeSafetyProperty(t *testing.T) {
 	const tailscaleCatchAll = 5270
-	if exclusionPriority >= tailscaleCatchAll {
-		t.Fatalf("exclusion priority %d must be lower than tailscale's catch-all %d — a higher number is consulted later, which means never", exclusionPriority, tailscaleCatchAll)
+	if hostBypassPriority >= tailscaleCatchAll {
+		t.Fatalf("the host bypass (%d) must be consulted BEFORE tailscale's catch-all (%d), or this machine's own traffic goes into the tunnel — which is the bug this feature was rewritten to remove", hostBypassPriority, tailscaleCatchAll)
+	}
+	if containerRoutePriority >= hostBypassPriority {
+		t.Fatalf("the container routes (%d) must be consulted BEFORE the host bypass (%d), or the bypass swallows them and the gate silently does nothing", containerRoutePriority, hostBypassPriority)
+	}
+	if exclusionPriority >= containerRoutePriority {
+		t.Fatalf("the exclusions (%d) must be consulted BEFORE the container routes (%d), or container-to-LAN and container-to-control-plane traffic is sent into the tunnel", exclusionPriority, containerRoutePriority)
+	}
+	if meshPreservePriority >= hostBypassPriority {
+		t.Fatalf("the mesh-preserve rule (%d) must be consulted BEFORE the host bypass (%d) — measured on the Surface 2026-08-26, the main table has NO route for %s, so the bypass alone takes the host off the mesh", meshPreservePriority, hostBypassPriority, meshPrefix)
+	}
+	// And all of them inside tailscale's reserved block, which is what makes
+	// deleting blindly at these priorities safe.
+	for _, p := range routePriorities {
+		if p < 5210 || p > tailscaleCatchAll {
+			t.Fatalf("priority %d is outside tailscale's reserved 5210-%d block, so something else may allocate there and a blind delete would remove somebody else's rule", p, tailscaleCatchAll)
+		}
 	}
 	if !strings.Contains(ipRuleShowWithExclusions, fmt.Sprintf("%d:\tfrom all lookup 52", tailscaleCatchAll)) {
 		t.Fatal("the captured rule table no longer shows tailscale's catch-all where this test assumes it")
@@ -308,12 +447,17 @@ func TestParseRouteDevice(t *testing.T) {
 	}
 }
 
-func TestEgressVerdictExactMatchWins(t *testing.T) {
-	ok, _ := egressVerdict("188.250.165.236", "65.109.66.88", Egress{IP: "65.109.66.88", Via: "x"})
+func measured(ip string) ContainerEgressResult {
+	return ContainerEgressResult{IP: ip, Via: "https://1.1.1.1/cdn-cgi/trace", Runtime: "podman", Network: "podman"}
+}
+
+func TestContainerEgressVerdictExactMatchWins(t *testing.T) {
+	host := "188.250.165.236"
+	ok, _ := containerEgressVerdict(measured(host), measured("65.109.66.88"), "65.109.66.88", host)
 	if !ok {
 		t.Fatal("an exact match with the stated gate address is a confirmation")
 	}
-	ok, reason := egressVerdict("188.250.165.236", "65.109.66.88", Egress{IP: "1.2.3.4", Via: "x"})
+	ok, reason := containerEgressVerdict(measured(host), measured("1.2.3.4"), "65.109.66.88", host)
 	if ok {
 		t.Fatal("landing somewhere other than the stated gate is not a confirmation")
 	}
@@ -322,12 +466,12 @@ func TestEgressVerdictExactMatchWins(t *testing.T) {
 	}
 }
 
-// The card's rule, literally: if the public IP did not change, revert and
-// report failure. "The interface is up" proves nothing.
-func TestEgressVerdictUnchangedAddressIsAFailure(t *testing.T) {
-	ok, reason := egressVerdict("65.109.66.88", "", Egress{IP: "65.109.66.88", Via: "https://api.ipify.org"})
+// The card's rule, literally: if the containers' public IP did not change,
+// revert and report failure. "The interface is up" proves nothing.
+func TestContainerEgressVerdictUnchangedAddressIsAFailure(t *testing.T) {
+	ok, reason := containerEgressVerdict(measured("65.109.66.88"), measured("65.109.66.88"), "", "188.250.165.236")
 	if ok {
-		t.Fatal("an unchanged public IP cannot be reported as a working switch")
+		t.Fatal("an unchanged container IP cannot be reported as a working switch")
 	}
 	// And it has to say what to do about the legitimate case — a gate that
 	// really does present the address the client already used — rather than
@@ -337,8 +481,8 @@ func TestEgressVerdictUnchangedAddressIsAFailure(t *testing.T) {
 	}
 }
 
-func TestEgressVerdictNeedsSomethingToCompareAgainst(t *testing.T) {
-	ok, reason := egressVerdict("", "", Egress{IP: "65.109.66.88"})
+func TestContainerEgressVerdictNeedsSomethingToCompareAgainst(t *testing.T) {
+	ok, reason := containerEgressVerdict(ContainerEgressResult{Error: "no runtime"}, measured("65.109.66.88"), "", "188.250.165.236")
 	if ok {
 		t.Fatal("with no baseline and no expectation there is nothing that would count as proof")
 	}
@@ -347,16 +491,60 @@ func TestEgressVerdictNeedsSomethingToCompareAgainst(t *testing.T) {
 	}
 }
 
-func TestConfirmResultDescribeShowsTheEvidenceNotAVerdict(t *testing.T) {
+// THE FAILURE THAT USED TO LOOK LIKE SUCCESS. The containers' address changed
+// from their own baseline and still equals the host's — which, with the host
+// proven to have held, can only mean the rules matched nothing. Read from the
+// container's number alone this is indistinguishable from a working gate.
+func TestContainerEgressEqualToTheHostsIsNeverAConfirmation(t *testing.T) {
+	ok, reason := containerEgressVerdict(measured("1.2.3.4"), measured("188.250.165.236"), "", "188.250.165.236")
+	if ok {
+		t.Fatal("container egress equal to the host's means nothing was routed, however much it changed")
+	}
+	if !strings.Contains(reason, "not going through the gate at all") {
+		t.Fatalf("reason = %q", reason)
+	}
+}
+
+// A container that cannot reach anything is a failure with a reason, never a
+// silent pass and never the host's address stood in for it.
+func TestContainerEgressVerdictReportsAnUnreachableContainer(t *testing.T) {
+	ok, reason := containerEgressVerdict(measured("1.2.3.4"), ContainerEgressResult{Error: "curl: (28) timed out"}, "", "188.250.165.236")
+	if ok {
+		t.Fatal("no measurement is not a confirmation")
+	}
+	if !strings.Contains(reason, "timed out") {
+		t.Fatalf("the reason must carry the evidence: %q", reason)
+	}
+}
+
+// BOTH PAIRS, ALWAYS. A description that showed only the containers' addresses
+// would hide the one fact that decides whether this was a success or a
+// production machine losing its address.
+func TestConfirmResultDescribeShowsBothHalves(t *testing.T) {
 	c := ConfirmResult{
-		Baseline: "188.250.165.236", Observed: "65.109.66.88", ObservedVia: "https://api.ipify.org",
-		DefaultDevice: "tailscale0", ControlPlaneOK: true, OK: false, Reason: "something",
+		HostBefore: "188.250.165.236", HostAfter: "188.250.165.236",
+		HostAfterVia: "https://1.1.1.1/cdn-cgi/trace", HostHeld: true,
+		ContainerBefore: measured("188.250.165.236"), ContainerAfter: measured("65.109.66.88"),
+		DefaultDevice: "eth0", ControlPlaneOK: true, OK: false, Reason: "something",
 	}
 	desc := c.Describe()
-	for _, want := range []string{"188.250.165.236", "65.109.66.88", "tailscale0", "control plane: reachable", "NOT CONFIRMED"} {
+	for _, want := range []string{
+		"host egress before: 188.250.165.236",
+		"held, as required",
+		"container egress before: 188.250.165.236",
+		"container egress now:    65.109.66.88",
+		"eth0",
+		"control plane: reachable",
+		"NOT CONFIRMED",
+	} {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("%q missing from:\n%s", want, desc)
 		}
+	}
+
+	moved := ConfirmResult{HostBefore: "188.250.165.236", HostAfter: "65.109.66.88", HostMoved: true, Reason: "x"}
+	if !strings.Contains(moved.Describe(), "MOVED. This is a failed apply.") {
+		t.Fatalf("a host that moved must say so in words, not leave it to be inferred from two numbers:\n%s", moved.Describe())
 	}
 }
 

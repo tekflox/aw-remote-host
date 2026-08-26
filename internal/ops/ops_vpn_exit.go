@@ -47,12 +47,15 @@ import (
 var (
 	useExit   = vpn.UseExit
 	clearExit = vpn.ClearExit
-	// hostScopeRefused is indirected for the same reason useExit is. The tests
-	// below cover this verb's argument handling, its eligibility refusals and
-	// its reply shape — all of which sit BENEATH the scope refusal and are
-	// exactly what the container-scoped verb will inherit. A test turns the
-	// refusal off to reach them; the refusal itself is asserted on its own.
-	hostScopeRefused = vpn.HostScopeRefused
+	// scopeRefusal is indirected for the same reason useExit is. It probes the
+	// machine — is there a container runtime, does it define a network — and
+	// the tests below cover this verb's argument handling, its eligibility
+	// refusals and its reply shape, none of which should depend on whether the
+	// box running `go test` happens to have docker installed.
+	scopeRefusal = vpn.ScopeRefusal
+	// containerEgress is the read side of the same change, indirected so the
+	// vpn_public_ip tests do not start a container.
+	containerEgress = measureContainerEgress
 )
 
 // VPNUseExit routes this host — and every container on it — out through a
@@ -109,27 +112,30 @@ func (h *Handler) VPNUseExit(ctx context.Context, args map[string]any, emit Emit
 	elig := probeEligibility()
 	payload := eligibilityPayload(elig)
 
-	// THE SCOPE REFUSAL, ahead of the eligibility one because it does not
-	// depend on the host: this verb moves the whole machine's route and only
-	// the containers' egress was ever meant to move. A host that is perfectly
-	// capable of doing it is exactly the host this must refuse — the bare
-	// metal running production is both eligible and the worst possible
-	// target. See vpn.HostRouteScopeRefusal.
+	// THE SCOPE REFUSAL, ahead of the eligibility one because it is about what
+	// this verb is FOR rather than about what this host can do. It answers one
+	// question: can this machine's containers be routed without the machine
+	// being routed with them? A host with no container runtime, or a Mac whose
+	// containers live behind a VM's NAT, cannot — and for those the only thing
+	// left to route is the machine itself, which is the destructive action
+	// this verb exists to have stopped offering.
 	//
-	// It refuses `plan` too, unlike the CLI's --plan. A preview is only worth
-	// keeping where someone can read the exclusion set off it while working on
-	// the replacement, which is a local, deliberate act; over the tunnel the
-	// only consumer is a confirmation dialog, and answering one for an action
-	// that cannot be applied is how a screen offers a button that lies.
-	if hostScopeRefused() {
-		emit("warning", "vpn", "not selecting an exit gate — "+vpn.HostRouteScopeRefusal)
+	// It refuses `plan` too, unlike the CLI's --plan. Over the tunnel the only
+	// consumer of a preview is a confirmation dialog, and answering one for an
+	// action that cannot be applied is how a screen offers a button that lies.
+	// Locally, --plan is a deliberate act by someone who can read the reason.
+	if refusal := scopeRefusal(ctx, h.runner()); refusal != "" {
+		emit("warning", "vpn", "not selecting an exit gate — "+refusal)
 		return map[string]any{
 			"eligibility": payload,
 			"applied":     false,
 			"changed":     false,
 			"refused":     true,
-			"refusal":     vpn.HostRouteScopeRefusal,
-			"scope":       "host",
+			"refusal":     refusal,
+			// `scope` names WHY it was refused rather than what was asked for:
+			// this host has no scope narrower than the whole machine, so there
+			// is no safe version of the request.
+			"scope": "host",
 		}, nil
 	}
 
@@ -164,7 +170,8 @@ func (h *Handler) VPNUseExit(ctx context.Context, args map[string]any, emit Emit
 			"eligibility":        payload,
 			"applied":            false,
 			"changed":            false,
-			"refused":            false,
+			"refused":            plan.Refusal != "",
+			"refusal":            plan.Refusal,
 			"plan":               true,
 			"gate":               plan.Gate.Name,
 			"gate_ip":            plan.GateIP,
@@ -175,6 +182,12 @@ func (h *Handler) VPNUseExit(ctx context.Context, args map[string]any, emit Emit
 			"control_plane_host": plan.Exclusions.ControlPlaneHost,
 			"manageability":      plan.Manageability,
 			"narration":          plan.Narration,
+			// What would actually move, so a confirmation dialog can name the
+			// networks rather than promise "your containers".
+			"runtime":          plan.Runtime.Name,
+			"runtime_version":  plan.Runtime.Version,
+			"container_routes": containerRoutePayload(plan.Routes.Containers),
+			"probe_network":    plan.ProbeNetwork,
 		}, nil
 	}
 
@@ -213,6 +226,11 @@ func (h *Handler) VPNClearExit(ctx context.Context, args map[string]any, emit Em
 		"deadman_stood_down": res.DeadmanStoodDown,
 		"egress":             res.Egress,
 		"egress_via":         res.EgressVia,
+		// The undo's own both-halves check: with no gate in force these two
+		// should have come back together. A container egress still diverging
+		// after a clear is the leftover-rule shape, and this is where it
+		// becomes visible instead of waiting two days for a deploy to fail.
+		"container_egress": containerEgressPayload(res.ContainerEgress),
 	}
 	if res.EgressError != "" {
 		out["egress_error"] = res.EgressError
@@ -260,27 +278,38 @@ func useExitPayload(eligibility map[string]any, res vpn.UseExitResult) map[strin
 		// `applied` is the honest verb-level answer: the gate is in force
 		// only if egress was CONFIRMED through the new route. An interface
 		// being up has never been enough here.
-		"applied":    res.Confirmed,
-		"changed":    res.Confirmed,
-		"confirmed":  res.Confirmed,
-		"reverted":   res.Reverted,
-		"reason":     res.Reason,
-		"gate":       res.Gate,
-		"gate_ip":    res.GateIP,
-		"exclusions": exclusionPayload(res.Exclusions),
-		// The pair the whole feature exists to show. Empty means NOT
-		// MEASURED, never "unchanged" — the caller must render an absent
-		// address as unknown rather than reusing the last one it saw.
-		"egress_before":       res.EgressBefore,
-		"egress_before_via":   res.EgressBeforeVia,
-		"egress_after":        res.EgressAfter,
-		"egress_after_via":    res.EgressAfterVia,
-		"expect_egress":       res.Expected,
-		"default_device":      res.DefaultDevice,
-		"control_plane_ok":    res.ControlPlaneOK,
-		"deadman_expires_at":  res.DeadmanExpiresAt,
-		"deadman_still_armed": res.DeadmanStillArmed,
-		"boot_guard":          res.BootGuard,
+		"applied":          res.Confirmed,
+		"changed":          res.Confirmed,
+		"confirmed":        res.Confirmed,
+		"reverted":         res.Reverted,
+		"reason":           res.Reason,
+		"gate":             res.Gate,
+		"gate_ip":          res.GateIP,
+		"exclusions":       exclusionPayload(res.Exclusions),
+		"runtime":          res.Runtime,
+		"container_routes": containerRoutePayload(res.Containers),
+		// FOUR addresses, and reading them as two pairs is the whole point.
+		// egress_before/egress_after are THIS MACHINE's, and they are supposed
+		// to be the SAME — host_held says they were, host_moved says the apply
+		// failed in the one way that damages the box. The container pair is
+		// supposed to DIFFER, and to differ from the host's.
+		//
+		// Empty means NOT MEASURED, never "unchanged" — a caller must render
+		// an absent address as unknown rather than reusing the last one it saw.
+		"egress_before":           res.EgressBefore,
+		"egress_before_via":       res.EgressBeforeVia,
+		"egress_after":            res.EgressAfter,
+		"egress_after_via":        res.EgressAfterVia,
+		"host_held":               res.HostHeld,
+		"host_moved":              res.HostMoved,
+		"container_egress_before": containerEgressPayload(res.ContainerEgressBefore),
+		"container_egress_after":  containerEgressPayload(res.ContainerEgressAfter),
+		"expect_egress":           res.Expected,
+		"default_device":          res.DefaultDevice,
+		"control_plane_ok":        res.ControlPlaneOK,
+		"deadman_expires_at":      res.DeadmanExpiresAt,
+		"deadman_still_armed":     res.DeadmanStillArmed,
+		"boot_guard":              res.BootGuard,
 		// Empty means the management path IS pinned outside the tunnel; a
 		// sentence means it is not, and why (macOS). A control plane that
 		// drops this field reports the Linux guarantee on a Mac.
@@ -348,10 +377,89 @@ func secondsArg(args map[string]any, key string, def time.Duration) time.Duratio
 // disabled. That is not a detail: a pooled connection opened before the route
 // moved answers over the old path and reports a change that never happened,
 // which is the specific way this kind of check lies.
+// TWO ADDRESSES, NOT ONE, and their divergence is the feature (card
+// 3c85bf3b-9510-81af-b361-e89c687368f1, re-scoped 2026-08-26 to be the read
+// side of container-scoped routing):
+//
+//	CONTROL-PLANE EGRESS — `ip`, the address this HOST leaves from. It is the
+//	address aw-console and aw-backend see, and under the corrected invariant it
+//	is the one that must NEVER move when a gate is applied.
+//	CONTAINER EGRESS — `container_egress`, the address this host's CONTAINERS
+//	leave from. It is the one the gate is supposed to move.
+//
+// How to read the pair, which is the whole diagnostic and is why neither is
+// worth showing alone:
+//
+//	no gate applied, the two are EQUAL       -> healthy
+//	no gate applied, the two DIFFER          -> something is already routing
+//	                                            container traffic somewhere
+//	                                            unexpected: the aw-console
+//	                                            `51821` shape, unnoticed for
+//	                                            two days
+//	gate applied, the two DIFFER             -> it worked, AND the host was
+//	                                            left alone. Both facts, from
+//	                                            one comparison
+//	gate applied, the two are still EQUAL    -> either the gate did nothing,
+//	                                            or the host moved too and both
+//	                                            are now the gate's address.
+//	                                            Indistinguishable from the
+//	                                            container's number alone,
+//	                                            which is exactly why both are
+//	                                            reported
+//
+// The container half shares vpn.MeasureContainerEgress with the exit-gate
+// sequence rather than measuring its own way. Two implementations would drift,
+// and a divergence produced by two different methods would prove nothing.
+//
+// The honesty contract is the monolith's `public_ip()` and it applies to both
+// halves: a failed measurement returns an empty address WITH the reason and
+// NEVER a remembered one. A host with no container runtime says exactly that —
+// it never copies the host's address into the container's field, which is the
+// invented-data failure this screen is built against, and the one that would
+// make an unapplied gate look applied.
 func (h *Handler) VPNPublicIP(ctx context.Context) (map[string]any, error) {
-	egress, err := vpn.PublicIP(ctx)
-	if err != nil {
-		return map[string]any{"ip": "", "via": "", "error": err.Error()}, nil
+	out := map[string]any{"ip": "", "via": ""}
+	if egress, err := vpn.PublicIP(ctx); err == nil {
+		out["ip"], out["via"] = egress.IP, egress.Via
+	} else {
+		out["error"] = err.Error()
 	}
-	return map[string]any{"ip": egress.IP, "via": egress.Via}, nil
+	out["container_egress"] = containerEgressPayload(containerEgress(ctx, h.runner()))
+	return out, nil
+}
+
+// measureContainerEgress is the whole container half in one call: detect the
+// runtime, find its networks, pick the probe network, measure. Each step's
+// failure is the answer rather than an error, because "no container runtime"
+// is a legitimate, permanent state for two of this account's hosts (Mac.Home
+// and the native Windows link) and their rows must render an honest unknown —
+// not a blank, and above all not a duplicate of the host's address.
+func measureContainerEgress(ctx context.Context, r vpn.Runner) vpn.ContainerEgressResult {
+	runtime, err := vpn.DetectContainerRuntime(ctx, r)
+	if err != nil {
+		return vpn.ContainerEgressResult{Error: err.Error()}
+	}
+	networks, err := vpn.ContainerNetworks(ctx, r, runtime)
+	if err != nil {
+		return vpn.ContainerEgressResult{Runtime: runtime.Name, Error: err.Error()}
+	}
+	return vpn.MeasureContainerEgress(ctx, r, runtime, vpn.PickProbeNetwork(runtime, networks))
+}
+
+func containerEgressPayload(c vpn.ContainerEgressResult) map[string]any {
+	return map[string]any{
+		"ip":      c.IP,
+		"via":     c.Via,
+		"runtime": c.Runtime,
+		"network": c.Network,
+		"error":   c.Error,
+	}
+}
+
+func containerRoutePayload(routes []vpn.ContainerRoute) []map[string]any {
+	out := make([]map[string]any, 0, len(routes))
+	for _, r := range routes {
+		out = append(out, map[string]any{"prefix": r.Prefix, "networks": r.Networks})
+	}
+	return out
 }

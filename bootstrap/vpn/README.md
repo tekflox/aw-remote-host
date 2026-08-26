@@ -3,41 +3,66 @@
 Installs tailscale and enrols this machine in **the tenant's own headscale**,
 optionally offering it as an exit gate — and, since phase 2, selecting one.
 
-| Command | Touches the default route? |
+| Command | Whose egress moves? |
 |---|---|
-| `aw-remote-host vpn --login-server=…` | no — enrolment only (phase 1) |
-| `aw-remote-host vpn --advertise-exit-node` | no — *offering* is not *using* |
-| **`aw-remote-host vpn use-exit <node>`** | **REFUSED — see "Why selecting a gate is refused"** |
-| `aw-remote-host vpn use-exit <node> --plan` | no — read-only preview, still works |
-| `aw-remote-host vpn clear-exit` | yes, back to normal — never refused |
+| `aw-remote-host vpn --login-server=…` | nobody's — enrolment only (phase 1) |
+| `aw-remote-host vpn --advertise-exit-node` | nobody's — *offering* is not *using* |
+| **`aw-remote-host vpn use-exit <node>`** | **the CONTAINERS'. Never the host's — see below** |
+| `aw-remote-host vpn use-exit <node> --plan` | nobody's — read-only preview |
+| `aw-remote-host vpn clear-exit` | back to normal — never refused |
 
-## Why selecting a gate is refused
+## The invariant: route the containers, never the host
 
-`use-exit` moves **this machine's** default route — `ip rule … lookup 52`
-applied `from all`, so the host and every container on it leave through the
-gate. That was the wrong scope. What the feature is for is moving the
-**containers'** egress; the host's own public IP is the thing that must *not*
-change, and a host whose address moved is a failed apply however healthy the
-container's egress looks.
+This is the correction of 2026-08-26, and it inverts what the feature used to
+do. `use-exit` once moved **this machine's** default route — `ip rule … lookup
+52` applied `from all`, so the host and every container on it left through the
+gate. That was the wrong scope, and the cost was not theoretical: the first
+real apply took a Mac off the internet, and the same verb was reachable against
+a bare metal running production.
 
-The cost of the old shape is not theoretical. The first real apply took a Mac
-off the internet, and the same verb is reachable against a bare metal running
-production. So until the rules are keyed per container network, this refuses
-rather than keep offering a destructive action — routing the whole machine is
-not a degraded mode of this feature, it *is* the bug.
+What holds now:
 
-Refused in four places, because each one becomes reachable at a different
-time: `vpn.UseExit` (`internal/vpn/usexit.go`, the innermost — every path goes
-through it), the `vpn_use_exit` /link verb, this CLI, and aw-backend's
-`/exit-gate` endpoint. The last one is what actually holds today: the host's
-own refusal only reaches a machine once its binary is updated, and that is a
-manual job.
+- the **containers'** public IP **must change**. That is the feature.
+- the **host's** public IP **must not change**. That is a hard assertion, not a
+  hope.
+- a host whose address moved is a **failed apply** and reverts, however healthy
+  the container's egress looks.
+- the confirmation checks **both**, because either alone is a half-measure:
+  container-changed-only hides a host that moved too; host-unchanged-only
+  proves nothing happened at all.
+
+### What is still refused, and why that is not a leftover
+
+Routing the whole machine is not a degraded mode of this feature — it *is* the
+bug. So any host where the only thing that *could* move is the machine itself
+is **refused**, with the reason, rather than served:
+
+| Host | Answer |
+|---|---|
+| Linux with a container runtime and at least one network | **allowed** — container-scoped |
+| Linux with no `docker`/`podman` that answers | **refused**: nothing to route but the machine |
+| a runtime that answers but defines no IPv4 network | **refused**: same, one step later |
+| **macOS** | **refused** — see "A Mac as a client" |
+| Windows | refused towards its WSL2 distro, as before |
+
+`vpn.ScopeRefusal` is that verdict, in two halves: the static one from the OS
+(no probe can change a Mac's answer) and the live one from the machine (is
+there a runtime, does it define a network). The CLI and the `vpn_use_exit`
+verb both ask it before building a spec, so a caller gets the reason instead of
+a failure from deep in the sequence; `UseExit` asks again as the innermost
+layer, because a refusal that lives only in the callers is one a future caller
+walks around.
 
 **`clear-exit` is never refused**, deliberately — it is the way *off* a gate,
 and the hosts that took a selection before this landed are exactly who needs
-it. `--plan` also still works: it changes nothing by construction, and it is
-where the exclusion set a host would really install can be read while that set
-is being re-derived for the container-scoped model.
+it. `--plan` also still works on a refused host: it changes nothing by
+construction, and it is where the reason can be read next to what that host
+actually resolves to.
+
+> **aw-backend still refuses `POST /exit-gate` with a 409** as of this commit.
+> That flag was added while the whole verb was refused, and lifting it for the
+> container-scoped path is a change in *that* repo, not this one. Until it is
+> lifted the UI path stays closed and the CLI / `/link` verb are the ways in.
 
 ## Offering a node that is already on the mesh
 
@@ -183,76 +208,131 @@ aw-remote-host vpn use-exit <node> [--expect-egress <ip>] [--exclude a,b] \
 aw-remote-host vpn clear-exit
 ```
 
-This moves the machine's default route — and, because every container NATs
-out through it, every container's traffic with it — onto `<node>`. It is the
-dangerous half of this module, so **the safety mechanism is the feature**.
-The ordering below is the deliverable; the `tailscale set` in the middle is
-the easy part.
+This moves the egress of every **container network** on this host onto
+`<node>`, and leaves the machine's own where it is. It is the dangerous half
+of this module, so **the safety mechanism is the feature**. The ordering below
+is the deliverable; the `tailscale set` in the middle is the easy part.
 
-1. **Measure egress before.** There is otherwise nothing to compare against.
+1. **Measure BOTH egresses before** — the host's, which must hold, and the
+   containers', which must move. The same function measures the "after", or
+   the pair proves nothing.
 2. **Arm a dead-man's switch, before touching anything.** A detached
    `sh -c 'sleep N; tailscale set --exit-node=; …'` in its own session
    (`SysProcAttr.Setsid` — it has to outlive the session that armed it, which
    is the session most likely to be killed by the route change it guards).
    Every later failure — a gate that does not forward, a confirmation that
-   hangs, this process being `kill -9`ed — still ends with the route back.
-   It is the **tool's** job, never the caller's.
-3. **Pin the exclusions**, control plane first. (On macOS there are none to
-   pin, and that is measured rather than skipped — see "A Mac as a client".)
-4. **Move the route** — `tailscale set --exit-node=<ip>
+   hangs, this process being `kill -9`ed — still ends with the rules gone.
+3. **Install the rules**, host bypass *first* (below).
+4. **Select the gate** — `tailscale set --exit-node=<ip>
    --exit-node-allow-lan-access=true --accept-dns=false`.
-5. **Confirm through the new route**: fetch the real public IP, and check the
-   control plane still answers.
+5. **Confirm both halves**: the containers' address changed, the host's did
+   not, and the control plane still answers.
 6. **Revert anything unconfirmed** — and only *then* stand the switch down.
 
-### The exclusions, and why they are shaped this way
+### The rules, and why they are shaped this way
 
-| Prefix | Why |
+Four priorities, all inside tailscale's own reserved 5210–5270 block — which
+is what makes deleting blindly at them safe, since nothing else allocates
+there. In the order the kernel evaluates them:
+
+| Priority | Rule | Why |
+|---|---|---|
+| 5259 | `to 100.64.0.0/10 lookup 52` | the mesh stays reachable for host and containers alike |
+| 5260 | `to <prefix> lookup main` | the exclusions — control plane, every attached network, `--exclude` |
+| 5261 | `from <container CIDR> lookup 52` | **the feature.** One per container network |
+| 5265 | `from all lookup main` | **the host's route, held still** |
+
+- **5265 is what makes the invariant hold.** Everything that is not a container
+  reaches it before tailscale's catch-all at 5270 ever gets a chance, so the
+  host's default stays in the main table for the whole life of the selection.
+  Its public IP cannot move, because nothing consults table 52 on its behalf.
+  It is also installed **first**, before any container rule and long before
+  `tailscale set` creates 5270 — so the window in which the host could take
+  the gate is zero, not small.
+- **5259 is not optional, and was nearly missed.** Measured on the Surface,
+  2026-08-26: `ip route show 100.64.0.0/10` in the **main** table is *empty* —
+  the peer routes live only in table 52. Without 5259 the bypass would send
+  mesh traffic to a table with no route for it and the machine would lose the
+  mesh, including the peer it is being routed through, while looking healthy.
+- **The container rules are keyed on the network's CIDR, never on a container's
+  own address.** Container IPs are ephemeral *and* recycled, so a rule pinned
+  to `172.18.0.5` silently starts applying to whatever different container next
+  gets that address. That is the recorded accident on this infrastructure:
+  `ip rule from 172.18.0.5 lookup 51821` left a container with no internet
+  **for two days, silently**, surviving restarts because the rule lived on the
+  host.
+- **The CIDRs come from the runtime, never from the interface table.**
+  `docker`/`podman network inspect`, parsed across all three shapes in play
+  (podman 4/netavark, docker, podman 3/CNI). A defined network with no running
+  container has no host-side bridge address at all: on the Surface, podman
+  knows `10.88.0.0/16` and `10.89.0.0/24` while `ip -4 addr` shows only the
+  second. An interface sweep would have missed half the containers on the box,
+  in the direction that reads as success.
+
+**The one rule that points into the tunnel's table**, said plainly rather than
+glossed: `from <CIDR> lookup 52` is the shape exit.go's header warns about, and
+routing containers through a tunnel cannot be expressed any other way. What
+makes it survivable is a property table 51821 did not have — tailscaled puts a
+**default route** in table 52 only while a selection is in force, and removes
+it when the selection clears (measured on the Surface: with nothing selected,
+table 52 holds peer routes and no default). A leftover container rule therefore
+finds no default and the kernel falls through to the next rule. The 51821 rule
+pointed at a wireguard table that kept its dead default forever.
+
+**The exclusions were re-derived, not inherited.** Under the old model they
+protected the *host*, whose route was moving. It no longer moves, so each had
+to earn its place again as a rule about *container* traffic — and both kinds
+did:
+
+| Prefix | Why, under the new model |
 |---|---|
-| the control plane's address (`api.aw.tekflox.com`) | the only remote-management path. **Not optional** — if it cannot even be resolved, `use-exit` refuses rather than moving the route without it |
-| every directly attached IPv4 network | that is the LAN prefix (`internal/lanfastpath` depends on it) *and* every podman/docker bridge, in one sweep that cannot drift as new bridges appear |
+| the control plane's address | a container's traffic to it would otherwise leave through the gate. **Still not optional**: an unresolvable control plane is still a refusal |
+| every directly attached IPv4 network | where container-to-LAN and container-to-container traffic goes. Without them a container talking to the NAS, the host, or a container on another bridge would have it sent into the tunnel and dropped. `internal/lanfastpath` depends on the LAN one |
 | whatever `--exclude` names | the things only the operator knows: a NAS on a routed subnet, a jump host |
 
-On Linux they are installed as `ip rule add to <prefix> lookup main priority
-5260`.
-Two details carry the whole safety property:
-
-- **5260 beats tailscale's catch-all at 5270.** Measured on `aw-baremetal`,
-  2026-08-25: tailscale's rules live at 5210/5230/5250 (fwmark, its own
-  packets only) and 5270 (`from all lookup 52`). 5260 is consulted first.
-- **They point at the *main* table, never at a table the tunnel owns.** A
-  leftover exclusion is therefore **inert** — "send this prefix to the main
-  table" is what an unconfigured machine already does. Compare the recorded
-  accident on this infrastructure: `ip rule from 172.18.0.5 lookup 51821`
-  pointed into a table whose gateway had ceased to exist, and a container had
-  no internet **for two days, silently**, surviving restarts because the rule
-  lived on the host. Nobody was alerted; it surfaced when a deploy failed.
-  The mechanism here is chosen so that failing to clean up cannot do that.
+They are `to <prefix> lookup main` rules, which is what lets them sit above the
+container rules and win: destination decides, so only traffic genuinely
+*leaving* is left for the gate.
 
 ### Confirming, rather than assuming
 
-"The interface is up" proves nothing. After the switch, `use-exit` fetches
-this host's real public IP (fresh connections, keep-alives disabled — a
-pooled connection would answer from the *old* path) and requires either:
+"The interface is up" proves nothing, and neither does one address. After the
+selection, `use-exit` re-measures both — fresh connections, keep-alives
+disabled, and the first endpoint is an **IP literal**
+(`https://1.1.1.1/cdn-cgi/trace`) so the answer does not depend on DNS, which
+matters most on the container side where `dns_enabled=false` is normal.
 
-- `--expect-egress <ip>`: an exact match with the gate's known public
-  address; or
-- no flag: that the address **changed**.
+The container half is measured by running a **throwaway container** on the
+host's own runtime, which makes the connection fresh by construction — there is
+no pool that could answer over the path that existed before the change. This is
+the same `vpn.MeasureContainerEgress` the read side uses; two implementations
+would drift, and a divergence produced by two different methods would prove
+nothing.
 
-An unchanged address with no `--expect-egress` is treated as a failure and
-reverted. There are legitimate topologies where a correct switch produces the
-same address — a gate that NATs to the public IP the client already used —
-and `--expect-egress` is how you say so up front. The control plane is
-re-checked at the same time: internet without a management path is still a
-lockout.
+Four checks, in the order of the damage:
+
+1. **the host held.** Failed first, and not retried — a host whose address
+   moved is already in the state the sequence exists to prevent. The result
+   carries `host_moved` so a caller can tell that apart from a gate that
+   merely did not work.
+2. **the control plane still answers.**
+3. **the containers moved** — `--expect-egress <ip>` for an exact match, or
+   without it, that the address **changed**. An unchanged address with no
+   `--expect-egress` is a failure and reverts; there are legitimate topologies
+   where a correct switch produces the same address, and the flag is how you
+   say so up front.
+4. **the two addresses differ.** With the host proven to have held, a container
+   egress equal to the host's can only mean the rules matched nothing. That is
+   the failure that used to be indistinguishable from success.
 
 ### The boot guard
 
 An exit-node selection is a tailscale **preference** and survives a reboot.
-The `ip rule` exclusions are runtime state and **do not**. A machine that
-rebooted with the first and without the second would come back with its
-default route on the mesh and nothing holding the control plane outside it —
-the lockout, arriving on its own, after everyone stopped watching.
+The `ip rule` set is runtime state and **does not**. A machine that rebooted
+with the first and without the second would come back with tailscale's
+`from all lookup 52` unopposed and **no host bypass** — which is the whole
+machine routed through the gate, the exact scope this feature exists to
+prevent, arriving on its own after everyone stopped watching.
 
 So `use-exit` installs `aw-vpn-exit-clear.service`, a oneshot that clears the
 selection at boot. This deliberately makes the selection non-persistent, and
@@ -267,19 +347,56 @@ probably should not.
   control plane that moves behind a rotating address goes stale; re-run
   `use-exit` (or `clear-exit`) if it does. `status` prints what is actually
   pinned.
-- **A container bridge created *after* `use-exit` is not excluded.** The
-  sweep runs once. Re-run `use-exit` after adding a network.
+- **A container network created *after* `use-exit` is not routed**, and not
+  excluded either. Discovery runs once, at selection time. Re-run `use-exit`
+  after adding a network — and note the failure is the safe direction: a new
+  network keeps the host's own egress rather than silently getting the gate's.
+- **The gate must not also be advertised by the client.** tailscale refuses to
+  advertise an exit node and use one at the same time, so a host offering
+  itself as a gate cannot select one until it stops. The refusal surfaces as a
+  failed `tailscale set`, and the sequence rolls every rule back.
+- **The probe pulls an image the first time.** `docker.io/curlimages/curl` is
+  ~10MB; on a host that does not have it, the first measurement waits for the
+  pull. `vpn.ContainerProbeImage` points it elsewhere.
 - **IPv4 only.** The exclusions and the default-route move are both IPv4;
   IPv6 is not claimed rather than half-supported.
 - **Linux and macOS.** Windows is refused towards its WSL2 distro: the
   workspace runs in there, so moving the Windows side's route would move the
   wrong operating system's.
 
-### A Mac as a client
+### A Mac as a client — the darwin question, answered
 
-A Mac can **select** a gate. It still cannot **offer** one — forwarding needs
-IP forwarding enabled with a sysctl nobody here has exercised on real
-hardware, so it stays deliberately unclaimed.
+**A Mac is refused, with a reason, and there is no fallback.** The card asked
+whether container-scoped routing is reachable from *outside* the Docker Desktop
+/ `podman machine` VM. It is not, and two independent things make it so —
+either alone would be enough:
+
+1. **The packets are already disguised.** There is no host-level container
+   network on macOS. Both runtimes run every container inside a Linux VM with
+   its own network stack, and that VM NATs container traffic to its own address
+   before macOS sees it (Docker Desktop goes further and terminates it in a
+   userspace proxy). By the time a packet reaches the Mac's routing, its source
+   is the VM's or the host's — there is no container CIDR left to key on.
+2. **There is nothing to key it with.** macOS has no policy routing by source
+   prefix; `route` keys on destination only. Measured on `Mac.Home`,
+   2026-08-26: `command -v ip` finds nothing — there is no `ip(8)` on the
+   platform at all.
+
+So the only scope available from out there is the **whole machine**, and under
+the corrected invariant that is not a degraded mode of this feature: it is the
+bug, and it is what took this Mac off the internet on the first real apply. A
+fallback would be the failure wearing the feature's name.
+
+**What would work**, so the refusal is not a dead end: enrol the VM itself. A
+`podman machine` / Docker Desktop VM is an ordinary Linux host, and an
+`aw-remote-host` inside it takes the Linux path with real container networks
+and a real `ip rule` — the same answer this module already gives Windows,
+whose workspace lives in WSL2.
+
+Everything below still describes what a Mac *can* do, and remains true: it can
+select a gate for **itself**, which is a capability this verb no longer
+exposes. It still cannot **offer** one — forwarding needs a sysctl nobody here
+has exercised on real hardware, so it stays deliberately unclaimed.
 
 "Can enrol" and "can select" are separate verdicts (`CanEnroll` /
 `CanSelectExit` in `internal/vpn`), and on `Mac.Home` they disagree: it can
@@ -350,31 +467,59 @@ Everything above is read back **from the machine**, not from `state.json` —
 the case that hurts is exactly the one where the two disagree:
 
 ```
-vpn: route exclusions in force (outside the tunnel): 65.109.66.88, 10.88.0.0/16, 172.17.0.0/16
-vpn: EXIT NODE IN FORCE — this machine's default route goes through aw-baremetal (100.64.0.1)
-vpn: default route for 1.1.1.1 leaves via tailscale0
-vpn: REAL public egress IP: 65.109.66.88 (measured via https://api.ipify.org)
+vpn: routing rules in force: from all to 100.64.0.0/10 lookup 52; from all to 65.109.66.88 lookup main; from 10.89.0.0/24 lookup 52; from all lookup main
+vpn: EXIT NODE IN FORCE — this host's CONTAINER networks go through aw-baremetal (100.64.0.1)
+vpn: this HOST's route for 1.1.1.1 leaves via eth0 (a tailscale interface here would mean the host is routed, which it must not be)
+vpn: HOST public egress IP: 188.250.165.236 (measured via https://1.1.1.1/cdn-cgi/trace) — with a gate in force this must be the SAME address as before it
+vpn: CONTAINER egress IP: 65.109.66.88 (measured via https://1.1.1.1/cdn-cgi/trace, from a throwaway container on podman network podman)
 ```
 
-and it speaks up about the leftover states rather than only the good ones —
-exclusions with no selection behind them, a selection with no exclusions, a
+Rules are printed **verbatim**, not summarised into bare prefixes: under
+container-scoped routing a rule's direction is its whole meaning, and `from
+10.89.0.0/24 lookup 52` (into the tunnel) and `to 10.89.0.0/24 lookup main`
+(out of it) would collapse into the same string.
+
+It speaks up about the leftover states rather than only the good ones — rules
+with no selection behind them, a selection with **no** rules (which now means
+tailscale's own catch-all is unopposed and the *machine* is routed), a
 dead-man's switch that already fired, a boot guard that is missing.
 
-### Measured end to end (disposable node, 2026-08-25)
+### The two addresses, and how to read them
 
-A throwaway systemd container enrolled as `aw-vpn-lab` (100.64.0.5) against
-the live `headscale.aw.tekflox.com`, using `aw-baremetal` as the gate:
+`vpn_public_ip` reports both, and their divergence is the diagnostic:
+
+| State | Reading |
+|---|---|
+| no gate, the two are **equal** | healthy |
+| no gate, the two **differ** | something is already routing container traffic somewhere unexpected — the `51821` shape, which went unnoticed for two days |
+| gate applied, the two **differ** | it worked, **and** the host was left alone. Both facts from one comparison |
+| gate applied, still **equal** | either the gate did nothing, or the host moved too and both are now the gate's address — indistinguishable from the container's number alone, which is why both are reported |
+
+A measurement that fails returns an empty address **with the reason** and never
+a remembered one; a host with no container runtime says exactly that. It never
+copies the host's address into the container's field — under this model the two
+numbers differing *is* the evidence, so that would fabricate the proof somebody
+is about to rely on.
+
+### Measured end to end, container-scoped (Surface WSL, 2026-08-26)
+
+A full cycle on `aw-surface-wsl` (`caf475b7032ee441`, podman 4.9.3, root),
+gate `aw-baremetal`, relayed via DERP(hel). Never on `bare-metal-privileged`,
+never on `Mac.Home`.
 
 | Proof | Result |
 |---|---|
-| default route moves | `ip route get 1.1.1.1` went `via 172.17.0.1 dev eth0` → `dev tailscale0 table 52` |
-| a **container** on that host follows | forwarded lookup `from 10.88.0.4 iif podman0` went `dev eth0` → `dev tailscale0`; its bytes crossed `tailscale0` |
-| `/link` survives | `ip route get 65.109.66.88` stayed on `eth0`; 3×`HTTP 200` from `/api/health`, and `wss://…/link` answered (a token rejection, not a connect failure) with the gate in force |
-| unconfirmed switch reverts | with no `--expect-egress` the IP could not change, so the tool reverted itself and exited non-zero |
-| **the dead-man's switch fires** | the tool was `SIGKILL`ed mid-confirmation; ~20s later (`--deadman=25s`) the exclusions were gone, the selection cleared, the route back on `eth0` and the internet working — with a log line saying so |
+| baseline, no gate | host `188.250.165.236`, container `188.250.165.236` — **equal**, as the model predicts |
+| discovery beats an interface sweep | routed `10.88.0.0/16` **and** `10.89.0.0/24`; only the second has a host interface |
+| **containers move** | container egress `188.250.165.236` → **`65.109.66.88`** |
+| **the host holds** | host egress `188.250.165.236` → `188.250.165.236`, and `ip route get 1.1.1.1` stayed `via 172.31.64.1 dev eth0` — never a tailscale interface |
+| independently re-measured with the gate in force | a shell outside the tool read host `188.250.165.236`, container `65.109.66.88` |
+| the rule table is what was designed | 5259/5260×3/5261×2/5265 present, tailscale's 5270 unreachable |
+| rollback on failure | an earlier attempt failed at `tailscale set` (the Surface was advertising a gate, which tailscale will not combine with using one); all **7 rules removed**, table back to pristine |
+| `clear-exit` restores both | 7 rules removed, host and container both back to `188.250.165.236` |
 
-The node, the container, the image and the ephemeral pre-auth key were all
-removed afterwards. Same standard as phase 1.
+The `--advertise-exit-node` turned off for the test was restored afterwards,
+and headscale still lists `aw-surface-wsl` with `0.0.0.0/0, ::/0` approved.
 
 ## Verify
 

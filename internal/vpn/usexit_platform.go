@@ -80,7 +80,15 @@ type exitPlatform interface {
 	// the stronger one.
 	manageability(controlPlaneHost string) string
 
-	applyExclusions(ctx context.Context, r Runner, ex []Exclusion) error
+	// containerScopeRefusal is the STATIC half of "can this platform route
+	// containers without routing the machine" — the half that is knowable
+	// from the OS alone, before any command runs. "" means the platform can,
+	// and the live half (is there a runtime, does it define a network) is
+	// then asked of the machine. A sentence means it cannot, ever, and no
+	// amount of probing will change that: see darwinExit's.
+	containerScopeRefusal() string
+
+	applyRoutes(ctx context.Context, r Runner, plan RoutePlan) error
 	clearExclusions(ctx context.Context, r Runner) (int, error)
 	listExclusions(ctx context.Context, r Runner) ([]string, error)
 
@@ -172,6 +180,12 @@ func (unsupportedExit) routeDevice(context.Context, Runner, string) (string, err
 func (unsupportedExit) bootGuardName() string    { return "(no boot guard on " + runtime.GOOS + ")" }
 func (unsupportedExit) bootGuardInstalled() bool { return false }
 
+// The darwin refusal is about a VM this platform does not have, so inheriting
+// it would explain the wrong machine to whoever is reading.
+func (unsupportedExit) containerScopeRefusal() string {
+	return runtime.GOOS + " has no exit-gate implementation in this module — only linux can route container networks through a gate, and only darwin has a documented reason why it cannot."
+}
+
 // ---------------------------------------------------------------- linux ---
 
 // linuxExit is the original implementation, unchanged in behaviour: `ip rule`
@@ -197,12 +211,19 @@ func (linuxExit) planExclusions(controlPlane string, extra []string, resolve Res
 
 func (linuxExit) manageability(string) string { return "" }
 
-func (linuxExit) applyExclusions(ctx context.Context, r Runner, ex []Exclusion) error {
-	return ApplyExclusions(ctx, r, ex)
+// containerScopeRefusal is empty on Linux: `ip rule` can key on a source
+// prefix, the container networks are on this kernel's own bridges, and the
+// host's route can be held still with one more rule. Whether this PARTICULAR
+// Linux host has a runtime with a network on it is the live half, asked by
+// ScopeRefusal.
+func (linuxExit) containerScopeRefusal() string { return "" }
+
+func (linuxExit) applyRoutes(ctx context.Context, r Runner, plan RoutePlan) error {
+	return ApplyRoutes(ctx, r, plan)
 }
 
 func (linuxExit) clearExclusions(ctx context.Context, r Runner) (int, error) {
-	return clearIPRuleExclusions(ctx, r)
+	return clearRouteRules(ctx, r)
 }
 
 func (linuxExit) listExclusions(ctx context.Context, r Runner) ([]string, error) {
@@ -217,8 +238,19 @@ func (linuxExit) routeDevice(ctx context.Context, r Runner, dst string) (string,
 	return parseRouteDevice(out), nil
 }
 
+// revertExclusionsScript is what the dead-man's switch runs after it clears
+// the selection. It has to sweep EVERY priority this module installs, not just
+// the exclusions: a switch that fired leaving the container rules behind would
+// leave `from <CIDR> lookup 52` pointing at a table whose default has just been
+// removed — inert, but exactly the leftover shape this project has already
+// been bitten by, and the switch is the path that runs when nothing else did.
 func (l linuxExit) revertExclusionsScript(r PrivilegedRunner) string {
-	return fmt.Sprintf("while %s rule del priority %d 2>/dev/null; do :; done", r.CommandPrefix(l.ipPath), exclusionPriority)
+	ip := r.CommandPrefix(l.ipPath)
+	var parts []string
+	for _, priority := range routePriorities {
+		parts = append(parts, fmt.Sprintf("while %s rule del priority %d 2>/dev/null; do :; done", ip, priority))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (linuxExit) bootGuardName() string    { return systemdBootGuardUnit }
@@ -234,7 +266,10 @@ func (linuxExit) removeBootGuard(ctx context.Context, r PrivilegedRunner) error 
 
 func (linuxExit) planNarration(gateIP string) []string {
 	return []string{
-		fmt.Sprintf("would run: ip rule add to <each prefix above> lookup main priority %d", exclusionPriority),
+		fmt.Sprintf("would run: ip rule add from all lookup main priority %d   <-- FIRST, and it is what holds this machine's own egress still", hostBypassPriority),
+		fmt.Sprintf("would run: ip rule add to %s lookup 52 priority %d   <-- so the bypass does not cost this host the mesh", meshPrefix, meshPreservePriority),
+		fmt.Sprintf("would run: ip rule add to <each excluded prefix above> lookup main priority %d", exclusionPriority),
+		fmt.Sprintf("would run: ip rule add from <each container network above> lookup 52 priority %d   <-- the only traffic that moves", containerRoutePriority),
 		fmt.Sprintf("would run: tailscale set --exit-node=%s --exit-node-allow-lan-access=true --accept-dns=false", gateIP),
 	}
 }
@@ -357,9 +392,53 @@ func (darwinExit) manageability(controlPlaneHost string) string {
 	return fmt.Sprintf("the control plane (%s) is INSIDE the tunnel while this gate is in force. macOS offers no exclusion mechanism that is safe to leave behind, so the management path is CONFIRMED rather than pinned: this run proves it still works through the gate and reverts if it does not. What that does not cover is the gate breaking LATER — then this Mac loses its internet and its /link tunnel together, and the way back is somebody at the keyboard running `aw-remote-host vpn clear-exit`, or a reboot, which the boot guard turns into a clean slate.", controlPlaneHost)
 }
 
-func (darwinExit) applyExclusions(context.Context, Runner, []Exclusion) error { return nil }
-func (darwinExit) clearExclusions(context.Context, Runner) (int, error)       { return 0, nil }
-func (darwinExit) listExclusions(context.Context, Runner) ([]string, error)   { return nil, nil }
+// DarwinContainerScopeRefusal is the honest answer to the card's darwin
+// question, and it is a refusal rather than a fallback.
+//
+// The question was whether container-scoped routing is reachable from OUTSIDE
+// the Docker Desktop / podman machine VM. It is not, and TWO independent
+// things make it so — either alone would be enough:
+//
+//  1. THE PACKETS ARE ALREADY DISGUISED. There is no host-level container
+//     network on macOS. Docker Desktop and `podman machine` run every
+//     container inside a Linux VM that has its own network stack, and that VM
+//     NATs container traffic to its own address (Docker Desktop goes further
+//     and terminates it in a userspace proxy on the host). By the time macOS
+//     sees a packet, its source address is the VM's or the host's — there is
+//     no container CIDR left to key a rule on, because the thing that would
+//     have carried it was rewritten one layer down.
+//
+//  2. THERE IS NOTHING TO KEY IT WITH. macOS has no `ip rule` and no policy
+//     routing by source prefix at all; `route` keys on destination only.
+//     darwinExit.planExclusions already documents why this module installs no
+//     routes here — tailscaled owns the utun — and the same absence that makes
+//     the exclusions unnecessary makes container-scoped routing impossible.
+//
+// So the only scope a Mac could be routed at is the WHOLE MACHINE, and under
+// the corrected invariant that is not a degraded mode of this feature: it is
+// the bug the feature was rewritten to remove, and it is the thing that took
+// this Mac off the internet on the first real apply. A fallback here would be
+// the failure wearing the feature's name.
+//
+// What WOULD work, said so the refusal is not a dead end: enrol the VM itself.
+// A `podman machine` or Docker Desktop VM is an ordinary Linux host, and an
+// aw-remote-host inside it takes the linux branch of this file with real
+// container networks and a real `ip rule`. That is the same answer this module
+// already gives Windows, whose workspace lives in WSL2.
+const DarwinContainerScopeRefusal = "this Mac has no container network that could be routed without routing the Mac. Docker Desktop and `podman machine` run containers inside a Linux VM which NATs their traffic to its own address before macOS ever sees it, so there is no container CIDR left out here to key a rule on — and macOS has no `ip rule` to key one with either, only destination routes. The only scope available from outside that VM is the whole machine, and moving this machine's own egress is exactly what this verb must never do. To route a Mac's containers through a gate, run aw-remote-host INSIDE the VM and select the gate there, the same way a Windows host selects one from its WSL2 distro."
+
+func (darwinExit) containerScopeRefusal() string { return DarwinContainerScopeRefusal }
+
+// applyRoutes is unreachable on darwin — containerScopeRefusal refuses before
+// a plan is built — and it errors rather than returning nil so that a future
+// caller which finds a way past the refusal fails loudly instead of silently
+// installing nothing and reporting a gate that is not there.
+func (darwinExit) applyRoutes(context.Context, Runner, RoutePlan) error {
+	return fmt.Errorf("%s", DarwinContainerScopeRefusal)
+}
+
+func (darwinExit) clearExclusions(context.Context, Runner) (int, error)     { return 0, nil }
+func (darwinExit) listExclusions(context.Context, Runner) ([]string, error) { return nil, nil }
 
 // routeDevice reads `route -n get <dst>`, macOS's answer to `ip route get`.
 // It needs no privilege, which matters: this is the cheap local half of the
@@ -412,10 +491,9 @@ func (darwinExit) removeBootGuard(ctx context.Context, r PrivilegedRunner) error
 	return removeLaunchdBootGuard(ctx, r)
 }
 
-func (darwinExit) planNarration(gateIP string) []string {
+func (darwinExit) planNarration(string) []string {
 	return []string{
-		"would install NO route exclusions: on macOS tailscaled owns the utun and the LAN stays outside the tunnel natively via --exit-node-allow-lan-access. The control plane is confirmed through the gate instead of pinned around it",
-		fmt.Sprintf("would run: tailscale set --exit-node=%s --exit-node-allow-lan-access=true --accept-dns=false", gateIP),
+		"would do NOTHING: " + DarwinContainerScopeRefusal,
 	}
 }
 

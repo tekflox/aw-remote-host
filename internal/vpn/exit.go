@@ -35,24 +35,60 @@ import (
 //     fetching the real public IP through the new route, and a switch that
 //     cannot be confirmed is reverted rather than reported.
 
+// The `ip rule` priorities this module installs, and the whole of the routing
+// model in one place. Every one of them lives inside tailscale's own reserved
+// 5210-5270 block, which is what makes them safe to delete blindly on the way
+// out: nothing else in the system allocates there.
+//
+// Measured on aw-baremetal 2026-08-25 and re-measured on the Surface
+// 2026-08-26 — tailscale's own rules, with an exit node in force, are:
+//
+//	5210: from all fwmark 0x80000/0xff0000 lookup main
+//	5230: from all fwmark 0x80000/0xff0000 lookup default
+//	5250: from all fwmark 0x80000/0xff0000 unreachable
+//	5270: from all lookup 52
+//
+// 5270 is the catch-all that puts EVERY packet into tailscale's table, and it
+// is the reason the old shape of this feature moved the whole machine. The
+// three fwmark rules above only ever match tailscaled's OWN packets, so
+// sitting below them shadows nothing.
+//
+// What this module installs, in the order the kernel evaluates it:
+//
+//	5259: to 100.64.0.0/10 lookup 52     the mesh stays reachable — see below
+//	5260: to <prefix> lookup main        the exclusions (control plane, LANs)
+//	5261: from <container CIDR> lookup 52  THE FEATURE: containers only
+//	5265: from all lookup main           THE HOST'S ROUTE, HELD STILL
+//
+// 5265 is what makes the invariant hold. It is reached by everything that is
+// not a container, before tailscale's 5270 ever gets a chance, so the host's
+// default route stays in the main table for the entire life of the selection.
+// The host's public IP cannot move because nothing ever consults table 52 on
+// its behalf.
+//
+// 5259 is not optional and was nearly missed. On the Surface, `ip route show
+// 100.64.0.0/10` in the MAIN table is EMPTY — the peer routes
+// (100.64.0.1/100.64.0.3/100.100.100.100 dev tailscale0) live only in table
+// 52. Without 5259 the host bypass at 5265 would send mesh traffic to a table
+// that has no route for it, and the machine would lose the mesh — including
+// the peers it is being routed through — while looking perfectly healthy.
 const (
-	// exclusionPriority is the `ip rule` priority the route exclusions are
-	// installed at.
-	//
-	// Measured on aw-baremetal 2026-08-25 — tailscale's own rules are:
-	//
-	//	5210: from all fwmark 0x80000/0xff0000 lookup main
-	//	5230: from all fwmark 0x80000/0xff0000 lookup default
-	//	5250: from all fwmark 0x80000/0xff0000 unreachable
-	//	5270: from all lookup 52
-	//
-	// 5270 is the catch-all that puts every packet into tailscale's table.
-	// 5260 is immediately above it, so an exclusion wins over the tunnel; the
-	// three fwmark rules above only ever match tailscaled's OWN packets, so
-	// sitting below them shadows nothing. Living inside tailscale's reserved
-	// 5210-5270 block is also why this priority is safe to delete blindly in
-	// ClearExclusions: nothing else in the system allocates there.
+	// meshPreservePriority keeps the mesh itself reachable for host and
+	// containers alike, above the host bypass.
+	meshPreservePriority = 5259
+	// exclusionPriority is where the `to <prefix> lookup main` exclusions go.
 	exclusionPriority = 5260
+	// containerRoutePriority is where each container network's `from <CIDR>
+	// lookup 52` rule goes — keyed on the NETWORK, never on a container's own
+	// address. See containers.go's header for the outage that rule shape cost.
+	containerRoutePriority = 5261
+	// hostBypassPriority is the single `from all lookup main` that holds the
+	// host's own egress still.
+	hostBypassPriority = 5265
+
+	// meshPrefix is tailscale's CGNAT range, fixed by the protocol rather than
+	// by configuration.
+	meshPrefix = "100.64.0.0/10"
 
 	// exitConfirmEndpointTimeout bounds a single public-IP lookup. Short on
 	// purpose — when an exit gate is broken these hang, and every second
@@ -60,15 +96,39 @@ const (
 	exitConfirmEndpointTimeout = 8 * time.Second
 )
 
-// egressEndpoints are the plain-text "what is my public IP" services tried in
-// order. Three, from three different operators, because the confirmation step
-// is what stands between a broken exit node and a stranded host: one
-// provider having a bad day must not read as "the route is broken", and must
-// not read as "the route is fine" either.
-var egressEndpoints = []string{
-	"https://api.ipify.org",
-	"https://ifconfig.me/ip",
-	"https://icanhazip.com",
+// routePriorities is every priority this module owns, cleared as one set.
+// Listed once so a rule shape added later cannot be installed and then left
+// behind by a cleanup that never heard about it.
+var routePriorities = []int{meshPreservePriority, exclusionPriority, containerRoutePriority, hostBypassPriority}
+
+// egressEndpoints are the "what is my public IP" services tried in order, from
+// different operators, because the confirmation step is what stands between a
+// broken exit node and a stranded host: one provider having a bad day must not
+// read as "the route is broken", and must not read as "the route is fine"
+// either.
+//
+// The FIRST is an IP literal, and that is the point of the ordering. A gate
+// that forwards packets but breaks name resolution would otherwise be reported
+// as no internet at all; worse, on the container side a network with
+// dns_enabled=false is completely normal. Measured answering over TLS to the
+// bare address from both a host and a podman container on the Surface,
+// 2026-08-26.
+var egressEndpoints = []egressEndpoint{
+	{URL: "https://1.1.1.1/cdn-cgi/trace", Keyed: true, ByIP: true},
+	{URL: "https://api.ipify.org"},
+	{URL: "https://ifconfig.me/ip"},
+	{URL: "https://icanhazip.com"},
+}
+
+// egressEndpoint is one such service and how to read it.
+type egressEndpoint struct {
+	URL string
+	// Keyed marks a `key=value` body (Cloudflare's cdn-cgi/trace) rather than
+	// a bare address.
+	Keyed bool
+	// ByIP records that this URL needs no DNS. Carried so the honesty of a
+	// measurement is a property of the result and not folklore about the list.
+	ByIP bool
 }
 
 // Exclusion is one prefix deliberately kept OUT of the tunnel.
@@ -202,11 +262,32 @@ func PlanExclusions(controlPlane string, locals []LocalPrefix, extra []string, r
 		plan.Exclusions = append(plan.Exclusions, Exclusion{Prefix: prefix, Reason: reason})
 	}
 
+	// RE-DERIVED for container-scoped routing, 2026-08-26, rather than kept
+	// because it was there. Under the old model these protected the HOST,
+	// whose route was moving. The host's route no longer moves — the bypass at
+	// priority 5265 holds it — so every one of them had to earn its place
+	// again as a rule about CONTAINER traffic, and both kinds did:
+	//
+	//   - the control plane, because a container's traffic to it would
+	//     otherwise leave through the gate. The anti-lockout argument is gone
+	//     (the /link tunnel is the host's, and the host is untouched), but the
+	//     card's requirement that container->control-plane traffic keep
+	//     working is not, and this is what keeps it on the same path it used
+	//     yesterday instead of one that depends on a gate staying up;
+	//   - the attached networks, because they are where container-to-LAN and
+	//     container-to-container traffic goes. Without them a container
+	//     talking to the NAS, to the host, or to a container on another
+	//     bridge would have that traffic sent into the tunnel and dropped.
+	//     internal/lanfastpath depends on the LAN one.
+	//
+	// They are `to <prefix> lookup main` rules, which is what lets them sit
+	// above the container rules and win: destination decides, so only traffic
+	// that is genuinely LEAVING is left for the gate.
 	for _, ip := range plan.ControlPlaneIPs {
-		add(ip+"/32", "the control plane / /link tunnel endpoint ("+host+") — the only remote-management path this host has")
+		add(ip+"/32", "the control plane / /link tunnel endpoint ("+host+") — containers reach it on this host's own path rather than through the gate")
 	}
 	for _, l := range locals {
-		add(l.Prefix, "directly attached network on "+l.Iface+" (LAN prefix / container bridge — internal/lanfastpath depends on the LAN one)")
+		add(l.Prefix, "directly attached network on "+l.Iface+" (LAN prefix / container bridge) — container-to-LAN and container-to-container traffic must not enter the tunnel")
 	}
 	for _, raw := range extra {
 		prefix := strings.TrimSpace(raw)
@@ -288,46 +369,120 @@ func hostOf(raw string) string {
 	return s
 }
 
-// ApplyExclusions installs the plan as `ip rule` entries.
+// ContainerRoute is one container network's routing rule: the prefix that
+// moves, and which networks it belongs to.
 //
-// Existing exclusions are cleared first, so a second use-exit against a
-// different gate does not leave the first run's pins behind. It is also why
-// this is not additive: two overlapping generations of exclusion is precisely
-// the leftover-state failure the package header describes.
-func ApplyExclusions(ctx context.Context, r Runner, ex []Exclusion) error {
-	if _, err := clearIPRuleExclusions(ctx, r); err != nil {
+// Networks is for the narration only. It is what turns "10.89.0.0/24 now
+// leaves through the gate" into a sentence naming the containers an operator
+// recognises, and it is deliberately a list — two networks can share a subnet
+// when one was recreated under a new name, and one rule serves both.
+type ContainerRoute struct {
+	Prefix   string
+	Networks []string
+}
+
+// RoutePlan is the complete set of `ip rule` entries one selection installs.
+// Both halves together, because they are only correct together: the container
+// rules without the host bypass would route the machine, and the bypass
+// without the container rules would route nothing at all.
+type RoutePlan struct {
+	Containers []ContainerRoute
+	Exclusions []Exclusion
+}
+
+// ApplyRoutes installs the plan.
+//
+// THE ORDER IS THE SAFETY PROPERTY, and it is not the order the kernel
+// evaluates in — priorities decide that. It is the order in which a partial
+// failure leaves the machine:
+//
+//  1. everything at this module's priorities is cleared, so a second
+//     use-exit cannot stack a second generation of rules on the first;
+//  2. the HOST BYPASS goes in FIRST. From this instant the host's default
+//     route is pinned to the main table, and it is in place before any
+//     container rule and long before `tailscale set` installs its own
+//     `from all lookup 52` at 5270. There is no window, not even a
+//     millisecond, in which this machine's own egress could take the tunnel;
+//  3. the mesh-preserve rule, so the bypass cannot cost the host its peers;
+//  4. the exclusions;
+//  5. the container rules last — the only step whose failure means "the
+//     feature did not happen", which is the harmless direction to fail in.
+//
+// Any failure rolls the whole set back rather than leaving it half applied. A
+// half-applied set reads like the host is pinned when the pin may be the rule
+// that failed, and that misreading is what this sequence exists to prevent.
+func ApplyRoutes(ctx context.Context, r Runner, plan RoutePlan) error {
+	if _, err := clearRouteRules(ctx, r); err != nil {
 		return err
 	}
-	for _, e := range ex {
-		out, err := r.Run(ctx, "ip", "rule", "add", "to", e.Prefix, "lookup", "main", "priority", fmt.Sprint(exclusionPriority))
-		if err != nil {
-			// Roll back rather than leave a half-applied exclusion set: a
-			// partial set is worse than none, because it reads like the
-			// management path is pinned when it may be the one that failed.
-			_, _ = clearIPRuleExclusions(ctx, r)
-			return fmt.Errorf("install route exclusion for %s: %w: %s", e.Prefix, err, strings.TrimSpace(out))
+	rollback := func(format string, args ...any) error {
+		_, _ = clearRouteRules(ctx, r)
+		return fmt.Errorf(format, args...)
+	}
+
+	if out, err := r.Run(ctx, "ip", "rule", "add", "from", "all", "lookup", "main", "priority", fmt.Sprint(hostBypassPriority)); err != nil {
+		return rollback("install the host bypass (`from all lookup main` at priority %d): %w: %s — without it this machine's own route would move, which is the one thing this must never do", hostBypassPriority, err, strings.TrimSpace(out))
+	}
+	if out, err := r.Run(ctx, "ip", "rule", "add", "to", meshPrefix, "lookup", "52", "priority", fmt.Sprint(meshPreservePriority)); err != nil {
+		return rollback("install the mesh-preserve rule (`to %s lookup 52` at priority %d): %w: %s — the host bypass alone would take this machine off the mesh", meshPrefix, meshPreservePriority, err, strings.TrimSpace(out))
+	}
+	for _, e := range plan.Exclusions {
+		if out, err := r.Run(ctx, "ip", "rule", "add", "to", e.Prefix, "lookup", "main", "priority", fmt.Sprint(exclusionPriority)); err != nil {
+			return rollback("install route exclusion for %s: %w: %s", e.Prefix, err, strings.TrimSpace(out))
+		}
+	}
+	for _, c := range plan.Containers {
+		if out, err := r.Run(ctx, "ip", "rule", "add", "from", c.Prefix, "lookup", "52", "priority", fmt.Sprint(containerRoutePriority)); err != nil {
+			return rollback("install the container route for %s: %w: %s", c.Prefix, err, strings.TrimSpace(out))
 		}
 	}
 	return nil
 }
 
-// ClearExclusions removes whatever this host's platform installed. On a Mac
-// that is nothing, and it answers (0, nil) rather than reaching for `ip`.
-func ClearExclusions(ctx context.Context, r Runner) (int, error) {
+// ClearRoutes removes whatever this host's platform installed. On a Mac that
+// is nothing, and it answers (0, nil) rather than reaching for `ip`.
+func ClearRoutes(ctx context.Context, r Runner) (int, error) {
 	return currentPlatform().clearExclusions(ctx, r)
 }
 
-// clearIPRuleExclusions removes every rule this package installed, by
-// deleting at its own priority until the kernel says there are none left.
+// clearRouteRules removes every rule this package installed, by deleting at
+// each of its own priorities until the kernel says there are none left.
 //
 // Deleting by priority rather than by exact spec is what makes cleanup total.
 // A rule whose spec drifted (a prefix rewritten by something else, a run that
 // died between two adds) would survive a spec-matched delete and become the
 // leftover this whole design is built to avoid.
-func clearIPRuleExclusions(ctx context.Context, r Runner) (int, error) {
+//
+// WHAT A LEFTOVER COSTS UNDER THIS MODEL, said plainly, because one of these
+// rules is the shape that caused the aw-console outage. `from <CIDR> lookup
+// 52` does point INTO a table the tunnel owns — the very thing exit.go's
+// header says to avoid — and routing containers through a tunnel cannot be
+// expressed any other way. What makes it survivable here is a property of
+// table 52 that table 51821 did not have: tailscaled populates 52 with a
+// DEFAULT ROUTE only while an exit node is selected, and removes it when the
+// selection clears (measured on the Surface, 2026-08-26: with no selection,
+// table 52 holds peer routes only and no default). A leftover container rule
+// therefore finds no default, and `ip rule` falls through to the next rule
+// rather than dropping the packet. The 51821 rule pointed at a wireguard table
+// that kept its dead default forever, which is why it was a black hole and
+// this is not. The dead-man's switch, the boot guard and `status`'s
+// leftover-rule warning are the other three layers.
+func clearRouteRules(ctx context.Context, r Runner) (int, error) {
+	total := 0
+	for _, priority := range routePriorities {
+		removed, err := clearRulesAtPriority(ctx, r, priority)
+		total += removed
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func clearRulesAtPriority(ctx context.Context, r Runner, priority int) (int, error) {
 	removed := 0
 	for i := 0; i < 64; i++ {
-		out, err := r.Run(ctx, "ip", "rule", "del", "priority", fmt.Sprint(exclusionPriority))
+		out, err := r.Run(ctx, "ip", "rule", "del", "priority", fmt.Sprint(priority))
 		if err != nil {
 			// The kernel answers "RTNETLINK answers: No such file or
 			// directory" once the last one is gone. That is the loop's exit
@@ -335,11 +490,11 @@ func clearIPRuleExclusions(ctx context.Context, r Runner) (int, error) {
 			if isNoSuchRule(out) {
 				return removed, nil
 			}
-			return removed, fmt.Errorf("remove route exclusions: %w: %s", err, strings.TrimSpace(out))
+			return removed, fmt.Errorf("remove route rules at priority %d: %w: %s", priority, err, strings.TrimSpace(out))
 		}
 		removed++
 	}
-	return removed, fmt.Errorf("removed %d route exclusions and there are still more at priority %d — refusing to loop", removed, exclusionPriority)
+	return removed, fmt.Errorf("removed %d route rules and there are still more at priority %d — refusing to loop", removed, priority)
 }
 
 func isNoSuchRule(out string) bool {
@@ -347,10 +502,10 @@ func isNoSuchRule(out string) bool {
 	return strings.Contains(lowered, "no such file") || strings.Contains(lowered, "cannot find")
 }
 
-// ListExclusions reads back the exclusions actually in force. `status` shows
-// this rather than what state.json remembers being asked for — the whole
-// hazard is a rule outliving the intent that created it.
-func ListExclusions(ctx context.Context, r Runner) ([]string, error) {
+// ListRouteRules reads back the rules actually in force. `status` shows this
+// rather than what state.json remembers being asked for — the whole hazard is
+// a rule outliving the intent that created it.
+func ListRouteRules(ctx context.Context, r Runner) ([]string, error) {
 	return currentPlatform().listExclusions(ctx, r)
 }
 
@@ -359,25 +514,35 @@ func listIPRuleExclusions(ctx context.Context, r Runner) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read ip rules: %w: %s", err, strings.TrimSpace(out))
 	}
-	return parseExclusionRules(out), nil
+	return parseRouteRules(out), nil
 }
 
-// parseExclusionRules picks the exclusion lines out of `ip rule show`. The
-// format is "5260:\tfrom all to 1.2.3.4 lookup main".
-func parseExclusionRules(out string) []string {
+// parseRouteRules picks this module's lines out of `ip rule show`, at every
+// priority it owns, and returns the rule bodies verbatim:
+//
+//	5259:	from all to 100.64.0.0/10 lookup 52
+//	5260:	from all to 1.2.3.4 lookup main
+//	5261:	from 10.89.0.0/24 lookup 52
+//	5265:	from all lookup main
+//
+// Verbatim rather than summarised into "excluded prefixes", which is what this
+// used to do. Under container-scoped routing the direction of a rule is the
+// whole meaning — `from <CIDR> lookup 52` moves traffic INTO the tunnel and
+// `to <prefix> lookup main` keeps it OUT — and a list of bare prefixes cannot
+// tell an operator which of the two they are looking at.
+func parseRouteRules(out string) []string {
+	prefixes := make(map[string]bool, len(routePriorities))
+	for _, p := range routePriorities {
+		prefixes[fmt.Sprint(p)+":"] = true
+	}
 	var found []string
-	prefix := fmt.Sprint(exclusionPriority) + ":"
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, prefix) {
+		head, rest, ok := strings.Cut(line, ":")
+		if !ok || !prefixes[head+":"] {
 			continue
 		}
-		fields := strings.Fields(line)
-		for i, f := range fields {
-			if f == "to" && i+1 < len(fields) {
-				found = append(found, fields[i+1])
-			}
-		}
+		found = append(found, strings.Join(strings.Fields(rest), " "))
 	}
 	return found
 }
@@ -423,18 +588,18 @@ func PublicIP(ctx context.Context) (Egress, error) {
 	for _, endpoint := range egressEndpoints {
 		ip, err := fetchIP(ctx, endpoint)
 		if err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", endpoint, err))
+			errs = append(errs, fmt.Sprintf("%s: %v", endpoint.URL, err))
 			continue
 		}
-		return Egress{IP: ip, Via: endpoint}, nil
+		return Egress{IP: ip, Via: endpoint.URL}, nil
 	}
 	return Egress{}, fmt.Errorf("could not determine this host's public IP from any endpoint: %s", strings.Join(errs, "; "))
 }
 
-func fetchIP(ctx context.Context, endpoint string) (string, error) {
+func fetchIP(ctx context.Context, endpoint egressEndpoint) (string, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, exitConfirmEndpointTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint.URL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -444,18 +609,45 @@ func fetchIP(ctx context.Context, endpoint string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 128))
+	// The keyed body is a few hundred bytes and the address is not in the
+	// first line, so the cap has to clear it — but it stays a cap, because a
+	// misrouted request can land on anything at all.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
 		return "", err
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	ip := net.ParseIP(strings.TrimSpace(string(body)))
-	if ip == nil {
-		return "", fmt.Errorf("answered %q, which is not an IP address", strings.TrimSpace(string(body)))
+	ip := parseEgressBody(string(body), endpoint.Keyed)
+	if ip == "" {
+		return "", fmt.Errorf("answered %q, which is not an IP address", strings.TrimSpace(firstLine(string(body))))
 	}
-	return ip.String(), nil
+	return ip, nil
+}
+
+// parseEgressBody reads an address out of either answer shape: a bare address,
+// or Cloudflare's `ip=<addr>` line inside a key=value blob. net.ParseIP is the
+// only thing that promotes a string to a measurement — a captive portal's
+// login page and a proxy's error text both return HTTP 200 with a body, and
+// neither is an egress address.
+func parseEgressBody(body string, keyed bool) string {
+	if keyed {
+		for _, line := range strings.Split(body, "\n") {
+			value, ok := strings.CutPrefix(strings.TrimSpace(line), "ip=")
+			if !ok {
+				continue
+			}
+			if ip := net.ParseIP(strings.TrimSpace(value)); ip != nil && ip.To4() != nil {
+				return ip.To4().String()
+			}
+		}
+		return ""
+	}
+	if ip := net.ParseIP(strings.TrimSpace(body)); ip != nil {
+		return ip.String()
+	}
+	return ""
 }
 
 // Reachable reports whether an HTTP GET to url completes at all. Used against
@@ -582,11 +774,27 @@ func SetExitNode(ctx context.Context, r Runner, ip string) error {
 
 // ConfirmResult is everything the confirmation step measured, kept whole so a
 // failure can be reported with its evidence instead of as a verdict.
+//
+// It carries FOUR addresses, not two, and that is the shape of the corrected
+// invariant: the host's before and after, which must be the same address, and
+// the containers' before and after, which must not be.
 type ConfirmResult struct {
-	Baseline        string
-	Observed        string
-	ObservedVia     string
+	// The host half. HostHeld is the assertion that used to be a hope.
+	HostBefore   string
+	HostAfter    string
+	HostAfterVia string
+	HostHeld     bool
+	// HostMoved is the FAILED APPLY. It is separate from a plain !OK because
+	// it is the only failure that means the machine was damaged rather than
+	// the feature not working, and a caller has to be able to tell those
+	// apart without parsing Reason.
+	HostMoved bool
+
+	// The container half.
+	ContainerBefore ContainerEgressResult
+	ContainerAfter  ContainerEgressResult
 	Expected        string // "" when the caller did not state one
+
 	DefaultDevice   string
 	ControlPlaneOK  bool
 	ControlPlaneErr error
@@ -594,85 +802,136 @@ type ConfirmResult struct {
 	Reason          string
 }
 
-// ConfirmEgress decides whether the switch actually worked.
-//
-// Three things have to be true, and "the interface is up" is not one of them:
-//
-//  1. The machine can still reach the internet at all. This is the
-//     anti-lockout check and it is why a failure here triggers a revert.
-//  2. The traffic really moved. With an expected address (--expect-egress, or
-//     whatever the console knows the gate's address to be) that is an exact
-//     match. Without one, the only available evidence is that the public IP
-//     CHANGED — so an unchanged address is treated as a failure, per the
-//     card's rule, even though there are legitimate topologies where a
-//     correct switch produces the same address (a gate that NATs to the same
-//     public IP the client already used). Those topologies are exactly what
-//     --expect-egress is for, and the failure message says so rather than
-//     leaving the operator to guess.
-//  3. The control plane is still reachable. If it is not, the exclusion did
-//     not do its job and the machine has lost its management path even
-//     though it still has internet.
-func ConfirmEgress(ctx context.Context, r Runner, baseline, expected, controlPlaneURL string) ConfirmResult {
-	return confirmEgress(ctx, r, currentPlatform(), baseline, expected, controlPlaneURL)
+// confirmSpec is what the confirmation needs to reach a verdict. A struct
+// rather than nine positional arguments, because the two baselines are both
+// strings and swapping them would invert the entire test.
+type confirmSpec struct {
+	platform     exitPlatform
+	runtime      ContainerRuntime
+	network      string
+	hostBefore   string
+	container    ContainerEgressResult
+	expected     string
+	controlPlane string
 }
 
-func confirmEgress(ctx context.Context, r Runner, plat exitPlatform, baseline, expected, controlPlaneURL string) ConfirmResult {
-	res := ConfirmResult{Baseline: baseline, Expected: expected}
+// confirmContainerScoped decides whether the switch actually worked, and it
+// checks BOTH halves because either one alone is a half-measure:
+//
+//   - container-changed-only can hide the host having moved too, which is a
+//     production machine losing its address while the screen says success;
+//   - host-unchanged-only proves nothing happened at all.
+//
+// The order of the checks is the order of the damage:
+//
+//  1. THE HOST HELD. Measured first and failed first. A host whose public IP
+//     moved is a failed apply and must revert even if the container's egress
+//     looks perfect — the caller gets HostMoved so it can say so.
+//  2. The control plane is still reachable, the anti-lockout check.
+//  3. The containers really moved. With an expected address that is an exact
+//     match; without one, the evidence available is that the address CHANGED.
+//  4. The two addresses actually differ. A container egress equal to the
+//     host's, with the host proven to have held, means the rules matched
+//     nothing and the gate silently did nothing — the failure that used to be
+//     indistinguishable from success.
+func confirmContainerScoped(ctx context.Context, r Runner, spec confirmSpec) ConfirmResult {
+	res := ConfirmResult{
+		HostBefore:      spec.hostBefore,
+		ContainerBefore: spec.container,
+		Expected:        spec.expected,
+	}
 
-	if dev, err := plat.routeDevice(ctx, r, "1.1.1.1"); err == nil {
+	if dev, err := spec.platform.routeDevice(ctx, r, "1.1.1.1"); err == nil {
 		res.DefaultDevice = dev
 	}
 
-	egress, err := PublicIP(ctx)
+	host, err := PublicIP(ctx)
 	if err != nil {
-		res.Reason = "this host could not reach the internet at all through the new route: " + err.Error()
+		// Not knowing is not the same as unchanged, and it must never be
+		// reported as such: with the host bypass in force this host having no
+		// internet is itself a failure worth reverting.
+		res.Reason = "this host's own public IP could not be measured after the change, so it is not possible to assert that the machine's egress held — which is the one thing that must be proven: " + err.Error()
 		return res
 	}
-	res.Observed = egress.IP
-	res.ObservedVia = egress.Via
+	res.HostAfter, res.HostAfterVia = host.IP, host.Via
 
-	if err := Reachable(ctx, controlPlaneURL); err != nil {
+	if spec.hostBefore == "" {
+		res.Reason = "this host's public IP was never measured before the change, so there is nothing to assert the host's egress against. Refusing to call a selection confirmed on the container's evidence alone"
+		return res
+	}
+	if host.IP != spec.hostBefore {
+		res.HostMoved = true
+		res.Reason = fmt.Sprintf("THE HOST'S OWN EGRESS MOVED, from %s to %s (via %s). That is a failed apply whatever the containers are doing: this verb routes containers and the machine's own public IP is the thing that must not change", spec.hostBefore, host.IP, host.Via)
+		return res
+	}
+	res.HostHeld = true
+
+	if err := Reachable(ctx, spec.controlPlane); err != nil {
 		res.ControlPlaneErr = err
-		res.Reason = fmt.Sprintf("the control plane (%s) is NOT reachable with the exit node in force: %v — the route exclusion that is supposed to keep the management path outside the tunnel is not working", controlPlaneURL, err)
+		res.Reason = fmt.Sprintf("the control plane (%s) is NOT reachable with the exit node in force: %v — the exclusion that is supposed to keep the management path outside the tunnel is not working", spec.controlPlane, err)
 		return res
 	}
 	res.ControlPlaneOK = true
 
-	res.OK, res.Reason = egressVerdict(baseline, expected, egress)
+	res.ContainerAfter = MeasureContainerEgress(ctx, r, spec.runtime, spec.network)
+	res.OK, res.Reason = containerEgressVerdict(spec.container, res.ContainerAfter, spec.expected, host.IP)
 	return res
 }
 
-// egressVerdict is the decision, split out from the I/O so it can be tested
-// against every combination rather than only against whatever the machine
-// running `go test` happens to be behind.
-func egressVerdict(baseline, expected string, egress Egress) (bool, string) {
+// containerEgressVerdict is the container half of the decision, split out from
+// the I/O so it can be tested against every combination rather than only
+// against whatever the machine running `go test` happens to be behind.
+func containerEgressVerdict(before, after ContainerEgressResult, expected, hostIP string) (bool, string) {
+	if after.IP == "" {
+		return false, fmt.Sprintf("the containers could not reach the internet at all through the new route: %s", after.Error)
+	}
 	switch {
 	case expected != "":
-		if egress.IP != expected {
-			return false, fmt.Sprintf("egress is %s (via %s) but the exit gate was expected to present %s — traffic is not leaving through the gate that was selected", egress.IP, egress.Via, expected)
+		if after.IP != expected {
+			return false, fmt.Sprintf("container egress is %s (via %s) but the exit gate was expected to present %s — the containers are not leaving through the gate that was selected", after.IP, after.Via, expected)
 		}
-	case baseline == "":
-		return false, "there is no baseline public IP to compare against, so the switch cannot be confirmed — re-run with --expect-egress <ip> to state what the gate should present"
-	case egress.IP == baseline:
-		return false, fmt.Sprintf("egress is still %s (via %s), the same address as before the switch — nothing measurable changed, so this cannot be reported as working. If this gate legitimately presents the same public IP this host already used, re-run with --expect-egress %s to state that up front", egress.IP, egress.Via, egress.IP)
+	case before.IP == "":
+		return false, fmt.Sprintf("container egress was not measured before the change (%s), so there is no baseline to compare against — re-run with --expect-egress <ip> to state what the gate should present", before.Error)
+	case after.IP == before.IP:
+		return false, fmt.Sprintf("container egress is still %s (via %s), the same address as before the switch — nothing measurable changed, so this cannot be reported as working. If this gate legitimately presents the same public IP the containers already used, re-run with --expect-egress %s to state that up front", after.IP, after.Via, after.IP)
+	}
+	// The host has already been proven to have held by the time this runs, so
+	// an equal pair can only mean one thing — and it is the thing that reads
+	// as success from the container's number alone.
+	if after.IP == hostIP {
+		return false, fmt.Sprintf("container egress (%s) is the SAME address the host leaves from, and the host is proven not to have moved — so the containers are not going through the gate at all. The rules matched no traffic; check that the networks discovered from %s are the ones the containers actually run on", after.IP, after.Network)
 	}
 	return true, ""
 }
 
-// Describe renders a confirmation for a human, success or failure alike.
+// Describe renders a confirmation for a human, success or failure alike. Both
+// pairs, always, in the order the invariant reads: the host is supposed to be
+// boring and the containers are supposed to have moved.
 func (c ConfirmResult) Describe() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "egress before: %s\n", orNone(c.Baseline))
-	fmt.Fprintf(&b, "egress now:    %s", orNone(c.Observed))
-	if c.ObservedVia != "" {
-		fmt.Fprintf(&b, " (measured via %s)", c.ObservedVia)
+	fmt.Fprintf(&b, "host egress before: %s\n", orNone(c.HostBefore))
+	fmt.Fprintf(&b, "host egress now:    %s", orNone(c.HostAfter))
+	if c.HostAfterVia != "" {
+		fmt.Fprintf(&b, " (measured via %s)", c.HostAfterVia)
+	}
+	switch {
+	case c.HostMoved:
+		b.WriteString("  <-- MOVED. This is a failed apply.")
+	case c.HostHeld:
+		b.WriteString("  <-- held, as required")
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "container egress before: %s\n", orNone(c.ContainerBefore.IP))
+	fmt.Fprintf(&b, "container egress now:    %s", orNone(c.ContainerAfter.IP))
+	if c.ContainerAfter.Via != "" {
+		fmt.Fprintf(&b, " (measured via %s, on network %s)", c.ContainerAfter.Via, c.ContainerAfter.Network)
 	}
 	b.WriteString("\n")
 	if c.Expected != "" {
-		fmt.Fprintf(&b, "egress expected: %s\n", c.Expected)
+		fmt.Fprintf(&b, "container egress expected: %s\n", c.Expected)
 	}
 	if c.DefaultDevice != "" {
-		fmt.Fprintf(&b, "default route for 1.1.1.1 leaves via: %s\n", c.DefaultDevice)
+		fmt.Fprintf(&b, "the HOST's route for 1.1.1.1 leaves via: %s (must not be a tailscale interface)\n", c.DefaultDevice)
 	}
 	if c.ControlPlaneOK {
 		b.WriteString("control plane: reachable\n")

@@ -39,31 +39,43 @@ func withClearExit(t *testing.T, fn func(context.Context, vpn.ClearExitSpec, vpn
 	t.Cleanup(func() { clearExit = prev })
 }
 
-// withHostScopeAllowed reaches past the scope refusal to the verb's own
-// argument handling and reply shape underneath it. Everything that plumbing
-// does is what the container-scoped verb will inherit, so it keeps being
-// tested while the refusal stands — the refusal itself is asserted by
-// TestHostScopedSelectionIsRefusedOnAHostThatCouldDoIt, which does NOT call
-// this.
+// withHostScopeAllowed stands in for a host whose containers CAN be routed
+// without the machine being routed with them — a Linux box with a container
+// runtime and at least one network. It is stubbed rather than probed because
+// the tests underneath it are about this verb's argument handling and reply
+// shape, and none of that should depend on whether the box running `go test`
+// happens to have docker installed.
 func withHostScopeAllowed(t *testing.T) {
 	t.Helper()
-	prev := hostScopeRefused
-	hostScopeRefused = func() bool { return false }
-	t.Cleanup(func() { hostScopeRefused = prev })
+	withScopeRefusal(t, "")
 }
 
-// THE SAFETY PROPERTY. Selecting a gate moves the whole machine's default
-// route when only the containers' egress was ever meant to move, so the verb
-// refuses — and it refuses a host that is entirely CAPABLE of doing it,
-// because capability was never the question. The bare metal running production
-// is the most capable target and the worst one.
+func withScopeRefusal(t *testing.T, refusal string) {
+	t.Helper()
+	prev := scopeRefusal
+	scopeRefusal = func(context.Context, vpn.Runner) string { return refusal }
+	t.Cleanup(func() { scopeRefusal = prev })
+}
+
+// noContainerRuntime is what ScopeRefusal really answers on a host with no
+// engine — a lean-linked laptop, or the Mac.
+const noContainerRuntime = vpn.NoContainerRuntimeRefusal
+
+// THE SAFETY PROPERTY, and the one the whole rewrite turns on. A host whose
+// containers cannot be routed separately from the machine is REFUSED, not
+// routed whole — because the only scope left on such a host is the machine
+// itself, and moving a machine's own egress is the bug this feature was
+// rewritten to remove, not a degraded mode of it.
 //
-// It refuses in the shape a screen can render (`refused` + a sentence, nil
-// error), not as a failure, and the sequence must not be reached at all.
-func TestHostScopedSelectionIsRefusedOnAHostThatCouldDoIt(t *testing.T) {
+// The host used here is entirely CAPABLE of taking a selection; capability was
+// never the question. It refuses in the shape a screen can render (`refused` +
+// a sentence, nil error), not as a failure, and the sequence must not be
+// reached at all.
+func TestSelectionIsRefusedWhenOnlyTheHostCouldMove(t *testing.T) {
 	withVerdict(t, eligibleGateHost())
+	withScopeRefusal(t, noContainerRuntime)
 	withUseExit(t, func(context.Context, vpn.UseExitSpec, vpn.Progress) (vpn.UseExitResult, error) {
-		t.Fatal("the sequence must never run while host-scoped routing is refused")
+		t.Fatal("the sequence must never run on a host where only the machine's own route could move")
 		return vpn.UseExitResult{}, nil
 	})
 
@@ -76,11 +88,36 @@ func TestHostScopedSelectionIsRefusedOnAHostThatCouldDoIt(t *testing.T) {
 	if out["refused"] != true || out["applied"] != false || out["changed"] != false {
 		t.Fatalf("refused/applied/changed = %v/%v/%v", out["refused"], out["applied"], out["changed"])
 	}
-	if out["refusal"] != vpn.HostRouteScopeRefusal {
-		t.Fatalf("the refusal must carry the canonical sentence, got %v", out["refusal"])
+	if out["refusal"] != noContainerRuntime {
+		t.Fatalf("the refusal must carry the reason, got %v", out["refusal"])
 	}
 	if out["scope"] != "host" {
 		t.Fatalf("scope = %v — a caller has to be able to tell this apart from an eligibility refusal", out["scope"])
+	}
+}
+
+// The darwin answer the card asked for, at the verb: a Mac refuses with its
+// own reason rather than falling back to routing the whole machine.
+func TestDarwinIsRefusedWithItsOwnReason(t *testing.T) {
+	withVerdict(t, eligibleGateHost())
+	withScopeRefusal(t, vpn.DarwinContainerScopeRefusal)
+	withUseExit(t, func(context.Context, vpn.UseExitSpec, vpn.Progress) (vpn.UseExitResult, error) {
+		t.Fatal("a Mac must never reach the sequence")
+		return vpn.UseExitResult{}, nil
+	})
+
+	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{ControlPlane: "https://api.aw.tekflox.com"}}
+	data, err := h.Dispatch(context.Background(), "vpn_use_exit", map[string]any{"node": "aw-lab"}, noopEmit)
+	if err != nil {
+		t.Fatalf("a refusal is a successful reply, not an error: %v", err)
+	}
+	refusal, _ := data.(map[string]any)["refusal"].(string)
+	// The reason has to name the VM, or it reads as a bug to be fixed rather
+	// than a property of the platform.
+	for _, want := range []string{"VM", "whole machine"} {
+		if !strings.Contains(refusal, want) {
+			t.Fatalf("the darwin refusal must explain itself; %q missing from %q", want, refusal)
+		}
 	}
 }
 
@@ -89,6 +126,7 @@ func TestHostScopedSelectionIsRefusedOnAHostThatCouldDoIt(t *testing.T) {
 // cannot be applied is how a screen ends up offering a button that lies.
 func TestPlanIsRefusedOverTheTunnelToo(t *testing.T) {
 	withVerdict(t, eligibleGateHost())
+	withScopeRefusal(t, noContainerRuntime)
 
 	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{ControlPlane: "https://api.aw.tekflox.com"}}
 	data, err := h.Dispatch(context.Background(), "vpn_use_exit",
@@ -110,6 +148,7 @@ func TestPlanIsRefusedOverTheTunnelToo(t *testing.T) {
 // keep working.
 func TestClearExitIsNotGatedByTheScopeRefusal(t *testing.T) {
 	withVerdict(t, eligibleGateHost())
+	withScopeRefusal(t, noContainerRuntime)
 	called := false
 	withClearExit(t, func(context.Context, vpn.ClearExitSpec, vpn.Progress) (vpn.ClearExitResult, error) {
 		called = true

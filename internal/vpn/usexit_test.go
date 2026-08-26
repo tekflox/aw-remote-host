@@ -73,72 +73,80 @@ func TestPlanRefusesAnEmptyControlPlane(t *testing.T) {
 	}
 }
 
-// withHostRouteScopeAllowed lets a test reach the sequence beneath the scope
-// refusal. Nothing in this package exercises the real sequence yet — it needs
-// a machine with tailscale — but the hatch is what stops "turn the refusal
-// off" meaning "edit the source", when the container-scoped rewrite starts.
-func withHostRouteScopeAllowed(t *testing.T) {
-	t.Helper()
-	prev := hostRouteScopeRefused
-	hostRouteScopeRefused = false
-	t.Cleanup(func() { hostRouteScopeRefused = prev })
+// THE SCOPE REFUSAL AS A VALUE, not as a flag. What is refused is no longer
+// "every host" but "every host where the only thing that could move is the
+// machine itself" — and both halves of that verdict have to be reachable from
+// a test on a build machine that has no container runtime and no Mac.
+//
+// A refusal is decided by ScopeRefusal before UseExit measures, arms or moves
+// anything, and PlanUseExit stays read-only either way, which is what lets
+// --plan keep working on a refused host.
+func TestScopeRefusalRefusesAHostWithNoContainerRuntime(t *testing.T) {
+	// A runner that fails every command is a host with neither docker nor
+	// podman — the lean-linked laptop, which is exactly the kind of machine
+	// someone reaches for a gate on.
+	refusal := ScopeRefusal(context.Background(), failingRunner{})
+	if refusal == "" {
+		t.Fatal("a host with no container runtime must be REFUSED: the only thing left to route is the machine, and that is the bug this feature removed")
+	}
+	if !strings.Contains(refusal, "refusal, not a reason to fall back") {
+		t.Fatalf("the refusal must say it is not a fallback, got %q", refusal)
+	}
 }
 
-// THE INNERMOST LAYER. UseExit is the one function every path — CLI, /link
-// verb, and anything added later — has to go through to move a route, so the
-// refusal lives here too and not only in the callers that are easier to read.
-//
-// It must refuse BEFORE the plan: no DNS lookup, no tailscale call, and above
-// all nothing armed or moved. A spec that is otherwise complete and valid is
-// used deliberately — the refusal is about what this tool does, not about
-// whether the request was well formed.
+// The darwin answer the card asked for, and it is a refusal WITH A REASON
+// rather than a fallback to routing the whole Mac.
+func TestDarwinRefusesContainerScopeWithItsReason(t *testing.T) {
+	if got := (darwinExit{}).containerScopeRefusal(); got != DarwinContainerScopeRefusal {
+		t.Fatalf("darwin must refuse: %q", got)
+	}
+	// The reason has to be checkable, not just present: it names the VM, and
+	// it names the alternative, or a reader is left thinking it is a gap to be
+	// filled rather than a property of the platform.
+	for _, want := range []string{"VM", "ip rule", "INSIDE the VM"} {
+		if !strings.Contains(DarwinContainerScopeRefusal, want) {
+			t.Fatalf("%q missing from the darwin refusal: %q", want, DarwinContainerScopeRefusal)
+		}
+	}
+	if (linuxExit{}).containerScopeRefusal() != "" {
+		t.Fatal("linux can route container networks; refusing it statically would refuse every host")
+	}
+}
+
+// A refused host is refused BEFORE anything is armed, moved or even measured,
+// and the refusal comes back on the result rather than only as an error.
 func TestUseExitRefusesBeforeItTouchesAnything(t *testing.T) {
 	var narrated []string
 	res, err := UseExit(context.Background(), UseExitSpec{
-		Runner:       stubRunner{},
+		Runner:       failingRunner{},
 		ControlPlane: "https://api.example.com",
 		Node:         "gate",
 	}, func(level, message string) { narrated = append(narrated, level+": "+message) })
 
-	if !errors.Is(err, ErrHostRouteScope) {
-		t.Fatalf("err = %v, want ErrHostRouteScope", err)
+	// On a build machine with no tailscale this stops even earlier, at
+	// eligibility — which is itself the property under test: nothing is armed
+	// or measured before a host is judged.
+	if err == nil {
+		t.Fatal("a host that cannot be routed container-scoped must not reach the sequence")
 	}
-	if res.Reason != HostRouteScopeRefusal {
-		t.Fatalf("the result must carry the reason: %q", res.Reason)
-	}
-	// Nothing may have been armed, moved or even measured.
 	if res.DeadmanExpiresAt != "" || res.DeadmanStillArmed {
 		t.Fatalf("a refusal must not arm the dead-man's switch: %+v", res)
 	}
 	if res.EgressBefore != "" || res.EgressAfter != "" || res.Confirmed || res.Reverted {
 		t.Fatalf("a refusal must not measure or change anything: %+v", res)
 	}
-	if len(narrated) != 1 || !strings.Contains(narrated[0], "error: ") {
-		t.Fatalf("the refusal must be narrated once, as an error: %v", narrated)
-	}
-}
-
-// The hatch has to actually reopen the path, or every test that relies on it
-// is passing for the wrong reason.
-func TestTheScopeHatchReopensTheSequence(t *testing.T) {
-	if !HostScopeRefused() {
-		t.Fatal("host-scoped routing must be refused by default")
-	}
-	withHostRouteScopeAllowed(t)
-	if HostScopeRefused() {
-		t.Fatal("the hatch must turn the refusal off")
-	}
-	// Past the refusal, the ordinary refusals resume — proving the sequence
-	// was really entered rather than short-circuited a second time.
-	_, err := UseExit(context.Background(), UseExitSpec{Runner: stubRunner{}}, nil)
-	if err == nil || errors.Is(err, ErrHostRouteScope) {
-		t.Fatalf("err = %v, want the empty-control-plane refusal from PlanUseExit", err)
-	}
-	if !strings.Contains(err.Error(), "not an optional exclusion") {
-		t.Fatalf("err = %v", err)
+	if errors.Is(err, ErrScopeRefused) && len(narrated) != 1 {
+		t.Fatalf("a scope refusal must be narrated exactly once: %v", narrated)
 	}
 }
 
 type stubRunner struct{}
 
 func (stubRunner) Run(context.Context, string, ...string) (string, error) { return "", nil }
+
+// failingRunner is a host where nothing this module shells out to exists.
+type failingRunner struct{}
+
+func (failingRunner) Run(_ context.Context, name string, _ ...string) (string, error) {
+	return "", errors.New("exec: \"" + name + "\": executable file not found in $PATH")
+}
