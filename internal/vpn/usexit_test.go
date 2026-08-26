@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -68,6 +69,72 @@ func TestPlanRefusesAnEmptyControlPlane(t *testing.T) {
 		Node:   "gate",
 	})
 	if err == nil || !strings.Contains(err.Error(), "not an optional exclusion") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// withHostRouteScopeAllowed lets a test reach the sequence beneath the scope
+// refusal. Nothing in this package exercises the real sequence yet — it needs
+// a machine with tailscale — but the hatch is what stops "turn the refusal
+// off" meaning "edit the source", when the container-scoped rewrite starts.
+func withHostRouteScopeAllowed(t *testing.T) {
+	t.Helper()
+	prev := hostRouteScopeRefused
+	hostRouteScopeRefused = false
+	t.Cleanup(func() { hostRouteScopeRefused = prev })
+}
+
+// THE INNERMOST LAYER. UseExit is the one function every path — CLI, /link
+// verb, and anything added later — has to go through to move a route, so the
+// refusal lives here too and not only in the callers that are easier to read.
+//
+// It must refuse BEFORE the plan: no DNS lookup, no tailscale call, and above
+// all nothing armed or moved. A spec that is otherwise complete and valid is
+// used deliberately — the refusal is about what this tool does, not about
+// whether the request was well formed.
+func TestUseExitRefusesBeforeItTouchesAnything(t *testing.T) {
+	var narrated []string
+	res, err := UseExit(context.Background(), UseExitSpec{
+		Runner:       stubRunner{},
+		ControlPlane: "https://api.example.com",
+		Node:         "gate",
+	}, func(level, message string) { narrated = append(narrated, level+": "+message) })
+
+	if !errors.Is(err, ErrHostRouteScope) {
+		t.Fatalf("err = %v, want ErrHostRouteScope", err)
+	}
+	if res.Reason != HostRouteScopeRefusal {
+		t.Fatalf("the result must carry the reason: %q", res.Reason)
+	}
+	// Nothing may have been armed, moved or even measured.
+	if res.DeadmanExpiresAt != "" || res.DeadmanStillArmed {
+		t.Fatalf("a refusal must not arm the dead-man's switch: %+v", res)
+	}
+	if res.EgressBefore != "" || res.EgressAfter != "" || res.Confirmed || res.Reverted {
+		t.Fatalf("a refusal must not measure or change anything: %+v", res)
+	}
+	if len(narrated) != 1 || !strings.Contains(narrated[0], "error: ") {
+		t.Fatalf("the refusal must be narrated once, as an error: %v", narrated)
+	}
+}
+
+// The hatch has to actually reopen the path, or every test that relies on it
+// is passing for the wrong reason.
+func TestTheScopeHatchReopensTheSequence(t *testing.T) {
+	if !HostScopeRefused() {
+		t.Fatal("host-scoped routing must be refused by default")
+	}
+	withHostRouteScopeAllowed(t)
+	if HostScopeRefused() {
+		t.Fatal("the hatch must turn the refusal off")
+	}
+	// Past the refusal, the ordinary refusals resume — proving the sequence
+	// was really entered rather than short-circuited a second time.
+	_, err := UseExit(context.Background(), UseExitSpec{Runner: stubRunner{}}, nil)
+	if err == nil || errors.Is(err, ErrHostRouteScope) {
+		t.Fatalf("err = %v, want the empty-control-plane refusal from PlanUseExit", err)
+	}
+	if !strings.Contains(err.Error(), "not an optional exclusion") {
 		t.Fatalf("err = %v", err)
 	}
 }

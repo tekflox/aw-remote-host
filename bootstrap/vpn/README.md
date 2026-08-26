@@ -7,8 +7,37 @@ optionally offering it as an exit gate — and, since phase 2, selecting one.
 |---|---|
 | `aw-remote-host vpn --login-server=…` | no — enrolment only (phase 1) |
 | `aw-remote-host vpn --advertise-exit-node` | no — *offering* is not *using* |
-| **`aw-remote-host vpn use-exit <node>`** | **yes** — see "Selecting an exit gate" |
-| `aw-remote-host vpn clear-exit` | yes, back to normal |
+| **`aw-remote-host vpn use-exit <node>`** | **REFUSED — see "Why selecting a gate is refused"** |
+| `aw-remote-host vpn use-exit <node> --plan` | no — read-only preview, still works |
+| `aw-remote-host vpn clear-exit` | yes, back to normal — never refused |
+
+## Why selecting a gate is refused
+
+`use-exit` moves **this machine's** default route — `ip rule … lookup 52`
+applied `from all`, so the host and every container on it leave through the
+gate. That was the wrong scope. What the feature is for is moving the
+**containers'** egress; the host's own public IP is the thing that must *not*
+change, and a host whose address moved is a failed apply however healthy the
+container's egress looks.
+
+The cost of the old shape is not theoretical. The first real apply took a Mac
+off the internet, and the same verb is reachable against a bare metal running
+production. So until the rules are keyed per container network, this refuses
+rather than keep offering a destructive action — routing the whole machine is
+not a degraded mode of this feature, it *is* the bug.
+
+Refused in four places, because each one becomes reachable at a different
+time: `vpn.UseExit` (`internal/vpn/usexit.go`, the innermost — every path goes
+through it), the `vpn_use_exit` /link verb, this CLI, and aw-backend's
+`/exit-gate` endpoint. The last one is what actually holds today: the host's
+own refusal only reaches a machine once its binary is updated, and that is a
+manual job.
+
+**`clear-exit` is never refused**, deliberately — it is the way *off* a gate,
+and the hosts that took a selection before this landed are exactly who needs
+it. `--plan` also still works: it changes nothing by construction, and it is
+where the exclusion set a host would really install can be read while that set
+is being re-derived for the container-scoped model.
 
 Each of the two route-changing commands also has a `/link` verb, so the same
 thing can be asked for from the Networking screen instead of over SSH:

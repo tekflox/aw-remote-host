@@ -33,12 +33,58 @@ package vpn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/state"
 )
+
+// HostRouteScopeRefusal is why selecting a gate refuses today, and it is
+// deliberately UNCONDITIONAL — not a check on which host is asking.
+//
+// The invariant this feature was built on was backwards. Everything below
+// moves THIS MACHINE's default route (`ip rule ... lookup 52`, applied `from
+// all`), so the host and its containers both leave through the gate. What was
+// actually wanted is the containers' egress moving and the HOST's public IP
+// staying exactly where it is — the host address is now the thing that must
+// NOT change, and a host whose IP moved is a failed apply however good the
+// container's egress looks.
+//
+// The cost of the old shape is not theoretical: it took a Mac off the internet
+// on the first real apply, and the same verb is reachable against a bare metal
+// running production (agents-platform-multitenant, aw-backend, ~15
+// aw-custom-*), where moving the host route is destructive. So until the
+// per-container-network rules exist, the honest behaviour is to refuse rather
+// than to keep offering a destructive action with a dead-man's switch behind
+// it. Routing the whole machine is not a degraded mode of this feature; under
+// the corrected invariant it IS the bug.
+//
+// ClearExit is deliberately NOT gated by this. It is the way OFF a gate, and
+// an undo that refuses is one that fails exactly when it is most needed —
+// including for the hosts that took a selection before this refusal landed.
+const HostRouteScopeRefusal = "`vpn use-exit` moves this MACHINE's default route, and every container on it, out through the gate — but the only egress that should move is the containers'. The host's own public IP must not change. Until container-scoped routing exists this verb refuses, rather than keep offering a change that can take a production machine off the internet. `vpn clear-exit` still works, so a host already on a gate can be taken off one."
+
+// ErrHostRouteScope is HostRouteScopeRefusal as an error, so a caller can tell
+// "this tool will not do this at all" apart from "this host could not".
+var ErrHostRouteScope = errors.New(HostRouteScopeRefusal)
+
+// hostRouteScopeRefused is the switch the refusal hangs on, and it stays true
+// until UseExit routes container networks instead of the machine.
+//
+// A var rather than a bare unconditional return so the sequence beneath it
+// stays reachable from its own tests. That ordering — measure, arm, pin, move,
+// confirm, revert — is the safety mechanism, and it is what the
+// container-scoped rewrite will inherit; letting it sit unexercised behind a
+// refusal for however long that takes is how a rewrite starts from a sequence
+// nobody has run in months. Tests flip it with withHostRouteScopeAllowed.
+var hostRouteScopeRefused = true
+
+// HostScopeRefused reports whether selecting a gate is refused outright. The
+// layers above ask before they build a spec, so their caller gets the reason
+// instead of a generic failure from somewhere deep in the sequence.
+func HostScopeRefused() bool { return hostRouteScopeRefused }
 
 const (
 	// DefaultDeadmanTimeout is the proven value from the manual run on
@@ -155,6 +201,14 @@ type UseExitPlan struct {
 	// Narration is what --plan should print for the commands this platform
 	// would really run, so the preview cannot drift from the implementation.
 	Narration []string
+	// Refusal is HostRouteScopeRefusal, carried on the plan so that a preview
+	// cannot be mistaken for an actionable confirmation. Planning stays
+	// available while the refusal stands — it changes nothing by construction,
+	// and it is the only way to see what this host's exclusion set really
+	// resolves to, which is the input to re-deriving that set for the
+	// container-scoped model. But every consumer of a plan gets told, in the
+	// same sentence UseExit would fail with, that applying it is refused.
+	Refusal string
 
 	platform exitPlatform
 	runner   PrivilegedRunner
@@ -218,6 +272,7 @@ func PlanUseExit(ctx context.Context, spec UseExitSpec) (*UseExitPlan, error) {
 		Exclusions:    exclusions,
 		Manageability: platform.manageability(exclusions.ControlPlaneHost),
 		Narration:     platform.planNarration(FirstMeshV4(peer.IPs)),
+		Refusal:       HostRouteScopeRefusal,
 		platform:      platform,
 		runner:        runner,
 	}, nil
@@ -268,6 +323,18 @@ type UseExitResult struct {
 // failed switch that has already been reverted is a normal, safe outcome, and
 // the caller still wants the evidence.
 func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitResult, error) {
+	// BEFORE the plan, and before anything is measured, armed or moved. This
+	// is the innermost of the layers that refuse this today — the /link verb,
+	// the CLI and the control plane each refuse earlier and with a better
+	// message for their own caller, but they are all reachable past, and a
+	// refusal that lives only in them is one a future caller walks around.
+	// Costing nothing (no DNS, no tailscale call, no probe) is the point: the
+	// cheapest possible answer to a request that must not be served.
+	if hostRouteScopeRefused {
+		progress.emit("error", HostRouteScopeRefusal)
+		return UseExitResult{Reason: HostRouteScopeRefusal}, ErrHostRouteScope
+	}
+
 	spec = spec.withDefaults()
 
 	plan, err := PlanUseExit(ctx, spec)

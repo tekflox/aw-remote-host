@@ -69,6 +69,14 @@ func runVPNUseExit(args []string) error {
 		if err != nil {
 			return err
 		}
+		// The preview survives the refusal — it changes nothing, and it is
+		// where the exclusion set this host would really install can be read
+		// while that set is being re-derived for container-scoped routing.
+		// It leads with the refusal so it cannot be mistaken for a go-ahead.
+		if resolved.Refusal != "" {
+			fmt.Printf("vpn: REFUSED — %s\n", resolved.Refusal)
+			fmt.Println("vpn: what follows is a read-only preview of the host-scoped behaviour that is refused; applying it is not possible.")
+		}
 		printPlanHeader(*resolved)
 		fmt.Printf("[plan] would arm a dead-man's switch for %s BEFORE changing anything, reverting with `tailscale set --exit-node=` if this run does not confirm egress\n", *deadman)
 		// The commands come from the platform rather than from this file, so
@@ -81,6 +89,14 @@ func runVPNUseExit(args []string) error {
 			fmt.Printf("[plan] would install the %s boot guard, so a restart clears the selection rather than coming back up on a gate nothing re-confirmed\n", vpn.BootGuardName())
 		}
 		return nil
+	}
+
+	// Refused here as well as inside UseExit, so the command exits on the
+	// sentence alone rather than printing it once as narration and again as
+	// the error. `--plan` above is deliberately still reachable, and
+	// `clear-exit` is untouched: the way off a gate must never refuse.
+	if vpn.HostScopeRefused() {
+		return fmt.Errorf("%s\n\nTo preview what this host WOULD do, without changing anything: aw-remote-host vpn use-exit %s --plan", vpn.HostRouteScopeRefusal, wanted)
 	}
 
 	_, err := vpn.UseExit(ctx, spec, printProgress)

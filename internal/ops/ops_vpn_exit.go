@@ -47,6 +47,12 @@ import (
 var (
 	useExit   = vpn.UseExit
 	clearExit = vpn.ClearExit
+	// hostScopeRefused is indirected for the same reason useExit is. The tests
+	// below cover this verb's argument handling, its eligibility refusals and
+	// its reply shape — all of which sit BENEATH the scope refusal and are
+	// exactly what the container-scoped verb will inherit. A test turns the
+	// refusal off to reach them; the refusal itself is asserted on its own.
+	hostScopeRefused = vpn.HostScopeRefused
 )
 
 // VPNUseExit routes this host — and every container on it — out through a
@@ -102,6 +108,31 @@ func (h *Handler) VPNUseExit(ctx context.Context, args map[string]any, emit Emit
 
 	elig := probeEligibility()
 	payload := eligibilityPayload(elig)
+
+	// THE SCOPE REFUSAL, ahead of the eligibility one because it does not
+	// depend on the host: this verb moves the whole machine's route and only
+	// the containers' egress was ever meant to move. A host that is perfectly
+	// capable of doing it is exactly the host this must refuse — the bare
+	// metal running production is both eligible and the worst possible
+	// target. See vpn.HostRouteScopeRefusal.
+	//
+	// It refuses `plan` too, unlike the CLI's --plan. A preview is only worth
+	// keeping where someone can read the exclusion set off it while working on
+	// the replacement, which is a local, deliberate act; over the tunnel the
+	// only consumer is a confirmation dialog, and answering one for an action
+	// that cannot be applied is how a screen offers a button that lies.
+	if hostScopeRefused() {
+		emit("warning", "vpn", "not selecting an exit gate — "+vpn.HostRouteScopeRefusal)
+		return map[string]any{
+			"eligibility": payload,
+			"applied":     false,
+			"changed":     false,
+			"refused":     true,
+			"refusal":     vpn.HostRouteScopeRefusal,
+			"scope":       "host",
+		}, nil
+	}
+
 	if refusal := exitSelectionRefusal(elig); refusal != "" {
 		emit("warning", "vpn", "not selecting an exit gate — "+refusal)
 		return map[string]any{

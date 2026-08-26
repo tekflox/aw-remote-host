@@ -39,6 +39,96 @@ func withClearExit(t *testing.T, fn func(context.Context, vpn.ClearExitSpec, vpn
 	t.Cleanup(func() { clearExit = prev })
 }
 
+// withHostScopeAllowed reaches past the scope refusal to the verb's own
+// argument handling and reply shape underneath it. Everything that plumbing
+// does is what the container-scoped verb will inherit, so it keeps being
+// tested while the refusal stands — the refusal itself is asserted by
+// TestHostScopedSelectionIsRefusedOnAHostThatCouldDoIt, which does NOT call
+// this.
+func withHostScopeAllowed(t *testing.T) {
+	t.Helper()
+	prev := hostScopeRefused
+	hostScopeRefused = func() bool { return false }
+	t.Cleanup(func() { hostScopeRefused = prev })
+}
+
+// THE SAFETY PROPERTY. Selecting a gate moves the whole machine's default
+// route when only the containers' egress was ever meant to move, so the verb
+// refuses — and it refuses a host that is entirely CAPABLE of doing it,
+// because capability was never the question. The bare metal running production
+// is the most capable target and the worst one.
+//
+// It refuses in the shape a screen can render (`refused` + a sentence, nil
+// error), not as a failure, and the sequence must not be reached at all.
+func TestHostScopedSelectionIsRefusedOnAHostThatCouldDoIt(t *testing.T) {
+	withVerdict(t, eligibleGateHost())
+	withUseExit(t, func(context.Context, vpn.UseExitSpec, vpn.Progress) (vpn.UseExitResult, error) {
+		t.Fatal("the sequence must never run while host-scoped routing is refused")
+		return vpn.UseExitResult{}, nil
+	})
+
+	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{ControlPlane: "https://api.aw.tekflox.com"}}
+	data, err := h.Dispatch(context.Background(), "vpn_use_exit", map[string]any{"node": "aw-lab"}, noopEmit)
+	if err != nil {
+		t.Fatalf("a refusal is a successful reply, not an error: %v", err)
+	}
+	out := data.(map[string]any)
+	if out["refused"] != true || out["applied"] != false || out["changed"] != false {
+		t.Fatalf("refused/applied/changed = %v/%v/%v", out["refused"], out["applied"], out["changed"])
+	}
+	if out["refusal"] != vpn.HostRouteScopeRefusal {
+		t.Fatalf("the refusal must carry the canonical sentence, got %v", out["refusal"])
+	}
+	if out["scope"] != "host" {
+		t.Fatalf("scope = %v — a caller has to be able to tell this apart from an eligibility refusal", out["scope"])
+	}
+}
+
+// `plan` is refused too, unlike the CLI's --plan. Over the tunnel the only
+// consumer is a confirmation dialog, and answering one for an action that
+// cannot be applied is how a screen ends up offering a button that lies.
+func TestPlanIsRefusedOverTheTunnelToo(t *testing.T) {
+	withVerdict(t, eligibleGateHost())
+
+	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{ControlPlane: "https://api.aw.tekflox.com"}}
+	data, err := h.Dispatch(context.Background(), "vpn_use_exit",
+		map[string]any{"node": "aw-lab", "plan": true}, noopEmit)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	out := data.(map[string]any)
+	if out["refused"] != true {
+		t.Fatalf("a plan must be refused as well: %v", out)
+	}
+	if out["plan"] == true {
+		t.Fatal("a refused request must not come back looking like a resolved plan")
+	}
+}
+
+// The way OFF a gate must never refuse — including for the hosts that took a
+// selection before the refusal landed, which are the whole reason it has to
+// keep working.
+func TestClearExitIsNotGatedByTheScopeRefusal(t *testing.T) {
+	withVerdict(t, eligibleGateHost())
+	called := false
+	withClearExit(t, func(context.Context, vpn.ClearExitSpec, vpn.Progress) (vpn.ClearExitResult, error) {
+		called = true
+		return vpn.ClearExitResult{Egress: "188.250.165.236", EgressVia: "ifconfig.me"}, nil
+	})
+
+	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{ControlPlane: "https://api.aw.tekflox.com"}}
+	data, err := h.Dispatch(context.Background(), "vpn_clear_exit", map[string]any{}, noopEmit)
+	if err != nil {
+		t.Fatalf("clear-exit must not refuse: %v", err)
+	}
+	if !called {
+		t.Fatal("the scope refusal must not reach the undo path")
+	}
+	if out := data.(map[string]any); out["cleared"] != true {
+		t.Fatalf("cleared = %v", out["cleared"])
+	}
+}
+
 // Same guarantee vpn_status and the firewall verbs carry: a lean-linked
 // laptop has no podman, and it is exactly the kind of machine someone wants
 // to route out through a gate.
@@ -57,6 +147,7 @@ func TestVPNExitVerbsAreNotWorkspaceLifecycleVerbs(t *testing.T) {
 // a human can act on, and would read to the control plane exactly like a host
 // that could not be reached at all.
 func TestUnconfirmedSwitchComesBackAsEvidenceNotAsAnError(t *testing.T) {
+	withHostScopeAllowed(t)
 	withVerdict(t, eligibleGateHost())
 	withUseExit(t, func(context.Context, vpn.UseExitSpec, vpn.Progress) (vpn.UseExitResult, error) {
 		return vpn.UseExitResult{
@@ -90,6 +181,7 @@ func TestUnconfirmedSwitchComesBackAsEvidenceNotAsAnError(t *testing.T) {
 // `applied` must track CONFIRMED egress, not "the tailscale call returned".
 // The interface being up has never been enough here.
 func TestAppliedTracksConfirmedEgress(t *testing.T) {
+	withHostScopeAllowed(t)
 	withVerdict(t, eligibleGateHost())
 	withUseExit(t, func(context.Context, vpn.UseExitSpec, vpn.Progress) (vpn.UseExitResult, error) {
 		return vpn.UseExitResult{
@@ -117,6 +209,7 @@ func TestAppliedTracksConfirmedEgress(t *testing.T) {
 // the same shape vpn_bootstrap uses, so a screen can tell "this machine is
 // not able to" apart from "this machine could not be asked".
 func TestIneligibleHostRefusesInsteadOfErroring(t *testing.T) {
+	withHostScopeAllowed(t)
 	e := eligibleGateHost()
 	e.CanSelectExit = false
 	e.SelectExitRefusal = "aw-remote-host is not running as root here and `sudo -n true` fails."
@@ -147,6 +240,7 @@ func TestIneligibleHostRefusesInsteadOfErroring(t *testing.T) {
 // missing. Mac.Home is the host that made the difference visible — see
 // vpn.resolveSelectExit.
 func TestDarwinHostIsAcceptedAsAGateClient(t *testing.T) {
+	withHostScopeAllowed(t)
 	e := eligibleGateHost()
 	e.Host.OS = "darwin"
 	// The Mac's real shape: it can never ENROL, because /opt/homebrew belongs
@@ -178,6 +272,7 @@ func TestDarwinHostIsAcceptedAsAGateClient(t *testing.T) {
 // to fill later: the workspace lives in the WSL2 distro, so moving the
 // Windows side's route would move the wrong operating system's.
 func TestWindowsHostIsRefusedTowardsItsWSLDistro(t *testing.T) {
+	withHostScopeAllowed(t)
 	e := eligibleGateHost()
 	e.Host.OS = "windows"
 	e.CanSelectExit, e.SelectExitRefusal = false, "This is the Windows side of the host. Run this in the distro instead."
@@ -195,6 +290,7 @@ func TestWindowsHostIsRefusedTowardsItsWSLDistro(t *testing.T) {
 // Naming no gate is a CALLER error, not a host refusal — the two have
 // different fixes and only one of them is about this machine.
 func TestMissingNodeIsAnError(t *testing.T) {
+	withHostScopeAllowed(t)
 	withVerdict(t, eligibleGateHost())
 	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{ControlPlane: "https://api.aw.tekflox.com"}}
 	if _, err := h.Dispatch(context.Background(), "vpn_use_exit", map[string]any{}, noopEmit); err == nil {
@@ -207,6 +303,7 @@ func TestMissingNodeIsAnError(t *testing.T) {
 // default to anything else — or to empty — would pin the wrong address
 // outside the tunnel.
 func TestControlPlaneDefaultsToTheOneThisDaemonAnswersTo(t *testing.T) {
+	withHostScopeAllowed(t)
 	withVerdict(t, eligibleGateHost())
 	var got vpn.UseExitSpec
 	withUseExit(t, func(_ context.Context, spec vpn.UseExitSpec, _ vpn.Progress) (vpn.UseExitResult, error) {
@@ -226,6 +323,7 @@ func TestControlPlaneDefaultsToTheOneThisDaemonAnswersTo(t *testing.T) {
 // The timeouts arrive as JSON numbers from a web UI. Omitted, they must land
 // on the proven pair, not on zero.
 func TestTimeoutArgsAreSecondsAndDefaultToTheProvenWindow(t *testing.T) {
+	withHostScopeAllowed(t)
 	withVerdict(t, eligibleGateHost())
 	var got vpn.UseExitSpec
 	withUseExit(t, func(_ context.Context, spec vpn.UseExitSpec, _ vpn.Progress) (vpn.UseExitResult, error) {
