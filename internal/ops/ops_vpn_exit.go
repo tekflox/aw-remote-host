@@ -285,3 +285,33 @@ func secondsArg(args map[string]any, key string, def time.Duration) time.Duratio
 	}
 	return def
 }
+
+// VPNPublicIP measures the address this host actually leaves the internet
+// from, right now. Read-only: it changes nothing and needs no privilege.
+//
+// It exists as its own verb rather than as a field on vpn_status because
+// vpn_status is asked of EVERY host in an account at once, in parallel, on
+// every render of the Networking screen — and this is an outbound HTTPS
+// request that takes up to 8s against a host whose network is broken, which
+// is exactly the host whose row is most interesting. Bolting it onto the
+// status fan-out would make the whole screen wait for the worst-behaved
+// machine on the account.
+//
+// The honesty contract is the monolith's `public_ip()` (agentic-workspace,
+// src/api/vpn_manager.py), and it is the reason this verb is worth having at
+// all: a lookup that fails returns {"ip": "", "error": "<why>"} and NEVER a
+// remembered address. A screen showing yesterday's egress IP as if it were
+// today's is worse than a screen showing none — this whole feature exists so
+// somebody can trust that number after flipping a route.
+//
+// vpn.PublicIP does the measuring, on a FRESH connection with keep-alives
+// disabled. That is not a detail: a pooled connection opened before the route
+// moved answers over the old path and reports a change that never happened,
+// which is the specific way this kind of check lies.
+func (h *Handler) VPNPublicIP(ctx context.Context) (map[string]any, error) {
+	egress, err := vpn.PublicIP(ctx)
+	if err != nil {
+		return map[string]any{"ip": "", "via": "", "error": err.Error()}, nil
+	}
+	return map[string]any{"ip": egress.IP, "via": egress.Via}, nil
+}

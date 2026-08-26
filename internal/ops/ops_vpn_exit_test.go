@@ -257,3 +257,26 @@ func TestClearExitSurfacesAnEgressItCouldNotMeasure(t *testing.T) {
 		t.Fatalf("out = %v", out)
 	}
 }
+
+// The monolith's public_ip() contract, which is the whole reason the top of
+// the Networking section can be trusted: a lookup that fails reports NO
+// address and says why. A remembered address rendered as the current one is
+// the exact lie this screen exists to avoid.
+func TestPublicIPNeverReturnsARememberedAddress(t *testing.T) {
+	h := &Handler{Runner: newFakeRunner()}
+	data, err := h.Dispatch(context.Background(), "vpn_public_ip", nil, noopEmit)
+	if err != nil {
+		t.Fatalf("a failed lookup is a successful reply: %v", err)
+	}
+	out := data.(map[string]any)
+	// Whatever the machine running `go test` can reach, the invariant holds:
+	// an address XOR an error, never a bare empty field passed off as fact.
+	ip, _ := out["ip"].(string)
+	errText, _ := out["error"].(string)
+	if ip == "" && errText == "" {
+		t.Fatal("an unmeasurable egress must carry the reason, not just an empty ip")
+	}
+	if ip != "" && errText != "" {
+		t.Fatalf("ip %q and error %q cannot both be set", ip, errText)
+	}
+}
