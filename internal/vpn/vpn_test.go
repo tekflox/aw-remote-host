@@ -59,18 +59,54 @@ func TestResolveLinuxRootIsFullyEligible(t *testing.T) {
 	}
 }
 
-func TestResolveWSLEnrolsButIsNotAnExitGate(t *testing.T) {
+// CHANGED 2026-08-26. This used to assert WSL2 could not be a gate at all.
+// That refusal was the wrong shape of answer: it is the only machine this
+// account has that could be a SECOND gate, "never measured" is not "does not
+// work", and refusing left the mesh's owner with no way to find out either.
+//
+// So WSL2 is now a warned yes, and the warning is the test — a permission
+// with no price attached would offer a relayed, doubly-NATed gate silently,
+// which is worse than either a plain yes or a plain no.
+func TestResolveWSLMayBeAGateAndSaysWhatThatCosts(t *testing.T) {
 	e := Resolve(surfaceWSL())
 	if !e.CanEnroll {
 		t.Fatalf("WSL2 with root should enrol: %s", e.EnrollRefusal)
 	}
-	// It is a fine client and a bad gate: its network is NATed a second time
-	// by the Windows host, and forwarding through that was never measured.
-	if e.CanAdvertiseExit {
-		t.Fatal("WSL2 must not be offered as an exit node")
+	if !e.CanAdvertiseExit {
+		t.Fatalf("WSL2 may serve as a gate: %s", e.ExitRefusal)
 	}
-	if !strings.Contains(e.ExitRefusal, "WSL2") {
-		t.Fatalf("exit refusal should say why: %q", e.ExitRefusal)
+	if e.ExitRefusal != "" {
+		t.Fatalf("an allowed host must carry no refusal, got %q", e.ExitRefusal)
+	}
+	if !strings.Contains(e.ExitWarning, "WSL2") {
+		t.Fatalf("the cost must be stated, and must say what it is: %q", e.ExitWarning)
+	}
+	// The two consequences the card demanded reach the user: everything
+	// leaves through the Windows host, and it cannot hole-punch so a public
+	// relay carries it.
+	if !strings.Contains(e.ExitWarning, "relay") {
+		t.Fatalf("the warning must name the relay — that is the part nobody would guess: %q", e.ExitWarning)
+	}
+	if !strings.Contains(e.Describe(), e.ExitWarning) {
+		t.Fatalf("`status` must print the price beside the permission, got %q", e.Describe())
+	}
+}
+
+// A host refused outright still has no warning: the two fields answer
+// different questions, and a refusal that also carried advice about relays
+// would read as a soft no.
+func TestResolveRefusalsCarryNoWarning(t *testing.T) {
+	for name, h := range map[string]Host{"darwin": macHome(), "windows": {OS: "windows"}} {
+		e := Resolve(h)
+		if e.CanAdvertiseExit {
+			t.Fatalf("%s must not be offered as a gate", name)
+		}
+		if e.ExitWarning != "" {
+			t.Fatalf("%s: refusal carried a warning too: %q", name, e.ExitWarning)
+		}
+		if e.ExitRefusal == "" {
+			t.Fatalf("%s: refused with no reason", name)
+		}
 	}
 }
 
@@ -191,7 +227,17 @@ func TestDescribeSaysWhichOfTheTwoVerdictsFailed(t *testing.T) {
 	if got := Resolve(bareMetal()).Describe(); !strings.Contains(got, "exit node") {
 		t.Fatalf("got %q", got)
 	}
-	if got := Resolve(surfaceWSL()).Describe(); !strings.Contains(got, "NOT eligible as an exit node") {
+	// The WSL2 host moved from the middle branch to the first one on
+	// 2026-08-26 — it is now eligible AND warned, which is a different
+	// sentence, not a softer version of the old one.
+	if got := Resolve(surfaceWSL()).Describe(); !strings.Contains(got, "can be advertised as an exit node") || !strings.Contains(got, "but ") {
+		t.Fatalf("got %q", got)
+	}
+	// The middle branch still exists and still says which verdict failed. A
+	// Linux host with no systemd cannot enrol, so it cannot be a gate either.
+	noSystemd := bareMetal()
+	noSystemd.HasSystemd = false
+	if got := Resolve(noSystemd).Describe(); !strings.Contains(got, "NOT eligible") {
 		t.Fatalf("got %q", got)
 	}
 	if got := Resolve(macHome()).Describe(); !strings.HasPrefix(got, "NOT eligible to enrol") {

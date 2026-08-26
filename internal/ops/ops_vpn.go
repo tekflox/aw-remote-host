@@ -82,6 +82,12 @@ func eligibilityPayload(e vpn.Eligibility) map[string]any {
 		"enroll_refusal":     e.EnrollRefusal,
 		"can_advertise_exit": e.CanAdvertiseExit,
 		"exit_refusal":       e.ExitRefusal,
+		// The third answer. `can_advertise_exit: true` with a non-empty
+		// warning is a host that MAY be a gate and costs something to choose
+		// — the WSL2 case. A screen that rendered only the boolean would
+		// offer it silently, which is how every byte of somebody's traffic
+		// ends up on a public relay without them being told.
+		"exit_warning": e.ExitWarning,
 		// The CLIENT-side verdict, and the one the gate picker on the
 		// Networking screen actually needs: "can this host be pointed at a
 		// gate". can_advertise_exit answers the opposite question and a

@@ -31,8 +31,14 @@ vpn_exit_eligible() {
     return 1
   fi
   if vpn_is_wsl; then
-    echo "vpn: this is a WSL2 distro. It can join the mesh, but its network is NATed again by the Windows host it runs inside, so traffic forwarded through it as an exit gate has not been validated and is not offered." >&2
-    return 1
+    # ALLOWED SINCE 2026-08-26, with the cost printed. This used to return 1,
+    # and internal/vpn's Resolve() has been changed in the same breath — the
+    # two must keep agreeing or the module never converges (see the header).
+    # The reason for the change is in Resolve()'s WSL branch: a refusal left
+    # the only machine that could be a second gate permanently out, on the
+    # grounds that it had not been measured.
+    echo "vpn: WARNING — this is a WSL2 distro. It can forward, but its network is NATed again by the Windows host it runs inside, so everything routed through it leaves via that machine's own connection, through a public relay rather than a direct path." >&2
+    return 0
   fi
   return 0
 }

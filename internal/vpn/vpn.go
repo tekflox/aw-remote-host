@@ -128,6 +128,18 @@ type Eligibility struct {
 	// gate. Strictly narrower than CanEnroll.
 	CanAdvertiseExit bool
 	ExitRefusal      string
+	// ExitWarning is the THIRD answer, and it exists because "may it" and
+	// "should it" are different questions that this type used to answer with
+	// one boolean. A WSL2 distro forwards perfectly well and forwards through
+	// another layer of Windows NAT it does not control — refusing it hides a
+	// real capability, and allowing it silently hides a real cost. So it is
+	// allowed, and the cost travels with the permission as a complete
+	// sentence the control plane shows before anyone commits to it.
+	//
+	// Empty when there is nothing to say. Non-empty with CanAdvertiseExit
+	// false is meaningless and never produced: an outright refusal already
+	// carries its own reason in ExitRefusal.
+	ExitWarning string
 	// CanSelectExit: this node can be pointed AT a gate — the client side,
 	// which is a different question from both of the above and is not implied
 	// by either.
@@ -202,10 +214,22 @@ func Resolve(h Host) Eligibility {
 		// degradation this package exists to avoid.
 		e.ExitRefusal = fmt.Sprintf("advertising an exit node needs IP forwarding enabled in the kernel, which this module only knows how to do on Linux — %s is untested and is deliberately not claimed.", h.OS)
 	case h.WSL:
-		// The Surface. It enrols fine and is a good client; as a gate it
-		// would forward through a second layer of Windows NAT it does not
-		// control, and nothing about that has been measured.
-		e.ExitRefusal = "this is a WSL2 distro. It can join the mesh, but its network is NATed again by the Windows host it runs inside, so traffic forwarded through it as an exit gate has not been validated and is not offered."
+		// The Surface. Until 2026-08-26 this was an outright refusal, on the
+		// grounds that forwarding through a second layer of Windows NAT had
+		// not been measured. That was the wrong shape of answer: it is the
+		// only machine the account has that could be a second gate, "not
+		// measured" is not the same as "does not work", and a refusal left
+		// the owner of the mesh with no way to find out either.
+		//
+		// So: allowed, with the cost stated. Everything routed through here
+		// leaves via the Windows host's NAT and then whatever connection that
+		// machine is on, and this node cannot hole-punch from behind that
+		// extra layer — its measured path on this mesh is DERP(mad), meaning
+		// a public relay carries every byte. Those are real performance and
+		// privacy consequences, not caveats, and they belong in front of the
+		// person choosing rather than in a commit message.
+		e.CanAdvertiseExit = true
+		e.ExitWarning = "this is a WSL2 distro. It can forward, but its network is NATed again by the Windows host it runs inside, so everything routed through it leaves via that machine's own connection — and from behind that extra layer this node cannot hole-punch, so peers reach it through a PUBLIC relay rather than directly. Choosing it sends every byte of the routed host's traffic through that relay and through this machine's home connection."
 	default:
 		e.CanAdvertiseExit = true
 	}
@@ -272,6 +296,11 @@ func systemdRefusal(wsl bool) string {
 // is a separate sentence rather than a clause folded into this one.
 func (e Eligibility) Describe() string {
 	switch {
+	case e.CanAdvertiseExit && e.ExitWarning != "":
+		// A permission and its price, never the permission alone. An operator
+		// reading `aw-remote-host status` on the Surface has to see the same
+		// sentence the Networking screen shows before offering it.
+		return "eligible (can join the mesh and can be advertised as an exit node) — but " + e.ExitWarning
 	case e.CanAdvertiseExit:
 		return "eligible (can join the mesh and can be advertised as an exit node)"
 	case e.CanEnroll:
