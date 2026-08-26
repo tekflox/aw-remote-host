@@ -249,3 +249,61 @@ func TestArmRefusesWithoutAbsolutePathsOrATimeout(t *testing.T) {
 		t.Fatal("expected a refusal without an absolute tailscale path")
 	}
 }
+
+// The race that made TestArmRecordsTheSwitchWhereStatusCanFindIt flaky in CI
+// (run 32950183747), asserted directly and repeatedly.
+//
+// A single arm/check pass is exactly what was already there, and it passed on
+// a re-run — the window between fork and exec is microseconds wide, so one
+// sample proves almost nothing. Repeating it is what turns "usually true" into
+// evidence, and it is cheap: each switch is killed immediately.
+//
+// What must hold after Arm returns is not "a process exists" but "the process
+// can be RECOGNISED as this switch". Disarm and Fired are both built on that,
+// and the second one is the dangerous reader: an unrecognised switch makes
+// `status` announce a revert that never happened.
+func TestArmReturnsOnlyOnceTheSwitchIsIdentifiable(t *testing.T) {
+	homeIn(t)
+	for i := 0; i < 25; i++ {
+		d, err := Arm(ArmSpec{
+			After:           90 * time.Second,
+			ExitNode:        "aw-baremetal",
+			TailscalePath:   "/bin/true",
+			ExclusionRevert: "/bin/false rule del priority 5260",
+		})
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if !processIsDeadman(d.PID) {
+			t.Fatalf("iteration %d: Arm returned before pid %d was identifiable — Disarm would refuse to kill it and Fired() would call it dead", i, d.PID)
+		}
+		if d.Fired() {
+			t.Fatalf("iteration %d: a freshly armed switch has not fired", i)
+		}
+		if _, err := Disarm(); err != nil {
+			t.Fatalf("iteration %d: disarm: %v", i, err)
+		}
+	}
+}
+
+// The refusal half. A host whose armed process can never be identified must
+// stop the sequence rather than let it move a route it cannot put back — so
+// the failure has to come out of Arm as an error, not as a warning next to a
+// usable Deadman.
+func TestArmRefusesWhenTheSwitchNeverBecomesIdentifiable(t *testing.T) {
+	homeIn(t)
+	prev := processIsDeadman
+	processIsDeadman = func(int) bool { return false }
+	t.Cleanup(func() { processIsDeadman = prev })
+
+	d, err := Arm(ArmSpec{After: 90 * time.Second, TailscalePath: "/bin/true"})
+	if err == nil {
+		t.Fatal("a switch nothing can identify cannot be stood down, and must not be reported as armed")
+	}
+	if d != nil {
+		t.Fatalf("no Deadman may be handed back on that path: %+v", d)
+	}
+	if !strings.Contains(err.Error(), "stand it down") {
+		t.Fatalf("the error must say what the consequence is: %q", err)
+	}
+}

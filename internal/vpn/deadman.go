@@ -43,6 +43,17 @@ import (
 // the one this file exists to prevent.
 const deadmanMarker = "aw-vpn-deadman"
 
+const (
+	// deadmanVisibleTimeout / deadmanVisiblePoll bound how long Arm waits for
+	// the switch it just started to become identifiable. Generous against the
+	// race it closes (a fork-to-exec window measured in microseconds) and
+	// still short enough that a host where the marker never appears is
+	// refused promptly rather than hanging a command that has not yet touched
+	// the route.
+	deadmanVisibleTimeout = 3 * time.Second
+	deadmanVisiblePoll    = 5 * time.Millisecond
+)
+
 // Deadman is the record of an armed switch, written to disk so that a later
 // invocation — or `status`, or a human — can see that a revert is pending and
 // when it will fire.
@@ -165,6 +176,32 @@ func Arm(spec ArmSpec) (*Deadman, error) {
 	if err := startDetached(cmd); err != nil {
 		return nil, fmt.Errorf("arm dead-man's switch: %w", err)
 	}
+	// Do not return until the switch is IDENTIFIABLE, not merely started.
+	//
+	// cmd.Start() returns once the child has been forked, which can be before
+	// it has exec'd the shell — and in that window the child's command line is
+	// still this process's own, so processIsDeadman answers false about a
+	// switch that is alive and about to arm. Both readers of that predicate
+	// then get the wrong answer, in opposite and equally unacceptable
+	// directions: Disarm() declines to kill a switch it cannot identify,
+	// leaving a revert to fire under a selection that was legitimately
+	// confirmed; and Deadman.Fired() reports that a revert ALREADY HAPPENED
+	// with nobody watching — this package inventing the exact alarming event
+	// it exists to report honestly.
+	//
+	// Found as a flaky CI failure (run 32950183747,
+	// TestArmRecordsTheSwitchWhereStatusCanFindIt: "a freshly armed switch has
+	// not fired") that passed on an unchanged re-run, which is the signature
+	// of a narrow race rather than a broken read.
+	//
+	// Waiting HERE is the fix, rather than retrying in the reader, because
+	// this is the only moment at which "not yet visible" is knowably different
+	// from "gone". Everywhere later the two are indistinguishable, and a
+	// reader that retried would be guessing.
+	if err := awaitDeadmanVisible(cmd.Process.Pid); err != nil {
+		_ = killGroup(cmd.Process.Pid)
+		return nil, err
+	}
 	// Deliberately never Wait()ed: this process is expected to outlive the
 	// command that started it. It is reaped by init once we exit.
 	now := time.Now().UTC()
@@ -183,6 +220,27 @@ func Arm(spec ArmSpec) (*Deadman, error) {
 		return nil, err
 	}
 	return d, nil
+}
+
+// awaitDeadmanVisible blocks until the just-started switch's own command line
+// carries the marker, or gives up.
+//
+// Giving up is a REFUSAL, not a warning, and Arm propagates it: UseExit does
+// not touch the default route when arming fails. A switch that nothing can
+// identify is a switch that nothing can stand down, so it would fire under a
+// working selection — strictly worse than never having armed one. Failing in
+// that direction is the whole bargain this file is built on.
+func awaitDeadmanVisible(pid int) error {
+	deadline := time.Now().Add(deadmanVisibleTimeout)
+	for {
+		if processIsDeadman(pid) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("started a dead-man's switch (pid %d) but its command line never carried the %q marker within %s, so nothing could identify it later to stand it down — refusing to rely on a switch that cannot be disarmed", pid, deadmanMarker, deadmanVisibleTimeout)
+		}
+		time.Sleep(deadmanVisiblePoll)
+	}
 }
 
 // LoadDeadman reads the recorded switch, returning nil when none is armed.
@@ -267,7 +325,7 @@ func Disarm() (bool, error) {
 // down and fired minutes later under a selection that had been confirmed,
 // reverting a working gate with nobody watching. `ps -o command=` is the
 // portable read of the same fact.
-func processIsDeadman(pid int) bool {
+var processIsDeadman = func(pid int) bool {
 	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
 		return strings.Contains(string(data), deadmanMarker)
 	}
