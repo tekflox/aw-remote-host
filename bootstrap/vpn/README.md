@@ -10,6 +10,19 @@ optionally offering it as an exit gate — and, since phase 2, selecting one.
 | **`aw-remote-host vpn use-exit <node>`** | **yes** — see "Selecting an exit gate" |
 | `aw-remote-host vpn clear-exit` | yes, back to normal |
 
+Each of the two route-changing commands also has a `/link` verb, so the same
+thing can be asked for from the Networking screen instead of over SSH:
+`vpn_use_exit` and `vpn_clear_exit` (`internal/ops/ops_vpn_exit.go`), beside
+the read-only `vpn_status` and the enrolment-only `vpn_bootstrap`. They call
+**the same `internal/vpn.UseExit`** the command does — the ordering below is
+the safety mechanism, and a second copy of it reachable only from the control
+plane would be the copy nobody exercises by hand.
+
+That a verb can arrive over the very tunnel it is about to put at risk is the
+obvious objection, and the answer is the ordering: the dead-man's switch is
+armed *before* the route moves, so a caller who never hears back still gets
+the host back.
+
 This module is **opt-in** (`"optional": true` in `bootstrap/manifest.json`).
 A plain `bootstrap-workspace --with-workspace` never runs it: joining a
 network is a decision the machine's owner makes, not a side effect of

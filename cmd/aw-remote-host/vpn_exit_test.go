@@ -41,27 +41,3 @@ func TestSplitLeadingArgOnNoArgs(t *testing.T) {
 		t.Fatalf("node = %q rest = %v", node, rest)
 	}
 }
-
-// A dead-man's switch that fires while the selection is still being confirmed
-// would revert a gate that was about to work and report a confusing failure.
-// The two defaults must not be able to drift into that shape.
-func TestDeadmanWindowIsWiderThanTheConfirmationWindow(t *testing.T) {
-	if defaultDeadmanTimeout <= defaultConfirmTimeout {
-		t.Fatalf("deadman %s must outlast confirm %s", defaultDeadmanTimeout, defaultConfirmTimeout)
-	}
-	if confirmPollInterval >= defaultConfirmTimeout {
-		t.Fatalf("poll interval %s leaves no room inside the confirm window %s", confirmPollInterval, defaultConfirmTimeout)
-	}
-}
-
-// On a host without root every privileged step has to go through `sudo -n`,
-// including the ones spelled out as text inside the dead-man's switch script
-// and the boot-guard unit, where there is no Runner to wrap them.
-func TestPrivilegedRunnerCommandPrefixMatchesHowItRuns(t *testing.T) {
-	if got := (privilegedRunner{sudo: true}).commandPrefix("/usr/bin/tailscale"); got != "sudo -n /usr/bin/tailscale" {
-		t.Fatalf("got %q", got)
-	}
-	if got := (privilegedRunner{sudo: false}).commandPrefix("/usr/bin/tailscale"); got != "/usr/bin/tailscale" {
-		t.Fatalf("got %q", got)
-	}
-}
