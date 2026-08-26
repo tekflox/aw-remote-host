@@ -194,7 +194,7 @@ func TestDescribeSaysWhichOfTheTwoVerdictsFailed(t *testing.T) {
 	if got := Resolve(surfaceWSL()).Describe(); !strings.Contains(got, "NOT eligible as an exit node") {
 		t.Fatalf("got %q", got)
 	}
-	if got := Resolve(macHome()).Describe(); !strings.HasPrefix(got, "NOT eligible") {
+	if got := Resolve(macHome()).Describe(); !strings.HasPrefix(got, "NOT eligible to enrol") {
 		t.Fatalf("got %q", got)
 	}
 }

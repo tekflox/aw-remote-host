@@ -128,6 +128,20 @@ type Eligibility struct {
 	// gate. Strictly narrower than CanEnroll.
 	CanAdvertiseExit bool
 	ExitRefusal      string
+	// CanSelectExit: this node can be pointed AT a gate — the client side,
+	// which is a different question from both of the above and is not implied
+	// by either.
+	//
+	// Enrolment asks "could tailscale be installed and joined from here";
+	// selecting asks "can this node, already on the mesh, have its default
+	// route moved". Mac.Home is the case that forced the split: /opt/homebrew
+	// belongs to another account, so CanEnroll is false and stays false, yet
+	// tailscale is installed, tailscaled runs as a root LaunchDaemon and the
+	// machine can select a gate perfectly well. Reusing CanEnroll there would
+	// have refused it for the brew reason and sent its owner to fix the wrong
+	// thing.
+	CanSelectExit     bool
+	SelectExitRefusal string
 	// Installer is how install.sh would get tailscale here, when CanEnroll.
 	Installer string
 }
@@ -196,7 +210,49 @@ func Resolve(h Host) Eligibility {
 		e.CanAdvertiseExit = true
 	}
 
+	e.CanSelectExit, e.SelectExitRefusal = resolveSelectExit(h)
 	return e
+}
+
+// resolveSelectExit is the client-side verdict: may this node's own default
+// route be moved onto somebody else's gate?
+//
+// What each platform needs is genuinely different, and the difference is the
+// whole reason darwin can be supported at all:
+//
+//   - Linux does the route surgery itself — `ip rule` exclusions plus
+//     `tailscale set` — and both need root. No root, no selection.
+//   - macOS does none. tailscaled runs as a root LaunchDaemon and owns the
+//     utun, so the only thing this module does is write a preference, and the
+//     right to write it is granted per-user by `tailscale set --operator=`.
+//     That grant is invisible to uid and to `sudo -n`, which is exactly why
+//     it is NOT decided here: this function answers the static half, and
+//     darwinExit.preflight probes the live half before anything moves.
+//   - Windows enrols through its WSL2 distro, so the Windows side selecting a
+//     gate would move the route of the wrong operating system.
+//
+// Every path needs tailscale to already be here, and that is checked first:
+// "enrol it first" is a more useful sentence than any of the ones below.
+func resolveSelectExit(h Host) (bool, string) {
+	if h.TailscalePath == "" {
+		return false, "tailscale is not installed on this host, so there is no mesh to route through — enrol it first."
+	}
+	switch h.OS {
+	case "linux":
+		if !h.Privileged() {
+			return false, "aw-remote-host is not running as root here and `sudo -n true` fails. Selecting a gate on Linux moves the default route and installs `ip rule` exclusions to keep the management path outside the tunnel, and both need root — without them the route would move with nothing holding the control plane out, which is the lockout this command exists to prevent. Re-run aw-remote-host as root, or add a NOPASSWD sudoers entry for this user."
+		}
+		return true, ""
+	case "darwin":
+		// No privilege condition on purpose. See the doc comment: on macOS
+		// the right to change this is a tailscale grant, not a uid, and
+		// refusing here on uid would refuse a Mac that works.
+		return true, ""
+	case "windows":
+		return false, "This is the Windows side of the host. aw-remote-host runs the workspace inside its WSL2 distro, and it is that distro whose default route would need to move — selecting a gate from out here would route the wrong operating system. Run this in the distro instead."
+	default:
+		return false, fmt.Sprintf("%s has no exit-gate implementation in this module — only linux and darwin can select a gate.", h.OS)
+	}
 }
 
 func systemdRefusal(wsl bool) string {
@@ -206,7 +262,14 @@ func systemdRefusal(wsl bool) string {
 	return "/run/systemd/system does not exist, so systemd is not managing this host and this module has no other way to keep tailscaled running across reboots."
 }
 
-// Describe renders an eligibility verdict for a status line or a log.
+// Describe renders the ENROLMENT-side verdict for a status line or a log:
+// can this host join the mesh, and can it offer itself as a gate.
+//
+// It deliberately says nothing about selecting one. That is a third verdict
+// which disagrees with this one on exactly the machine it matters for —
+// Mac.Home reads "NOT eligible" here, because its Homebrew prefix belongs to
+// another account, and can still be pointed at a gate — so DescribeSelectExit
+// is a separate sentence rather than a clause folded into this one.
 func (e Eligibility) Describe() string {
 	switch {
 	case e.CanAdvertiseExit:
@@ -214,8 +277,17 @@ func (e Eligibility) Describe() string {
 	case e.CanEnroll:
 		return "eligible to join the mesh, NOT eligible as an exit node — " + e.ExitRefusal
 	default:
-		return "NOT eligible — " + e.EnrollRefusal
+		return "NOT eligible to enrol — " + e.EnrollRefusal
 	}
+}
+
+// DescribeSelectExit renders the CLIENT-side verdict: can this host's own
+// default route be moved onto somebody else's gate.
+func (e Eligibility) DescribeSelectExit() string {
+	if e.CanSelectExit {
+		return "CAN select an exit gate (as a client of one — a separate question from enrolling and from offering one)"
+	}
+	return "CANNOT select an exit gate — " + e.SelectExitRefusal
 }
 
 // Probe reads this machine's facts. Everything it touches is read-only: it

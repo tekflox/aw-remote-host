@@ -34,7 +34,6 @@ package vpn
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -148,12 +147,17 @@ type UseExitPlan struct {
 	Gate        Peer
 	GateIP      string
 	Exclusions  ExclusionPlan
-	// IPPath is the absolute path to `ip`, resolved now because the
-	// dead-man's switch has to bake it into a shell script that runs when
-	// the network is broken.
-	IPPath string
+	// Manageability is a written warning when the management path is NOT
+	// pinned outside the tunnel, and "" when it is. On darwin it is always
+	// set — see darwinExit.planExclusions. A caller that ignores it reports
+	// the Linux guarantee on a machine that does not have it.
+	Manageability string
+	// Narration is what --plan should print for the commands this platform
+	// would really run, so the preview cannot drift from the implementation.
+	Narration []string
 
-	runner PrivilegedRunner
+	platform exitPlatform
+	runner   PrivilegedRunner
 }
 
 // PlanUseExit resolves the gate and the exclusions, and refuses anything this
@@ -174,19 +178,20 @@ func PlanUseExit(ctx context.Context, spec UseExitSpec) (*UseExitPlan, error) {
 	}
 
 	elig := Resolve(Probe())
-	if !elig.CanEnroll {
-		return nil, fmt.Errorf("this host cannot select an exit node: %s", elig.EnrollRefusal)
-	}
-	if elig.Host.OS != "linux" {
-		return nil, fmt.Errorf("selecting an exit node changes this machine's default route, and the route exclusions that keep it manageable while that is true are implemented with `ip rule`, which is Linux-only. %s is deliberately not claimed rather than half-supported", elig.Host.OS)
-	}
-	if elig.Host.TailscalePath == "" {
-		return nil, fmt.Errorf("tailscale is not installed on this host — enrol it first")
+	if !elig.CanSelectExit {
+		return nil, fmt.Errorf("this host cannot select an exit node: %s", elig.SelectExitRefusal)
 	}
 
-	ipPath, err := exec.LookPath("ip")
+	platform, err := platformFor(elig.Host)
 	if err != nil {
-		return nil, fmt.Errorf("`ip` is not on PATH, and the route exclusions cannot be installed without it: %w", err)
+		return nil, err
+	}
+	// The live half of the privilege question, and the last refusal that is
+	// free: everything after this point is either a read of the mesh or a
+	// change to the machine.
+	runner, err := platform.preflight(ctx, elig.Host, spec.Runner)
+	if err != nil {
+		return nil, err
 	}
 
 	status, err := FetchStatus(ctx, spec.Runner)
@@ -201,18 +206,20 @@ func PlanUseExit(ctx context.Context, spec UseExitSpec) (*UseExitPlan, error) {
 		return nil, err
 	}
 
-	exclusions, err := PlanExclusions(spec.ControlPlane, LocalPrefixes(), spec.Exclude, DefaultResolver)
+	exclusions, err := platform.planExclusions(spec.ControlPlane, spec.Exclude, DefaultResolver)
 	if err != nil {
 		return nil, err
 	}
 
 	return &UseExitPlan{
-		Eligibility: elig,
-		Gate:        peer,
-		GateIP:      FirstMeshV4(peer.IPs),
-		Exclusions:  exclusions,
-		IPPath:      ipPath,
-		runner:      PrivilegedRunner{Inner: spec.Runner, Sudo: elig.Host.UID != 0},
+		Eligibility:   elig,
+		Gate:          peer,
+		GateIP:        FirstMeshV4(peer.IPs),
+		Exclusions:    exclusions,
+		Manageability: platform.manageability(exclusions.ControlPlaneHost),
+		Narration:     platform.planNarration(FirstMeshV4(peer.IPs)),
+		platform:      platform,
+		runner:        runner,
 	}, nil
 }
 
@@ -238,6 +245,12 @@ type UseExitResult struct {
 	Confirmed bool   `json:"confirmed"`
 	Reverted  bool   `json:"reverted"`
 	Reason    string `json:"reason,omitempty"`
+	// Manageability is UseExitPlan.Manageability, carried out to the caller.
+	// Empty means the management path IS pinned outside the tunnel; a
+	// sentence means it is not, and why. It rides on the result rather than
+	// only on the progress stream because a control plane that stores this
+	// reply is the reader most likely to have missed the narration.
+	Manageability string `json:"manageability,omitempty"`
 
 	DeadmanExpiresAt string `json:"deadman_expires_at,omitempty"`
 	// DeadmanStillArmed is true when the switch was deliberately left armed
@@ -262,17 +275,23 @@ func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitR
 		return UseExitResult{}, err
 	}
 	res := UseExitResult{
-		Gate:       plan.Gate.Name,
-		GateIP:     plan.GateIP,
-		Exclusions: plan.Exclusions.Exclusions,
-		Expected:   spec.ExpectEgress,
+		Gate:          plan.Gate.Name,
+		GateIP:        plan.GateIP,
+		Exclusions:    plan.Exclusions.Exclusions,
+		Expected:      spec.ExpectEgress,
+		Manageability: plan.Manageability,
 	}
 	runner := plan.runner
 
 	progress.emit("info", "exit gate %s (%s), path %s", plan.Gate.Name, plan.GateIP, plan.Gate.PathDescription())
-	progress.emit("info", "these prefixes stay OUTSIDE the tunnel:")
-	for _, e := range plan.Exclusions.Exclusions {
-		progress.emit("info", fmt.Sprintf("  %-20s %s", e.Prefix, e.Reason))
+	if len(plan.Exclusions.Exclusions) > 0 {
+		progress.emit("info", "these prefixes stay OUTSIDE the tunnel:")
+		for _, e := range plan.Exclusions.Exclusions {
+			progress.emit("info", fmt.Sprintf("  %-20s %s", e.Prefix, e.Reason))
+		}
+	}
+	if plan.Manageability != "" {
+		progress.emit("warning", plan.Manageability)
 	}
 
 	// Baseline. Without it there is nothing to compare against, so a switch
@@ -291,10 +310,10 @@ func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitR
 	// ARM FIRST. Everything below this line can fail, hang, or be killed, and
 	// the route still comes back.
 	armed, err := Arm(ArmSpec{
-		After:         spec.Deadman,
-		ExitNode:      plan.Gate.Name,
-		TailscalePath: runner.CommandPrefix(plan.Eligibility.Host.TailscalePath),
-		IPPath:        runner.CommandPrefix(plan.IPPath),
+		After:           spec.Deadman,
+		ExitNode:        plan.Gate.Name,
+		TailscalePath:   runner.CommandPrefix(plan.Eligibility.Host.TailscalePath),
+		ExclusionRevert: plan.platform.revertExclusionsScript(runner),
 	})
 	if err != nil {
 		return res, fmt.Errorf("refusing to touch the default route because the dead-man's switch could not be armed: %w", err)
@@ -302,17 +321,17 @@ func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitR
 	res.DeadmanExpiresAt = armed.ExpiresAt
 	progress.emit("info", "dead-man's switch ARMED (pid %d) — this selection reverts itself at %s unless this run confirms it", armed.PID, armed.ExpiresAt)
 
-	if err := ApplyExclusions(ctx, runner, plan.Exclusions.Exclusions); err != nil {
-		res.Reverted, res.DeadmanStillArmed = revertAfterFailure(ctx, runner, "the route exclusions could not be installed", progress)
+	if err := plan.platform.applyExclusions(ctx, runner, plan.Exclusions.Exclusions); err != nil {
+		res.Reverted, res.DeadmanStillArmed = revertAfterFailure(ctx, runner, plan.platform, "the route exclusions could not be installed", progress)
 		return res, err
 	}
 	if err := SetExitNode(ctx, runner, plan.GateIP); err != nil {
-		res.Reverted, res.DeadmanStillArmed = revertAfterFailure(ctx, runner, "the exit node could not be selected", progress)
+		res.Reverted, res.DeadmanStillArmed = revertAfterFailure(ctx, runner, plan.platform, "the exit node could not be selected", progress)
 		return res, err
 	}
 	progress.emit("info", "default route now points at %s — confirming egress (up to %s)...", plan.Gate.Name, spec.ConfirmTimeout)
 
-	confirm := confirmWithRetries(ctx, runner, res.EgressBefore, spec.ExpectEgress, spec.ControlPlane, spec.ConfirmTimeout, progress)
+	confirm := confirmWithRetries(ctx, runner, plan.platform, res.EgressBefore, spec.ExpectEgress, spec.ControlPlane, spec.ConfirmTimeout, progress)
 	res.EgressAfter = confirm.Observed
 	res.EgressAfterVia = confirm.ObservedVia
 	res.DefaultDevice = confirm.DefaultDevice
@@ -325,7 +344,7 @@ func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitR
 
 	if !confirm.OK {
 		progress.emit("warning", "REVERTING — an exit node that cannot be confirmed is the failure this command exists to prevent, not a partial success.")
-		if err := revert(ctx, runner, progress); err != nil {
+		if err := revert(ctx, runner, plan.platform, progress); err != nil {
 			res.DeadmanStillArmed = true
 			progress.emit("error", "the revert itself FAILED (%v). The dead-man's switch is still armed and fires at %s; leaving it armed on purpose.", err, armed.ExpiresAt)
 			return res, fmt.Errorf("exit node %s could not be confirmed and the revert failed: %s", plan.Gate.Name, confirm.Reason)
@@ -350,17 +369,17 @@ func UseExit(ctx context.Context, spec UseExitSpec, progress Progress) (UseExitR
 
 	if spec.PersistAcrossReboot {
 		res.BootGuard = "skipped"
-		progress.emit("warning", "persist-across-reboot: the %s boot guard was NOT installed. A tailscale exit-node selection survives a reboot but `ip rule` exclusions do NOT, so if this machine reboots it comes back with its default route on the mesh and NOTHING keeping %s outside it.",
-			BootGuardUnit, plan.Exclusions.ControlPlaneHost)
-		if err := RemoveBootGuard(ctx, runner); err != nil {
+		progress.emit("warning", "persist-across-reboot: the %s boot guard was NOT installed. A tailscale exit-node selection survives a reboot, but nothing re-confirms it on the way back up, so this machine can come back with its default route on a gate that has since stopped forwarding and with %s inside the tunnel.",
+			plan.platform.bootGuardName(), plan.Exclusions.ControlPlaneHost)
+		if err := plan.platform.removeBootGuard(ctx, runner); err != nil {
 			progress.emit("warning", "could not remove a previously installed boot guard: %v", err)
 		}
-	} else if err := InstallBootGuard(ctx, runner, plan.Eligibility.Host.TailscalePath, plan.IPPath); err != nil {
+	} else if err := plan.platform.installBootGuard(ctx, runner, plan.Eligibility.Host.TailscalePath); err != nil {
 		res.BootGuard = "failed: " + err.Error()
-		progress.emit("warning", "the selection is live but the boot guard could not be installed (%v). A reboot would come back with the route moved and no exclusions; clear the exit gate before rebooting this host.", err)
+		progress.emit("warning", "the selection is live but the boot guard could not be installed (%v). A reboot would come back with the route still moved and nothing having re-confirmed it; clear the exit gate before rebooting this host.", err)
 	} else {
 		res.BootGuard = "installed"
-		progress.emit("info", "boot guard %s installed — a reboot clears this selection, which is deliberate: the exclusions do not survive a reboot, so the selection must not either.", BootGuardUnit)
+		progress.emit("info", "boot guard %s installed — a restart clears this selection, which is deliberate: a reboot has to stay a way out of a gate that stopped forwarding.", plan.platform.bootGuardName())
 	}
 
 	return res, saveExitState(plan.Gate.Name, plan.GateIP, plan.Exclusions)
@@ -395,7 +414,16 @@ func ClearExit(ctx context.Context, spec ClearExitSpec, progress Progress) (Clea
 	if host.TailscalePath == "" {
 		return res, fmt.Errorf("tailscale is not installed on this host, so there is no exit-node selection to clear")
 	}
-	runner := PrivilegedRunner{Inner: spec.Runner, Sudo: host.UID != 0}
+	platform, err := platformFor(host)
+	if err != nil {
+		return res, err
+	}
+	// The undo path deliberately does NOT run platform.preflight. Preflight
+	// refuses a machine that may not write preferences, and refusing here
+	// would mean the one command that puts the route back is the one that
+	// declines to run — the failure would surface as an error from
+	// SetExitNode instead, which is where it belongs.
+	runner := PrivilegedRunner{Inner: spec.Runner, Sudo: host.OS != "darwin" && host.UID != 0}
 
 	// Stand the switch down first. Clearing the exit node is the same action
 	// the switch would take, so leaving it armed would only mean a redundant
@@ -407,12 +435,12 @@ func ClearExit(ctx context.Context, spec ClearExitSpec, progress Progress) (Clea
 		progress.emit("info", "dead-man's switch stood down")
 	}
 
-	removed, err := revertCounting(ctx, runner, progress)
+	removed, err := revertCounting(ctx, runner, platform, progress)
 	res.ExclusionsRemoved = removed
 	if err != nil {
 		return res, err
 	}
-	if err := RemoveBootGuard(ctx, runner); err != nil {
+	if err := platform.removeBootGuard(ctx, runner); err != nil {
 		progress.emit("warning", "could not remove the boot guard: %v", err)
 	}
 
@@ -434,16 +462,16 @@ func ClearExit(ctx context.Context, spec ClearExitSpec, progress Progress) (Clea
 // Order matters — clear the selection first, so that if removing the
 // exclusions fails the machine is already off the tunnel rather than on it
 // with half its pins gone.
-func revert(ctx context.Context, r Runner, progress Progress) error {
-	_, err := revertCounting(ctx, r, progress)
+func revert(ctx context.Context, r Runner, plat exitPlatform, progress Progress) error {
+	_, err := revertCounting(ctx, r, plat, progress)
 	return err
 }
 
-func revertCounting(ctx context.Context, r Runner, progress Progress) (int, error) {
+func revertCounting(ctx context.Context, r Runner, plat exitPlatform, progress Progress) (int, error) {
 	if err := SetExitNode(ctx, r, ""); err != nil {
 		return 0, fmt.Errorf("clear the exit-node selection: %w", err)
 	}
-	removed, err := ClearExclusions(ctx, r)
+	removed, err := plat.clearExclusions(ctx, r)
 	if err != nil {
 		return removed, fmt.Errorf("remove the route exclusions: %w", err)
 	}
@@ -460,9 +488,9 @@ func revertCounting(ctx context.Context, r Runner, progress Progress) (int, erro
 //
 // Returns (reverted, deadmanStillArmed) so the caller can report both rather
 // than only printing them.
-func revertAfterFailure(ctx context.Context, r Runner, what string, progress Progress) (bool, bool) {
+func revertAfterFailure(ctx context.Context, r Runner, plat exitPlatform, what string, progress Progress) (bool, bool) {
 	progress.emit("warning", "%s — undoing what was already applied", what)
-	if err := revert(ctx, r, progress); err != nil {
+	if err := revert(ctx, r, plat, progress); err != nil {
 		progress.emit("error", "the cleanup failed too (%v). The dead-man's switch is still armed and will finish the job; NOT standing it down.", err)
 		return false, true
 	}
@@ -478,11 +506,11 @@ func revertAfterFailure(ctx context.Context, r Runner, what string, progress Pro
 // install the route and the first packets have to find their way through DERP
 // or a direct path that may not be up yet. Retrying is not optimism — a
 // failure here reverts, so a false negative costs a working feature.
-func confirmWithRetries(ctx context.Context, r Runner, baseline, expected, controlPlane string, timeout time.Duration, progress Progress) ConfirmResult {
+func confirmWithRetries(ctx context.Context, r Runner, plat exitPlatform, baseline, expected, controlPlane string, timeout time.Duration, progress Progress) ConfirmResult {
 	deadline := time.Now().Add(timeout)
 	var last ConfirmResult
 	for attempt := 1; ; attempt++ {
-		last = ConfirmEgress(ctx, r, baseline, expected, controlPlane)
+		last = confirmEgress(ctx, r, plat, baseline, expected, controlPlane)
 		if last.OK || time.Now().After(deadline) {
 			return last
 		}

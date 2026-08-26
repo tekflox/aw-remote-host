@@ -106,7 +106,7 @@ The real work of this module is `internal/vpn`'s probe, in the spirit of
 |---|---|
 | Linux + root (`aw-baremetal`, uid 0, `/dev/net/tun`, systemd) | joins, and may advertise as exit node |
 | WSL2 + root (`aw-surface-wsl`, uid 0, passwordless sudo, systemd on) | joins; **refused as an exit gate** — its network is NATed again by the Windows host, and forwarding through that has not been validated |
-| macOS without sudo (`Mac.Home`, uid 503) | **refused entirely** — `sudo -n` fails so `tailscaled install-system-daemon` cannot run, and `/opt/homebrew` belongs to another account so `brew install` fails on permissions |
+| macOS without sudo (`Mac.Home`, uid 503) | **refused for ENROLMENT** — `sudo -n` fails so `tailscaled install-system-daemon` cannot run, and `/opt/homebrew` belongs to another account so `brew install` fails on permissions. It can still **select** a gate; that is a third verdict — see "A Mac as a client" |
 
 The macOS refusal is the one that matters most, because the failure it
 prevents is silent. Without root, tailscaled can still start with
@@ -137,7 +137,8 @@ the easy part.
    Every later failure — a gate that does not forward, a confirmation that
    hangs, this process being `kill -9`ed — still ends with the route back.
    It is the **tool's** job, never the caller's.
-3. **Pin the exclusions**, control plane first.
+3. **Pin the exclusions**, control plane first. (On macOS there are none to
+   pin, and that is measured rather than skipped — see "A Mac as a client".)
 4. **Move the route** — `tailscale set --exit-node=<ip>
    --exit-node-allow-lan-access=true --accept-dns=false`.
 5. **Confirm through the new route**: fetch the real public IP, and check the
@@ -152,7 +153,8 @@ the easy part.
 | every directly attached IPv4 network | that is the LAN prefix (`internal/lanfastpath` depends on it) *and* every podman/docker bridge, in one sweep that cannot drift as new bridges appear |
 | whatever `--exclude` names | the things only the operator knows: a NAS on a routed subnet, a jump host |
 
-They are installed as `ip rule add to <prefix> lookup main priority 5260`.
+On Linux they are installed as `ip rule add to <prefix> lookup main priority
+5260`.
 Two details carry the whole safety property:
 
 - **5260 beats tailscale's catch-all at 5270.** Measured on `aw-baremetal`,
@@ -209,8 +211,78 @@ probably should not.
   sweep runs once. Re-run `use-exit` after adding a network.
 - **IPv4 only.** The exclusions and the default-route move are both IPv4;
   IPv6 is not claimed rather than half-supported.
-- **Linux only**, for the same reason phase 1 refuses exit-node advertising
-  off Linux: `ip rule` is where the safety lives.
+- **Linux and macOS.** Windows is refused towards its WSL2 distro: the
+  workspace runs in there, so moving the Windows side's route would move the
+  wrong operating system's.
+
+### A Mac as a client
+
+A Mac can **select** a gate. It still cannot **offer** one — forwarding needs
+IP forwarding enabled with a sysctl nobody here has exercised on real
+hardware, so it stays deliberately unclaimed.
+
+"Can enrol" and "can select" are separate verdicts (`CanEnroll` /
+`CanSelectExit` in `internal/vpn`), and on `Mac.Home` they disagree: it can
+never enrol, because `/opt/homebrew` belongs to another account, and it can
+select perfectly well, because tailscale is already installed there and
+tailscaled runs as a root LaunchDaemon. Deciding the second with the first's
+answer sent the machine's owner off to fix Homebrew, which would have changed
+nothing.
+
+**No route surgery, and that is the finding rather than a gap.** Measured on
+`Mac.Home` (Darwin 25.5.0, arm64, tailscale 1.102.3) on 2026-08-26:
+
+- tailscaled owns the utun and installs the split default itself. There is no
+  `ip rule`, no table 52, and nothing for this module to route by hand.
+- The LAN half of the exclusions is native —
+  `--exit-node-allow-lan-access=true`, which the selection passes anyway, and
+  which tailscaled tears down together with the selection that justified it.
+  An exclusion that cannot outlive its justification.
+- The only macOS mechanism for holding one address outside the tunnel is a
+  static host route, `route -n add -host <ip> <gateway>`. It names a gateway,
+  so it is the exact inverse of the inert `ip rule` above: a laptop that
+  leaves that network comes back with a **black hole** for precisely the
+  address the exclusion existed to protect, and a laptop is the one machine
+  that changes networks every day. Not implemented, on purpose.
+
+So on macOS the control plane's reachability is **confirmed rather than
+pinned**: step 5 proves it still answers through the gate and reverts if it
+does not. Its address is still resolved at plan time and an unresolvable one
+is still a refusal — confirming a thing requires knowing where it is. What
+this does not cover is the gate breaking *later*; then the Mac loses its
+internet and its `/link` tunnel together, and the way back is `clear-exit`
+from that keyboard or a restart. The result and the `vpn_use_exit` reply both
+carry a `manageability` sentence saying so, so a screen cannot report the
+Linux guarantee on a Mac. `--exclude` is **refused** there rather than
+ignored: silently dropping it would tell an operator a prefix is outside the
+tunnel when nothing is holding it there.
+
+**The one privilege it does need, once.** tailscaled on macOS runs as a root
+LaunchDaemon and gates every preference write on the calling user, so
+`tailscale set` from an ordinary account answers `Access denied: checkprefs
+access denied`. The fix is tailscale's own, and it is a one-time action by an
+administrator of that Mac:
+
+```
+sudo tailscale set --operator=<user>
+```
+
+After that no further privilege is needed to select a gate from there.
+Because the grant is invisible to `uid` and to `sudo -n`, the check is a
+**live probe** and not a guess: `PlanUseExit` issues
+`tailscale set --accept-dns=false` — a write that changes nothing, since that
+flag is passed on every selection anyway and MagicDNS is forced off at
+enrolment — and refuses with the command above if it is denied. It runs
+*before* the dead-man's switch is armed, so a Mac without the grant is
+refused rather than half-applied.
+
+**The boot guard is a LaunchAgent there**,
+`~/Library/LaunchAgents/com.tekflox.aw-vpn-exit-clear.plist`, user-scoped so
+it needs no root either. Its premise differs from the systemd unit's — there
+are no exclusions to lose across a reboot — but the other half of that unit's
+value applies unchanged: a restart has to stay a way out of a gate that
+stopped forwarding. The cost, said out loud: an agent fires at **login**, not
+at boot, so the window between the two is not covered.
 
 ### What `status` reports
 

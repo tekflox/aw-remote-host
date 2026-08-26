@@ -229,7 +229,7 @@ func TestClearExclusionsStopsOnTheKernelsNoSuchRule(t *testing.T) {
 		}
 		return noRule, errors.New("exit status 2")
 	})
-	removed, err := ClearExclusions(context.Background(), stub)
+	removed, err := clearIPRuleExclusions(context.Background(), stub)
 	if err != nil {
 		t.Fatalf("the kernel's 'no such rule' is the loop's exit condition, not a failure: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestClearExclusionsPropagatesARealError(t *testing.T) {
 	stub := runnerFunc(func(context.Context, string, ...string) (string, error) {
 		return "RTNETLINK answers: Operation not permitted", errors.New("exit status 2")
 	})
-	if _, err := ClearExclusions(context.Background(), stub); err == nil {
+	if _, err := clearIPRuleExclusions(context.Background(), stub); err == nil {
 		t.Fatal("a permission error is not 'there were none left'")
 	}
 }

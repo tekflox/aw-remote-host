@@ -187,24 +187,11 @@ func DefaultResolver(host string) ([]string, error) {
 // extra is the operator's own --exclude list, for the things only they know
 // about — a NAS on a routed subnet, a jump host, a second management plane.
 func PlanExclusions(controlPlane string, locals []LocalPrefix, extra []string, resolve Resolver) (ExclusionPlan, error) {
-	host := hostOf(controlPlane)
-	if host == "" {
-		return ExclusionPlan{}, fmt.Errorf("cannot work out the control-plane host from %q, and the management path is not an optional exclusion", controlPlane)
+	host, ips, err := resolveControlPlane(controlPlane, resolve)
+	if err != nil {
+		return ExclusionPlan{}, err
 	}
-	plan := ExclusionPlan{ControlPlaneHost: host}
-
-	if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
-		plan.ControlPlaneIPs = []string{ip.To4().String()}
-	} else {
-		ips, err := resolve(host)
-		if err != nil {
-			return ExclusionPlan{}, fmt.Errorf("resolve control plane %q: %w — refusing to move the default route without pinning the management path outside the tunnel", host, err)
-		}
-		if len(ips) == 0 {
-			return ExclusionPlan{}, fmt.Errorf("control plane %q resolved to no IPv4 address — refusing to move the default route without pinning the management path outside the tunnel", host)
-		}
-		plan.ControlPlaneIPs = ips
-	}
+	plan := ExclusionPlan{ControlPlaneHost: host, ControlPlaneIPs: ips}
 
 	add := func(prefix, reason string) {
 		for _, existing := range plan.Exclusions {
@@ -233,6 +220,33 @@ func PlanExclusions(controlPlane string, locals []LocalPrefix, extra []string, r
 		add(normalised, "requested with --exclude")
 	}
 	return plan, nil
+}
+
+// resolveControlPlane works out where the management path lives, and refuses
+// when it cannot.
+//
+// Split out of PlanExclusions because it is the one part of that function
+// every platform needs, including the ones that pin nothing: on darwin the
+// control plane's reachability is CONFIRMED rather than pinned, and
+// confirming it still requires knowing where it is. The refusal wording talks
+// about the default route rather than about exclusions for the same reason —
+// it is true on a host that installs none.
+func resolveControlPlane(controlPlane string, resolve Resolver) (host string, ips []string, err error) {
+	host = hostOf(controlPlane)
+	if host == "" {
+		return "", nil, fmt.Errorf("cannot work out the control-plane host from %q, and the management path is not an optional exclusion", controlPlane)
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+		return host, []string{ip.To4().String()}, nil
+	}
+	ips, err = resolve(host)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve control plane %q: %w — refusing to move the default route without knowing where the management path is", host, err)
+	}
+	if len(ips) == 0 {
+		return "", nil, fmt.Errorf("control plane %q resolved to no IPv4 address — refusing to move the default route without knowing where the management path is", host)
+	}
+	return host, ips, nil
 }
 
 func normalisePrefix(raw string) (string, error) {
@@ -281,7 +295,7 @@ func hostOf(raw string) string {
 // this is not additive: two overlapping generations of exclusion is precisely
 // the leftover-state failure the package header describes.
 func ApplyExclusions(ctx context.Context, r Runner, ex []Exclusion) error {
-	if _, err := ClearExclusions(ctx, r); err != nil {
+	if _, err := clearIPRuleExclusions(ctx, r); err != nil {
 		return err
 	}
 	for _, e := range ex {
@@ -290,21 +304,27 @@ func ApplyExclusions(ctx context.Context, r Runner, ex []Exclusion) error {
 			// Roll back rather than leave a half-applied exclusion set: a
 			// partial set is worse than none, because it reads like the
 			// management path is pinned when it may be the one that failed.
-			_, _ = ClearExclusions(ctx, r)
+			_, _ = clearIPRuleExclusions(ctx, r)
 			return fmt.Errorf("install route exclusion for %s: %w: %s", e.Prefix, err, strings.TrimSpace(out))
 		}
 	}
 	return nil
 }
 
-// ClearExclusions removes every rule this package installed, by deleting at
-// its own priority until the kernel says there are none left.
+// ClearExclusions removes whatever this host's platform installed. On a Mac
+// that is nothing, and it answers (0, nil) rather than reaching for `ip`.
+func ClearExclusions(ctx context.Context, r Runner) (int, error) {
+	return currentPlatform().clearExclusions(ctx, r)
+}
+
+// clearIPRuleExclusions removes every rule this package installed, by
+// deleting at its own priority until the kernel says there are none left.
 //
 // Deleting by priority rather than by exact spec is what makes cleanup total.
 // A rule whose spec drifted (a prefix rewritten by something else, a run that
 // died between two adds) would survive a spec-matched delete and become the
 // leftover this whole design is built to avoid.
-func ClearExclusions(ctx context.Context, r Runner) (int, error) {
+func clearIPRuleExclusions(ctx context.Context, r Runner) (int, error) {
 	removed := 0
 	for i := 0; i < 64; i++ {
 		out, err := r.Run(ctx, "ip", "rule", "del", "priority", fmt.Sprint(exclusionPriority))
@@ -331,6 +351,10 @@ func isNoSuchRule(out string) bool {
 // this rather than what state.json remembers being asked for — the whole
 // hazard is a rule outliving the intent that created it.
 func ListExclusions(ctx context.Context, r Runner) ([]string, error) {
+	return currentPlatform().listExclusions(ctx, r)
+}
+
+func listIPRuleExclusions(ctx context.Context, r Runner) ([]string, error) {
 	out, err := r.Run(ctx, "ip", "rule", "show")
 	if err != nil {
 		return nil, fmt.Errorf("read ip rules: %w: %s", err, strings.TrimSpace(out))
@@ -364,12 +388,10 @@ func parseExclusionRules(out string) []string {
 // not. It is evidence, never proof — an interface being chosen says nothing
 // about whether anything is listening at the other end, which is why the
 // public-IP check below exists as well.
+// It asks whichever tool this OS answers with — `ip route get` on Linux,
+// `route -n get` on macOS.
 func RouteDevice(ctx context.Context, r Runner, dst string) (string, error) {
-	out, err := r.Run(ctx, "ip", "route", "get", dst)
-	if err != nil {
-		return "", fmt.Errorf("ip route get %s: %w: %s", dst, err, strings.TrimSpace(out))
-	}
-	return parseRouteDevice(out), nil
+	return currentPlatform().routeDevice(ctx, r, dst)
 }
 
 func parseRouteDevice(out string) string {
@@ -591,9 +613,13 @@ type ConfirmResult struct {
 //     not do its job and the machine has lost its management path even
 //     though it still has internet.
 func ConfirmEgress(ctx context.Context, r Runner, baseline, expected, controlPlaneURL string) ConfirmResult {
+	return confirmEgress(ctx, r, currentPlatform(), baseline, expected, controlPlaneURL)
+}
+
+func confirmEgress(ctx context.Context, r Runner, plat exitPlatform, baseline, expected, controlPlaneURL string) ConfirmResult {
 	res := ConfirmResult{Baseline: baseline, Expected: expected}
 
-	if dev, err := RouteDevice(ctx, r, "1.1.1.1"); err == nil {
+	if dev, err := plat.routeDevice(ctx, r, "1.1.1.1"); err == nil {
 		res.DefaultDevice = dev
 	}
 

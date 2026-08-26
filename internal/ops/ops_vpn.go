@@ -82,7 +82,14 @@ func eligibilityPayload(e vpn.Eligibility) map[string]any {
 		"enroll_refusal":     e.EnrollRefusal,
 		"can_advertise_exit": e.CanAdvertiseExit,
 		"exit_refusal":       e.ExitRefusal,
-		"installer":          e.Installer,
+		// The CLIENT-side verdict, and the one the gate picker on the
+		// Networking screen actually needs: "can this host be pointed at a
+		// gate". can_advertise_exit answers the opposite question and a
+		// screen that used it would hide every machine that can only be a
+		// client, which is most of them.
+		"can_select_exit":     e.CanSelectExit,
+		"select_exit_refusal": e.SelectExitRefusal,
+		"installer":           e.Installer,
 	}
 }
 

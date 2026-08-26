@@ -71,11 +71,14 @@ func runVPNUseExit(args []string) error {
 		}
 		printPlanHeader(*resolved)
 		fmt.Printf("[plan] would arm a dead-man's switch for %s BEFORE changing anything, reverting with `tailscale set --exit-node=` if this run does not confirm egress\n", *deadman)
-		fmt.Printf("[plan] would run: ip rule add to <each prefix above> lookup main priority 5260\n")
-		fmt.Printf("[plan] would run: tailscale set --exit-node=%s --exit-node-allow-lan-access=true --accept-dns=false\n", resolved.GateIP)
+		// The commands come from the platform rather than from this file, so
+		// a preview cannot claim an `ip rule` on a machine that has none.
+		for _, line := range resolved.Narration {
+			fmt.Printf("[plan] %s\n", line)
+		}
 		fmt.Printf("[plan] would then fetch this host's real public IP and %s, reverting immediately if it does not\n", expectationSentence(*expectEgress))
 		if !*persist {
-			fmt.Printf("[plan] would install the %s boot guard, so a reboot clears the selection rather than coming back up with the route moved and no exclusions\n", vpn.BootGuardUnit)
+			fmt.Printf("[plan] would install the %s boot guard, so a restart clears the selection rather than coming back up on a gate nothing re-confirmed\n", vpn.BootGuardName())
 		}
 		return nil
 	}
@@ -94,8 +97,8 @@ func runVPNClearExit(args []string) error {
 	if *plan {
 		fmt.Println("[plan] would stand down any armed dead-man's switch")
 		fmt.Println("[plan] would run: tailscale set --exit-node= --exit-node-allow-lan-access=false --accept-dns=false")
-		fmt.Println("[plan] would remove every ip rule at priority 5260 (the route exclusions)")
-		fmt.Printf("[plan] would remove the %s boot guard\n", vpn.BootGuardUnit)
+		fmt.Println("[plan] would remove whatever this platform pinned outside the tunnel (on Linux, every ip rule at priority 5260; on macOS there is nothing to remove)")
+		fmt.Printf("[plan] would remove the %s boot guard\n", vpn.BootGuardName())
 		return nil
 	}
 
@@ -119,9 +122,14 @@ func printProgress(level, message string) {
 
 func printPlanHeader(p vpn.UseExitPlan) {
 	fmt.Printf("vpn: exit gate %s (%s), path %s\n", p.Gate.Name, p.GateIP, p.Gate.PathDescription())
-	fmt.Println("vpn: these prefixes stay OUTSIDE the tunnel:")
-	for _, e := range p.Exclusions.Exclusions {
-		fmt.Printf("vpn:   %-20s %s\n", e.Prefix, e.Reason)
+	if len(p.Exclusions.Exclusions) > 0 {
+		fmt.Println("vpn: these prefixes stay OUTSIDE the tunnel:")
+		for _, e := range p.Exclusions.Exclusions {
+			fmt.Printf("vpn:   %-20s %s\n", e.Prefix, e.Reason)
+		}
+	}
+	if p.Manageability != "" {
+		fmt.Printf("vpn: WARNING — %s\n", p.Manageability)
 	}
 }
 
@@ -135,7 +143,10 @@ func printPlanHeader(p vpn.UseExitPlan) {
 // selection that created it, a switch that already fired.
 func reportExitStatus(ctx context.Context, prefs vpn.Prefs, prefsErr error, st *state.State) {
 	host := vpn.Probe()
-	runner := vpn.PrivilegedRunner{Inner: ops.DefaultRunner, Sudo: host.UID != 0}
+	// No sudo wrapper on darwin: everything read below (`route -n get`,
+	// `tailscale debug prefs`) works as the ordinary user there, and wrapping
+	// it would turn a readable status into "sudo: a password is required".
+	runner := vpn.PrivilegedRunner{Inner: ops.DefaultRunner, Sudo: host.OS != "darwin" && host.UID != 0}
 
 	if deadman, err := vpn.LoadDeadman(); err == nil && deadman != nil {
 		fmt.Printf("vpn: %s\n", deadman.Describe())
@@ -184,13 +195,20 @@ func reportExitStatus(ctx context.Context, prefs vpn.Prefs, prefsErr error, st *
 		fmt.Printf("vpn: REAL public egress IP: UNKNOWN — this host could not reach the internet at all (%v). With an exit node in force that means the gate is not forwarding.\n", egressErr)
 	}
 	if !vpn.BootGuardInstalled() {
-		fmt.Printf("vpn: WARNING — the %s boot guard is NOT installed. An exit-node selection survives a reboot; the ip-rule exclusions above do not. This host would come back up with its default route on the mesh and nothing keeping the control plane outside it.\n", vpn.BootGuardUnit)
+		fmt.Printf("vpn: WARNING — the %s boot guard is NOT installed. An exit-node selection survives a reboot and nothing re-confirms it on the way back up, so this host can come back with its default route on a gate that has since stopped forwarding.\n", vpn.BootGuardName())
 	}
 	if recorded := recordedExit(st); recorded != "" && gate.name != "" && gate.name != recorded {
 		fmt.Printf("vpn: NOTE — local state records exit node %q, but %q is what is actually in force.\n", recorded, gate.name)
 	}
-	if len(live) == 0 {
+	// On darwin an empty exclusion list is the design, not a fault — this
+	// module installs no routes there — so the warning would be false. The
+	// same fact is still reported, as the manageability sentence use-exit
+	// prints, rather than as an accusation that something went wrong.
+	if len(live) == 0 && host.OS == "linux" {
 		fmt.Println("vpn: WARNING — an exit node is in force and there are NO route exclusions. The control plane is inside the tunnel; if the gate stops forwarding, this host is unmanageable. Run `aw-remote-host vpn clear-exit`, or re-select the gate with `vpn use-exit`, which installs them.")
+	}
+	if host.OS == "darwin" {
+		fmt.Println("vpn: NOTE — on macOS this module installs no route exclusions (tailscaled owns the utun and the LAN stays out natively). The control plane is inside the tunnel while a gate is in force: if it stops forwarding, run `aw-remote-host vpn clear-exit` from this keyboard, or restart — the boot guard clears the selection at login.")
 	}
 }
 

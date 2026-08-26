@@ -153,6 +153,11 @@ func reportEligibility(e vpn.Eligibility) {
 	fmt.Printf("vpn: host is %s/%s%s, uid %d%s\n",
 		h.OS, h.Arch, wslNote(h.WSL), h.UID, sudoNote(h))
 	fmt.Printf("vpn: %s\n", e.Describe())
+	// Two lines, not one. On Mac.Home the two verdicts disagree — it can
+	// never enrol and can still be pointed at a gate — and collapsing them
+	// sent the reader off to fix Homebrew for a problem Homebrew does not
+	// cause.
+	fmt.Printf("vpn: %s\n", e.DescribeSelectExit())
 }
 
 func wslNote(wsl bool) string {

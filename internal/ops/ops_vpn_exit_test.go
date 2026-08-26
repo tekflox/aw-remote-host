@@ -17,6 +17,7 @@ import (
 func eligibleGateHost() vpn.Eligibility {
 	e := eligible()
 	e.Host.TailscalePath = tailscaleBin
+	e.CanSelectExit = true
 	return e
 }
 
@@ -44,7 +45,7 @@ func withClearExit(t *testing.T, fn func(context.Context, vpn.ClearExitSpec, vpn
 func TestVPNExitVerbsAreNotWorkspaceLifecycleVerbs(t *testing.T) {
 	for _, verb := range []string{"vpn_use_exit", "vpn_clear_exit"} {
 		if workspaceLifecycleVerbs[verb] {
-			t.Fatalf("%s must not be in workspaceLifecycleVerbs — it needs tailscale and `ip`, never podman", verb)
+			t.Fatalf("%s must not be in workspaceLifecycleVerbs — it needs tailscale, never podman", verb)
 		}
 	}
 }
@@ -117,8 +118,8 @@ func TestAppliedTracksConfirmedEgress(t *testing.T) {
 // not able to" apart from "this machine could not be asked".
 func TestIneligibleHostRefusesInsteadOfErroring(t *testing.T) {
 	e := eligibleGateHost()
-	e.CanEnroll = false
-	e.EnrollRefusal = "/dev/net/tun is not present on this host."
+	e.CanSelectExit = false
+	e.SelectExitRefusal = "aw-remote-host is not running as root here and `sudo -n true` fails."
 	withVerdict(t, e)
 	withUseExit(t, func(context.Context, vpn.UseExitSpec, vpn.Progress) (vpn.UseExitResult, error) {
 		t.Fatal("the sequence must not run on a host that was already refused")
@@ -131,7 +132,7 @@ func TestIneligibleHostRefusesInsteadOfErroring(t *testing.T) {
 		t.Fatalf("a refusal is a successful reply: %v", err)
 	}
 	out := data.(map[string]any)
-	if out["refused"] != true || out["refusal"] != e.EnrollRefusal {
+	if out["refused"] != true || out["refusal"] != e.SelectExitRefusal {
 		t.Fatalf("refused/refusal = %v/%v", out["refused"], out["refusal"])
 	}
 	if out["applied"] != false || out["changed"] != false {
@@ -139,23 +140,55 @@ func TestIneligibleHostRefusesInsteadOfErroring(t *testing.T) {
 	}
 }
 
-// A non-Linux host is refused for a different reason and it has to say which:
-// `ip rule` is what implements the exclusions, and a macOS box being told
-// "not eligible" with no sentence sends its owner hunting for the wrong fix.
-func TestNonLinuxHostIsRefusedWithTheRouteExclusionReason(t *testing.T) {
+// A Mac is a CLIENT of a gate, and the verb has to let it be one. This used
+// to be the refusal path ("`ip rule` is Linux-only") and it was refusing a
+// machine that works: on macOS tailscaled owns the utun and this module
+// installs no routes at all, so there is nothing Linux-only left to be
+// missing. Mac.Home is the host that made the difference visible — see
+// vpn.resolveSelectExit.
+func TestDarwinHostIsAcceptedAsAGateClient(t *testing.T) {
 	e := eligibleGateHost()
 	e.Host.OS = "darwin"
+	// The Mac's real shape: it can never ENROL, because /opt/homebrew belongs
+	// to another account. That must not decide whether it can select.
+	e.CanEnroll = false
+	e.EnrollRefusal = "/opt/homebrew exists but this user cannot write to it."
+	withVerdict(t, e)
+	ran := false
+	withUseExit(t, func(context.Context, vpn.UseExitSpec, vpn.Progress) (vpn.UseExitResult, error) {
+		ran = true
+		return vpn.UseExitResult{Gate: "aw-baremetal", Confirmed: true}, nil
+	})
+
+	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{ControlPlane: "https://api.aw.tekflox.com"}}
+	data, err := h.Dispatch(context.Background(), "vpn_use_exit", map[string]any{"node": "aw-baremetal"}, noopEmit)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	out := data.(map[string]any)
+	if out["refused"] != false {
+		t.Fatalf("a Mac that can select a gate must not be refused: %v", out["refusal"])
+	}
+	if !ran {
+		t.Fatal("the sequence must actually run on darwin")
+	}
+}
+
+// Windows is still refused, and the sentence has to say why it is not a gap
+// to fill later: the workspace lives in the WSL2 distro, so moving the
+// Windows side's route would move the wrong operating system's.
+func TestWindowsHostIsRefusedTowardsItsWSLDistro(t *testing.T) {
+	e := eligibleGateHost()
+	e.Host.OS = "windows"
+	e.CanSelectExit, e.SelectExitRefusal = false, "This is the Windows side of the host. Run this in the distro instead."
 	withVerdict(t, e)
 
 	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{ControlPlane: "https://api.aw.tekflox.com"}}
 	data, _ := h.Dispatch(context.Background(), "vpn_use_exit", map[string]any{"node": "aw-lab"}, noopEmit)
 	out := data.(map[string]any)
 	refusal, _ := out["refusal"].(string)
-	if out["refused"] != true || refusal == "" {
+	if out["refused"] != true || !strings.Contains(refusal, "distro") {
 		t.Fatalf("refused/refusal = %v/%q", out["refused"], refusal)
-	}
-	if want := "ip rule"; !strings.Contains(refusal, want) {
-		t.Fatalf("refusal must name what is missing (%q), got %q", want, refusal)
 	}
 }
 

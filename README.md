@@ -344,14 +344,14 @@ through it, every container's traffic with it — through `<node>`. It is the
 one command in this repo that can take a host off the internet **and remove
 the means of putting it back**, so the safety machinery is the feature:
 
-- **The control plane and every attached network stay outside the tunnel.**
-  Installed as `ip rule … lookup main` at priority 5260, which beats
+- **On Linux, the control plane and every attached network stay outside the
+  tunnel.** Installed as `ip rule … lookup main` at priority 5260, which beats
   tailscale's catch-all at 5270. Pointing at the *main* table is what makes a
   leftover exclusion inert rather than a black hole — the difference from
   the `ip rule from 172.18.0.5 lookup 51821` that left a container on this
   very infrastructure with no internet for two days, silently. If the control
   plane cannot even be resolved, the command **refuses** rather than moving
-  the route without pinning it.
+  the route without knowing where it is.
 - **A dead-man's switch is armed before anything changes**, in its own
   session so it outlives whatever armed it, and is stood down only *after*
   egress has been confirmed. Kill the tool mid-flight and the route still
@@ -361,8 +361,17 @@ the means of putting it back**, so the safety machinery is the feature:
   path) and must match `--expect-egress`, or have changed. Anything else is
   reverted and reported as a failure. "The interface is up" proves nothing.
 - **A boot guard clears the selection at reboot**, because the selection
-  survives a reboot and the exclusions do not — coming back up with one and
-  not the other is the lockout arriving on its own.
+  survives a reboot and nothing re-confirms it on the way back up — a
+  systemd oneshot on Linux, a user LaunchAgent on macOS.
+- **A Mac can be a client of a gate, and installs no routes at all.** There
+  tailscaled owns the utun, the LAN stays out natively via
+  `--exit-node-allow-lan-access`, and the only available pin — a static host
+  route naming a gateway — would turn into a black hole the moment the laptop
+  changed networks. So the control plane is *confirmed through the gate*
+  rather than pinned around it, and the reply says so in `manageability`
+  instead of letting a screen assume the Linux guarantee. It needs
+  `sudo tailscale set --operator=<user>` once, from an administrator account;
+  without it the command refuses, naming that command, before anything moves.
 
 `status` then reports which gate is in force, what the **real** egress IP is,
 what is pinned outside the tunnel, and every leftover state in between.

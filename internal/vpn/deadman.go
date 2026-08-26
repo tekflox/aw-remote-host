@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,13 +83,22 @@ type ArmSpec struct {
 	After time.Duration
 	// ExitNode is only recorded for reporting.
 	ExitNode string
-	// TailscalePath and IPPath are absolute paths resolved at arming time.
-	// Resolved, not looked up later, because the revert runs in a shell with
-	// whatever PATH it inherits — and on a machine whose network is broken is
-	// the worst possible moment to discover a binary is not where it was
-	// assumed to be.
+	// TailscalePath is an absolute path resolved at arming time. Resolved,
+	// not looked up later, because the revert runs in a shell with whatever
+	// PATH it inherits — and on a machine whose network is broken is the
+	// worst possible moment to discover a binary is not where it was assumed
+	// to be.
 	TailscalePath string
-	IPPath        string
+	// ExclusionRevert is the platform's extra shell for undoing whatever it
+	// pinned outside the tunnel, with every path already absolute and every
+	// privilege prefix already applied (exitPlatform.revertExclusionsScript).
+	//
+	// Empty is a legitimate value and means there is nothing to undo — the
+	// macOS case, where tailscaled owns the routing and this module installs
+	// none. It is deliberately NOT a required field: making it one would have
+	// forced darwin to supply a no-op command, i.e. a line of shell that can
+	// fail on a machine whose network has just gone.
+	ExclusionRevert string
 }
 
 // revertScript is the shell the armed process runs. It is deliberately three
@@ -98,19 +108,22 @@ type ArmSpec struct {
 // revert dies with any update, rename, or partial write of the very tool that
 // armed it.
 func (s ArmSpec) revertScript() string {
+	exclusions := strings.TrimSpace(s.ExclusionRevert)
+	if exclusions == "" {
+		exclusions = "# nothing to unpin on this platform"
+	}
 	return fmt.Sprintf(`# %s
 sleep %d
 echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) dead-man's switch FIRED: reverting exit-node selection (%s) that was never confirmed"
 %s set --exit-node= --exit-node-allow-lan-access=false --accept-dns=false
-while %s rule del priority %d 2>/dev/null; do :; done
+%s
 echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) dead-man's switch: revert complete"
 `,
 		deadmanMarker,
 		int(s.After.Seconds()),
 		s.ExitNode,
 		s.TailscalePath,
-		s.IPPath,
-		exclusionPriority,
+		exclusions,
 	)
 }
 
@@ -123,8 +136,8 @@ func Arm(spec ArmSpec) (*Deadman, error) {
 	if spec.After <= 0 {
 		return nil, errors.New("dead-man's switch needs a positive timeout")
 	}
-	if spec.TailscalePath == "" || spec.IPPath == "" {
-		return nil, errors.New("dead-man's switch needs absolute paths for tailscale and ip, resolved before the route is touched")
+	if spec.TailscalePath == "" {
+		return nil, errors.New("dead-man's switch needs an absolute path for tailscale, resolved before the route is touched")
 	}
 	if _, err := Disarm(); err != nil {
 		return nil, fmt.Errorf("stand down the previously armed switch: %w", err)
@@ -243,15 +256,26 @@ func Disarm() (bool, error) {
 }
 
 // processIsDeadman checks that the PID still belongs to a switch this package
-// armed, by looking for the marker in its command line. On anything without
-// /proc this answers false, which fails in the safe direction: the switch is
-// left to fire rather than a stranger's process being killed.
+// armed, by looking for the marker in its command line. When the command line
+// cannot be read at all this answers false, which fails in the safe
+// direction: the switch is left to fire rather than a stranger's process
+// being killed.
+//
+// macOS has no /proc, and answering false there was not a safe degradation —
+// it was a bug with the failure mode reversed. Disarm() only kills a process
+// it can identify, so on a Mac EVERY switch would have survived being stood
+// down and fired minutes later under a selection that had been confirmed,
+// reverting a working gate with nobody watching. `ps -o command=` is the
+// portable read of the same fact.
 func processIsDeadman(pid int) bool {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+		return strings.Contains(string(data), deadmanMarker)
+	}
+	out, err := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(data), deadmanMarker)
+	return strings.Contains(string(out), deadmanMarker)
 }
 
 // Pending reports an armed switch that has not fired yet, for `status`.

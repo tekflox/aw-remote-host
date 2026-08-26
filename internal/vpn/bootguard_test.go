@@ -40,7 +40,7 @@ func TestBootGuardUnitClearsBothHalvesOfASelection(t *testing.T) {
 
 func TestInstallBootGuardGoesThroughTheRunnerSoSudoApplies(t *testing.T) {
 	r := newRecordingRunner()
-	if err := InstallBootGuard(context.Background(), r, "/usr/bin/tailscale", "/usr/sbin/ip"); err != nil {
+	if err := installSystemdBootGuard(context.Background(), r, "/usr/bin/tailscale", "/usr/sbin/ip"); err != nil {
 		t.Fatal(err)
 	}
 	if len(r.calls) != 3 {
@@ -49,13 +49,13 @@ func TestInstallBootGuardGoesThroughTheRunnerSoSudoApplies(t *testing.T) {
 	// Written through the Runner rather than os.WriteFile: aw-remote-host does
 	// not always run as root, and on a passwordless-sudo host every other
 	// privileged step here goes through the same wrapper.
-	if !strings.HasPrefix(r.calls[0], "sh -c cat > /etc/systemd/system/"+BootGuardUnit) {
+	if !strings.HasPrefix(r.calls[0], "sh -c cat > /etc/systemd/system/"+systemdBootGuardUnit) {
 		t.Fatalf("first call = %q", r.calls[0])
 	}
 	if r.calls[1] != "systemctl daemon-reload" {
 		t.Fatalf("a unit written but not reloaded is not installed: %q", r.calls[1])
 	}
-	if r.calls[2] != "systemctl enable "+BootGuardUnit {
+	if r.calls[2] != "systemctl enable "+systemdBootGuardUnit {
 		t.Fatalf("a unit installed but not enabled never runs: %q", r.calls[2])
 	}
 }

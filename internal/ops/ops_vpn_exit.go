@@ -16,16 +16,20 @@
 // call cannot come back. That is survivable here and only here, because of
 // the order internal/vpn/usexit.go runs in — the dead-man's switch is armed
 // BEFORE the route moves, so a caller that never hears back still gets its
-// host back, and the control plane's exclusion is pinned outside the tunnel
-// so the tunnel itself normally survives. Proven on a lab node on 2026-08-25
-// by killing the tool with SIGKILL mid-switch: exclusions gone, selection
-// cleared, internet back in ~20s. A verb without that ordering behind it
-// would have no business existing.
+// host back. On Linux the control plane's exclusion is pinned outside the
+// tunnel as well, so the tunnel itself normally survives. On macOS it is not,
+// because there is no mechanism there that is safe to leave behind — see
+// vpn.darwinExit.planExclusions — so the tunnel rides through the gate and
+// the dead-man's switch is the whole of the guarantee. Which of the two
+// applies travels back in the reply's `manageability` field rather than being
+// assumed by whoever reads it. Proven on a lab node on 2026-08-25 by killing
+// the tool with SIGKILL mid-switch: exclusions gone, selection cleared,
+// internet back in ~20s. A verb without that ordering behind it would have no
+// business existing.
 //
 // Deliberately NOT in workspaceLifecycleVerbs (ops.go), for the same reason
-// vpn_status is not: this needs tailscale and `ip`, never podman, and a
-// lean-linked host is exactly the kind of machine most likely to be on the
-// mesh.
+// vpn_status is not: this needs tailscale, never podman, and a lean-linked
+// laptop is exactly the kind of machine most likely to want a gate.
 package ops
 
 import (
@@ -66,14 +70,16 @@ var (
 //	                Given, confirmation is an exact match; omitted,
 //	                confirmation is that the public IP CHANGED.
 //	exclude         ([]string, optional) extra IPv4 addresses/CIDRs to keep
-//	                outside the tunnel.
+//	                outside the tunnel. Refused on macOS rather than ignored:
+//	                nothing there could hold them out.
 //	deadman_s       (number, optional) seconds before an unconfirmed
 //	                selection reverts itself. Default 120.
 //	confirm_s       (number, optional) seconds to keep trying to confirm.
 //	                Default 45, and it must stay inside deadman_s.
-//	persist_across_reboot (bool, optional) skip the boot guard. The `ip rule`
-//	                exclusions do not survive a reboot and a tailscale
-//	                selection does, so this is the dangerous option.
+//	persist_across_reboot (bool, optional) skip the boot guard. A tailscale
+//	                selection survives a reboot and nothing re-confirms it on
+//	                the way back up (and on Linux the `ip rule` exclusions do
+//	                not survive at all), so this is the dangerous option.
 //	plan            (bool, optional) resolve the gate and the exclusions,
 //	                report them, and change NOTHING.
 //
@@ -136,6 +142,8 @@ func (h *Handler) VPNUseExit(ctx context.Context, args map[string]any, emit Emit
 			"control_plane":      controlPlane,
 			"control_plane_ips":  plan.Exclusions.ControlPlaneIPs,
 			"control_plane_host": plan.Exclusions.ControlPlaneHost,
+			"manageability":      plan.Manageability,
+			"narration":          plan.Narration,
 		}, nil
 	}
 
@@ -194,17 +202,14 @@ func (h *Handler) VPNClearExit(ctx context.Context, args map[string]any, emit Em
 // "no peer by that name" or "the control plane will not resolve" are caller
 // or environment problems and stay errors, the same split vpn_bootstrap makes
 // between a refusal and a missing login_server.
+// It reads CanSelectExit rather than CanEnroll. Those are different questions
+// and conflating them refused a capable Mac for the wrong reason: Mac.Home
+// cannot ENROL (its Homebrew prefix belongs to another account) yet has
+// tailscale installed, tailscaled running as a root LaunchDaemon, and can
+// select a gate perfectly well once its user holds the tailscale operator
+// grant. See vpn.resolveSelectExit.
 func exitSelectionRefusal(e vpn.Eligibility) string {
-	if !e.CanEnroll {
-		return e.EnrollRefusal
-	}
-	if e.Host.OS != "linux" {
-		return fmt.Sprintf("selecting an exit gate changes this machine's default route, and the route exclusions that keep it manageable while that is true are implemented with `ip rule`, which is Linux-only. %s is deliberately not claimed rather than half-supported.", e.Host.OS)
-	}
-	if e.Host.TailscalePath == "" {
-		return "tailscale is not installed on this host, so there is no mesh to route through — enrol it first."
-	}
-	return ""
+	return e.SelectExitRefusal
 }
 
 // linkProgress forwards internal/vpn's narration to the control plane as link
@@ -245,6 +250,10 @@ func useExitPayload(eligibility map[string]any, res vpn.UseExitResult) map[strin
 		"deadman_expires_at":  res.DeadmanExpiresAt,
 		"deadman_still_armed": res.DeadmanStillArmed,
 		"boot_guard":          res.BootGuard,
+		// Empty means the management path IS pinned outside the tunnel; a
+		// sentence means it is not, and why (macOS). A control plane that
+		// drops this field reports the Linux guarantee on a Mac.
+		"manageability": res.Manageability,
 	}
 }
 

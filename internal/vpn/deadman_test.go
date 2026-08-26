@@ -24,10 +24,10 @@ func homeIn(t *testing.T) string {
 func armForTest(t *testing.T, after time.Duration) *Deadman {
 	t.Helper()
 	d, err := Arm(ArmSpec{
-		After:         after,
-		ExitNode:      "aw-baremetal",
-		TailscalePath: "/bin/true",
-		IPPath:        "/bin/false",
+		After:           after,
+		ExitNode:        "aw-baremetal",
+		TailscalePath:   "/bin/true",
+		ExclusionRevert: "/bin/false rule del priority 5260",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -179,10 +179,10 @@ func TestArmStandsDownAPreviouslyArmedSwitch(t *testing.T) {
 func TestAnUnattendedSwitchActuallyFires(t *testing.T) {
 	home := homeIn(t)
 	if _, err := Arm(ArmSpec{
-		After:         2 * time.Second,
-		ExitNode:      "aw-baremetal",
-		TailscalePath: "/bin/echo TAILSCALE",
-		IPPath:        "/bin/false",
+		After:           2 * time.Second,
+		ExitNode:        "aw-baremetal",
+		TailscalePath:   "/bin/echo TAILSCALE",
+		ExclusionRevert: "/bin/false rule del priority 5260",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestAnUnattendedSwitchActuallyFires(t *testing.T) {
 func TestRevertScriptShellsOutToTailscaleDirectly(t *testing.T) {
 	script := ArmSpec{
 		After: 120 * time.Second, ExitNode: "aw-baremetal",
-		TailscalePath: "/usr/bin/tailscale", IPPath: "/usr/sbin/ip",
+		TailscalePath: "/usr/bin/tailscale", ExclusionRevert: "while /usr/sbin/ip rule del priority 5260 2>/dev/null; do :; done",
 	}.revertScript()
 
 	if strings.Contains(script, "aw-remote-host ") {
@@ -240,12 +240,12 @@ func TestRevertScriptShellsOutToTailscaleDirectly(t *testing.T) {
 
 func TestArmRefusesWithoutAbsolutePathsOrATimeout(t *testing.T) {
 	homeIn(t)
-	if _, err := Arm(ArmSpec{After: 0, TailscalePath: "/bin/true", IPPath: "/bin/true"}); err == nil {
+	if _, err := Arm(ArmSpec{After: 0, TailscalePath: "/bin/true"}); err == nil {
 		t.Fatal("a switch with no timeout is not a switch")
 	}
 	// Resolved before the route is touched, because a machine whose network
 	// has just broken is the worst place to discover a binary is not on PATH.
-	if _, err := Arm(ArmSpec{After: time.Minute, TailscalePath: "", IPPath: "/bin/true"}); err == nil {
+	if _, err := Arm(ArmSpec{After: time.Minute, TailscalePath: ""}); err == nil {
 		t.Fatal("expected a refusal without an absolute tailscale path")
 	}
 }
