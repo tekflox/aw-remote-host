@@ -698,6 +698,12 @@ func copyPath(src, dst string) error {
 	return nil
 }
 
+// runModule is bootstrap.RunModule, indirected so a test can observe which
+// modules a pass actually selects without executing any install script —
+// the manifest selection below is real logic that used to have no coverage
+// at this call site at all.
+var runModule = bootstrap.RunModule
+
 func (h *Handler) runModules(ctx context.Context, opts BootstrapOpts, full bool, emit Emit) (map[string]any, error) {
 	return h.runModulesWithEnv(ctx, opts, full, emit, nil)
 }
@@ -715,7 +721,13 @@ func (h *Handler) runModulesWithEnv(ctx context.Context, opts BootstrapOpts, ful
 	}
 	manifest := m.Only("workspace")
 	if full {
-		manifest = m
+		// Default(), not the raw manifest: "full" means every module this
+		// host is supposed to have, which excludes the opt-in ones. An
+		// optional module like vpn needs inputs (login server, pre-auth key)
+		// BootstrapOpts does not carry, so running it here fails the whole
+		// control-plane bootstrap on a module nobody asked for — after
+		// podman/postgres/redis/workspace already came up fine.
+		manifest = m.Default()
 	}
 	runOpts := bootstrap.RunOptions{
 		ExtractDir: opts.ExtractDir,
@@ -723,7 +735,7 @@ func (h *Handler) runModulesWithEnv(ctx context.Context, opts BootstrapOpts, ful
 	}
 	for _, mod := range manifest.Modules {
 		emit("info", mod.Name, fmt.Sprintf("bootstrapping %s...", mod.Name))
-		st := bootstrap.RunModule(ctx, mod, runOpts)
+		st := runModule(ctx, mod, runOpts)
 		if !st.OK {
 			emit("error", mod.Name, fmt.Sprintf("%s failed: %s", mod.Name, st.Output))
 			return nil, fmt.Errorf("module %q failed", mod.Name)
