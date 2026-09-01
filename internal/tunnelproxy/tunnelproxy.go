@@ -87,6 +87,20 @@ func (h *Handler) ServeHTTP(
 		return
 	}
 	for k, v := range headers {
+		// Go's http.Client reads the outgoing wire "Host:" from req.Host
+		// (falling back to req.URL.Host), never from req.Header — setting
+		// it here via req.Header.Set would be silently discarded when the
+		// request is written. aw-backend's workspace_tunnel_proxy.py now
+		// forwards the original public Host through (it used to strip it
+		// as hop-by-hop noise), specifically so the local aw-workspace
+		// process can tell a Tier-2 app-mount hostname
+		// (<app_id>.app.<slug>...) apart from its own API/SPA hosts; that
+		// only works end-to-end if this hop actually sets req.Host instead
+		// of leaving it defaulted to the 127.0.0.1 target.
+		if strings.EqualFold(k, "host") {
+			req.Host = v
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 

@@ -110,6 +110,34 @@ func TestServeHTTPForwardsRequestBody(t *testing.T) {
 	}
 }
 
+func TestServeHTTPSetsRequestHostFromHeaders(t *testing.T) {
+	// Regression: Go's http.Client reads the outgoing wire Host from
+	// req.Host (falling back to req.URL.Host), never from req.Header — a
+	// naive req.Header.Set("host", ...) is silently discarded. aw-backend
+	// forwards the browser's original public Host (e.g. a Tier-2 app's own
+	// <app_id>.app.<slug>... hostname) through the "host" entry in this
+	// map specifically so the local aw-workspace process can tell that
+	// hostname apart from its own API/SPA hosts.
+	var gotHost string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	h := &Handler{Target: srv.URL}
+	h.ServeHTTP(context.Background(), "req-1", "GET", "/", map[string]string{
+		"Host":    "signoz.app.acme.workspace.aw.tekflox.com",
+		"X-Other": "kept",
+	}, nil,
+		func(string, int, map[string]string) {}, func(string, []byte) {}, func(string) {},
+	)
+
+	if gotHost != "signoz.app.acme.workspace.aw.tekflox.com" {
+		t.Fatalf("r.Host = %q, want the forwarded app-mount host", gotHost)
+	}
+}
+
 func TestOpenWSBridgesMessagesBothWays(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
