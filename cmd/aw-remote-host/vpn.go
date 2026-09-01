@@ -59,7 +59,14 @@ func runVPNEnroll(args []string) error {
 			fmt.Println("[plan] --login-server is required to enrol (no default: one headscale per tenant, never hardcoded)")
 			return nil
 		}
-		fmt.Printf("[plan] would install tailscale via %s\n", elig.Installer)
+		// An already-enrolled node has no installer, and printing "would
+		// install tailscale via " with nothing after it is the same kind of
+		// half-truth this whole file exists to avoid.
+		if elig.AlreadyEnrolled {
+			fmt.Println("[plan] tailscale is already installed and this node is already on the mesh — nothing would be installed")
+		} else {
+			fmt.Printf("[plan] would install tailscale via %s\n", elig.Installer)
+		}
 		fmt.Printf("[plan] would run: tailscale up --login-server=%s --accept-routes=false --accept-dns=%t%s\n",
 			*loginServer, *acceptDNS, exitFlagPlan(*advertiseExit, elig))
 		fmt.Println("[plan] would NOT select an exit node and would NOT change this machine's default route (phase 2, deliberately out of scope)")
