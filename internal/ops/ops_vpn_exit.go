@@ -184,10 +184,11 @@ func (h *Handler) VPNUseExit(ctx context.Context, args map[string]any, emit Emit
 			"narration":          plan.Narration,
 			// What would actually move, so a confirmation dialog can name the
 			// networks rather than promise "your containers".
-			"runtime":          plan.Runtime.Name,
-			"runtime_version":  plan.Runtime.Version,
-			"container_routes": containerRoutePayload(plan.Routes.Containers),
-			"probe_network":    plan.ProbeNetwork,
+			"runtime":              plan.Runtime.Name,
+			"runtime_version":      plan.Runtime.Version,
+			"container_routes":     containerRoutePayload(plan.Routes.Containers),
+			"probe_network":        plan.ProbeNetwork,
+			"probe_network_reason": plan.ProbeNetworkReason,
 		}, nil
 	}
 
@@ -443,7 +444,8 @@ func measureContainerEgress(ctx context.Context, r vpn.Runner) vpn.ContainerEgre
 	if err != nil {
 		return vpn.ContainerEgressResult{Runtime: runtime.Name, Error: err.Error()}
 	}
-	return vpn.MeasureContainerEgress(ctx, r, runtime, vpn.PickProbeNetwork(runtime, networks))
+	probeNetwork, _ := vpn.PickProbeNetwork(runtime, networks)
+	return vpn.MeasureContainerEgress(ctx, r, runtime, probeNetwork)
 }
 
 func containerEgressPayload(c vpn.ContainerEgressResult) map[string]any {

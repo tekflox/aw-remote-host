@@ -85,7 +85,11 @@ func runVPNUseExit(args []string) error {
 		for _, line := range resolved.Narration {
 			fmt.Printf("[plan] %s\n", line)
 		}
-		fmt.Printf("[plan] would then measure container egress from a throwaway container on network %q and %s, AND re-measure this host's own public IP and require it to be UNCHANGED — reverting immediately if either fails\n", resolved.ProbeNetwork, expectationSentence(*expectEgress))
+		if resolved.ProbeNetwork != "" {
+			fmt.Printf("[plan] would then measure container egress from a throwaway container on network %q (%s) and %s, AND re-measure this host's own public IP and require it to be UNCHANGED — reverting immediately if either fails\n", resolved.ProbeNetwork, resolved.ProbeNetworkReason, expectationSentence(*expectEgress))
+		} else {
+			fmt.Printf("[plan] container egress could not be measured: %s\n", resolved.ProbeNetworkReason)
+		}
 		if !*persist {
 			fmt.Printf("[plan] would install the %s boot guard, so a restart clears the selection rather than coming back up on a gate nothing re-confirmed\n", vpn.BootGuardName())
 		}
@@ -261,7 +265,8 @@ func reportContainerEgress(ctx context.Context, runner vpn.Runner) {
 		fmt.Printf("vpn: CONTAINER egress IP: not measurable — %s answers but defines no network with an IPv4 subnet\n", runtime.Name)
 		return
 	}
-	res := vpn.MeasureContainerEgress(ctx, runner, runtime, vpn.PickProbeNetwork(runtime, networks))
+	probeNetwork, _ := vpn.PickProbeNetwork(runtime, networks)
+	res := vpn.MeasureContainerEgress(ctx, runner, runtime, probeNetwork)
 	if res.IP == "" {
 		fmt.Printf("vpn: CONTAINER egress IP: UNKNOWN — %s\n", res.Error)
 		return

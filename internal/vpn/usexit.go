@@ -122,6 +122,9 @@ func ScopeRefusal(ctx context.Context, r Runner) string {
 	if len(networks) == 0 {
 		return fmt.Sprintf("%s answers on this host but defines no network with an IPv4 subnet, so there is no container traffic to route. %s", runtime.Name, NoContainerNetworkRefusal)
 	}
+	if probe, reason := PickProbeNetwork(runtime, networks); probe == "" {
+		return fmt.Sprintf("%s. %s", reason, NoAttachedContainerRefusal)
+	}
 	return ""
 }
 
@@ -255,6 +258,10 @@ type UseExitPlan struct {
 	Runtime      ContainerRuntime
 	Networks     []ContainerNetwork
 	ProbeNetwork string
+	// ProbeNetworkReason is why ProbeNetwork was picked (or, when ProbeNetwork
+	// is "", why nothing qualified) — see PickProbeNetwork. --plan prints it
+	// so the network it names is a measurement, not an assertion.
+	ProbeNetworkReason string
 	// Routes is exactly what will be installed — the container rules and the
 	// exclusions together. --plan prints it, ApplyRoutes consumes it, and
 	// there is no second derivation in between that could disagree.
@@ -365,7 +372,11 @@ func PlanUseExit(ctx context.Context, spec UseExitSpec) (*UseExitPlan, error) {
 		plan.Refusal = fmt.Sprintf("%s answers on this host but defines no network with an IPv4 subnet, so there is no container traffic to route. %s", plan.Runtime.Name, NoContainerNetworkRefusal)
 		return plan, nil
 	}
-	plan.ProbeNetwork = PickProbeNetwork(plan.Runtime, plan.Networks)
+	plan.ProbeNetwork, plan.ProbeNetworkReason = PickProbeNetwork(plan.Runtime, plan.Networks)
+	if plan.ProbeNetwork == "" {
+		plan.Refusal = fmt.Sprintf("%s. %s", plan.ProbeNetworkReason, NoAttachedContainerRefusal)
+		return plan, nil
+	}
 	for _, subnet := range ContainerSubnets(plan.Networks) {
 		plan.Routes.Containers = append(plan.Routes.Containers, ContainerRoute{
 			Prefix:   subnet,
@@ -702,7 +713,8 @@ func ClearExit(ctx context.Context, spec ClearExitSpec, progress Progress) (Clea
 	// lost its container runtime still needs its rules taken off.
 	if runtime, err := DetectContainerRuntime(ctx, runner); err == nil {
 		networks, _ := ContainerNetworks(ctx, runner, runtime)
-		res.ContainerEgress = MeasureContainerEgress(ctx, runner, runtime, PickProbeNetwork(runtime, networks))
+		probeNetwork, _ := PickProbeNetwork(runtime, networks)
+		res.ContainerEgress = MeasureContainerEgress(ctx, runner, runtime, probeNetwork)
 		if res.ContainerEgress.IP != "" {
 			progress.emit("info", "container egress is now %s (via %s, on network %s) — with no gate in force this should match the host's", res.ContainerEgress.IP, res.ContainerEgress.Via, res.ContainerEgress.Network)
 		} else {

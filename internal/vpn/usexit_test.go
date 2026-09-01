@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -91,6 +92,47 @@ func TestScopeRefusalRefusesAHostWithNoContainerRuntime(t *testing.T) {
 	}
 	if !strings.Contains(refusal, "refusal, not a reason to fall back") {
 		t.Fatalf("the refusal must say it is not a fallback, got %q", refusal)
+	}
+}
+
+// THE MEASURED BUG, one layer up from PickProbeNetwork's own unit tests: a
+// host whose runtime answers and whose networks all have an IPv4 subnet, but
+// where NOTHING has a container attached, must still be refused here — the
+// actual gate `use-exit` and `--plan` go through — not just at the pure
+// function underneath it. ScopeRefusal used to stop at "does len(networks)
+// == 0", which is exactly why the empty `podman` network on
+// b614f41828c8 was never caught: it has a subnet, so the old check passed.
+//
+// The runner is normalised for sudo because ScopeRefusal wraps every call in
+// PrivilegedRunner when the process is not UID 0, and this test has to pass
+// in both shapes — it is not testing privilege escalation, only the scope
+// decision above it.
+func TestScopeRefusalRefusesAHostWithNoAttachedContainer(t *testing.T) {
+	runner := runnerFunc(func(_ context.Context, name string, args ...string) (string, error) {
+		if name == "sudo" && len(args) >= 2 && args[0] == "-n" {
+			name, args = args[1], args[2:]
+		}
+		switch {
+		case name == "docker":
+			return "", errors.New("not found")
+		case len(args) >= 2 && args[0] == "network" && args[1] == "ls":
+			return "aw-remote-host\npodman\n", nil
+		case len(args) >= 1 && args[0] == "--version":
+			return "podman version 4.9.3\n", nil
+		case len(args) >= 2 && args[0] == "network" && args[1] == "inspect":
+			return podman4NetworkInspect, nil
+		case len(args) >= 1 && args[0] == "ps":
+			// every network answers with zero attached containers
+			return "", nil
+		}
+		return "", fmt.Errorf("unexpected command: %s %v", name, args)
+	})
+	refusal := ScopeRefusal(context.Background(), runner)
+	if refusal == "" {
+		t.Fatal("networks with subnets but no attached container must still be REFUSED, not silently probed")
+	}
+	if !strings.Contains(refusal, "container attached") {
+		t.Fatalf("the refusal must say why, got %q", refusal)
 	}
 }
 

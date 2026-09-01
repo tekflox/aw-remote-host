@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -122,6 +123,53 @@ func TestContainerSubnetsDeduplicatesAcrossNetworks(t *testing.T) {
 	}
 }
 
+// End-to-end through ContainerNetworks, not just PickProbeNetwork's own
+// hand-built fixtures: the `ps --filter network=<name>` measurement has to
+// actually reach ContainerNetwork.Attached, or PickProbeNetwork's corrected
+// logic would still be picking blind. Mirrors the real shape measured on the
+// aw-remote-host workspace container (b614f41828c8, 2026-09-01): `podman`
+// defined but empty, `aw-remote-host` carrying every real container.
+func TestContainerNetworksMeasuresAttachment(t *testing.T) {
+	runner := runnerFunc(func(_ context.Context, name string, args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "network" && args[1] == "ls" {
+			return "aw-remote-host\npodman\n", nil
+		}
+		if len(args) >= 2 && args[0] == "network" && args[1] == "inspect" {
+			if args[2] == "aw-remote-host" {
+				return `[{"name":"aw-remote-host","subnets":[{"subnet":"10.89.0.0/24"}]}]`, nil
+			}
+			return `[{"name":"podman","subnets":[{"subnet":"10.88.0.0/16"}]}]`, nil
+		}
+		if len(args) >= 1 && args[0] == "ps" {
+			network := ""
+			for _, a := range args {
+				if strings.HasPrefix(a, "network=") {
+					network = strings.TrimPrefix(a, "network=")
+				}
+			}
+			if network == "aw-remote-host" {
+				return "id1\nid2\nid3\n", nil
+			}
+			return "", nil
+		}
+		return "", fmt.Errorf("unexpected command: %s %v", name, args)
+	})
+	nets, err := ContainerNetworks(context.Background(), runner, ContainerRuntime{Name: "podman"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]int{}
+	for _, n := range nets {
+		byName[n.Name] = n.Attached
+	}
+	if byName["aw-remote-host"] != 3 {
+		t.Fatalf("aw-remote-host attachment = %d, want 3: %v", byName["aw-remote-host"], byName)
+	}
+	if byName["podman"] != 0 {
+		t.Fatalf("podman attachment = %d, want 0: %v", byName["podman"], byName)
+	}
+}
+
 // A runtime must ANSWER, not merely be on PATH. A `docker` shim with no daemon
 // behind it is this house's silent-degradation shape exactly: present, green,
 // and serving nothing.
@@ -169,20 +217,61 @@ func TestDetectContainerRuntimePrefersTheOneThatAnswers(t *testing.T) {
 // feature is a comparison.
 func TestPickProbeNetworkIsStable(t *testing.T) {
 	nets := []ContainerNetwork{
-		{Name: "aw-remote-host", Subnets: []string{"10.89.0.0/24"}},
-		{Name: "podman", Subnets: []string{"10.88.0.0/16"}},
+		{Name: "aw-remote-host", Subnets: []string{"10.89.0.0/24"}, Attached: 75},
+		{Name: "podman", Subnets: []string{"10.88.0.0/16"}, Attached: 3},
 	}
 	rt := ContainerRuntime{Name: "podman"}
-	if got := PickProbeNetwork(rt, nets); got != "podman" {
-		t.Fatalf("the runtime's default should win, got %q", got)
+	if got, _ := PickProbeNetwork(rt, nets); got != "podman" {
+		t.Fatalf("the runtime's default should win when it too is populated, got %q", got)
 	}
-	// With the default gone, the first by name — never "whichever came back
-	// first from the runtime".
-	if got := PickProbeNetwork(rt, nets[:1]); got != "aw-remote-host" {
+	// With the default gone, the first by name among the populated ones —
+	// never "whichever came back first from the runtime".
+	if got, _ := PickProbeNetwork(rt, nets[:1]); got != "aw-remote-host" {
 		t.Fatalf("got %q", got)
 	}
-	if got := PickProbeNetwork(rt, nil); got != "" {
-		t.Fatalf("no networks is an empty answer, not a guess: %q", got)
+	if got, reason := PickProbeNetwork(rt, nil); got != "" || reason == "" {
+		t.Fatalf("no networks is an empty answer WITH a reason, not a guess: %q %q", got, reason)
+	}
+}
+
+// THE MEASURED BUG (finding vpn:pick-probe-network-prefers-empty-podman-network,
+// confirmed live on the aw-remote-host workspace container b614f41828c8,
+// 2026-09-01): the default-named network is NOT always the populated one.
+// Preferring it by NAME picked `podman` while it sat empty and all 75 real
+// containers were on `aw-remote-host`. The choice must be keyed on which
+// network has a container ATTACHED, not on which one matches the runtime's
+// default name.
+func TestPickProbeNetworkPrefersThePopulatedNetworkOverTheDefaultName(t *testing.T) {
+	nets := []ContainerNetwork{
+		{Name: "aw-remote-host", Subnets: []string{"10.89.0.0/24"}, Attached: 75},
+		{Name: "podman", Subnets: []string{"10.88.0.0/16"}, Attached: 0},
+	}
+	rt := ContainerRuntime{Name: "podman"}
+	got, reason := PickProbeNetwork(rt, nets)
+	if got != "aw-remote-host" {
+		t.Fatalf("the populated network must win over the empty default-named one, got %q", got)
+	}
+	if !strings.Contains(reason, "aw-remote-host") || !strings.Contains(reason, "75") {
+		t.Fatalf("the reason must name the network chosen and how many containers justified it: %q", reason)
+	}
+}
+
+// The other half of the same fix: a host whose networks are all defined but
+// none has a container attached is not "pick the first one anyway" — it is a
+// refusal with a reason, the same honesty contract NoContainerNetworkRefusal
+// already holds one step earlier for a runtime with no network at all.
+func TestPickProbeNetworkRefusesWhenNothingIsAttached(t *testing.T) {
+	nets := []ContainerNetwork{
+		{Name: "aw-remote-host", Subnets: []string{"10.89.0.0/24"}, Attached: 0},
+		{Name: "podman", Subnets: []string{"10.88.0.0/16"}, Attached: 0},
+	}
+	rt := ContainerRuntime{Name: "podman"}
+	got, reason := PickProbeNetwork(rt, nets)
+	if got != "" {
+		t.Fatalf("no network has a container attached — the answer must be a refusal, not %q", got)
+	}
+	if reason == "" || !strings.Contains(reason, "2") {
+		t.Fatalf("the refusal must say why: %q", reason)
 	}
 }
 

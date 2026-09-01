@@ -125,6 +125,13 @@ func DetectContainerRuntime(ctx context.Context, r Runner) (ContainerRuntime, er
 type ContainerNetwork struct {
 	Name    string
 	Subnets []string
+	// Attached is how many containers this network currently has attached,
+	// measured by `<runtime> ps --filter network=<name>` rather than read off
+	// `network inspect` — whose JSON carries no container list on either
+	// runtime (podman's own inspect output has no "containers" key at all;
+	// verified on the aw-remote-host workspace container, 2026-09-01).
+	// PickProbeNetwork exists to key off this instead of the network's name.
+	Attached int
 }
 
 // ContainerNetworks lists every network with at least one IPv4 subnet.
@@ -160,10 +167,29 @@ func ContainerNetworks(ctx context.Context, r Runner, rt ContainerRuntime) ([]Co
 		if len(subnets) == 0 {
 			continue
 		}
-		nets = append(nets, ContainerNetwork{Name: name, Subnets: subnets})
+		nets = append(nets, ContainerNetwork{
+			Name:     name,
+			Subnets:  subnets,
+			Attached: countAttachedContainers(ctx, r, rt, name),
+		})
 	}
 	sort.Slice(nets, func(i, j int) bool { return nets[i].Name < nets[j].Name })
 	return nets, nil
+}
+
+// countAttachedContainers measures how many containers a network actually
+// has attached. Best-effort and fails CLOSED: a network whose attachment
+// could not be measured counts as unpopulated rather than as populated,
+// because the cost of the two mistakes is not symmetric here — probing a
+// network nothing lives on produces a confident wrong answer (the bug this
+// whole file exists to fix), while refusing a network that was in fact
+// populated only costs a clearer error message.
+func countAttachedContainers(ctx context.Context, r Runner, rt ContainerRuntime, network string) int {
+	out, err := r.Run(ctx, rt.Name, "ps", "--filter", "network="+network, "--format", "{{.ID}}")
+	if err != nil {
+		return 0
+	}
+	return len(strings.Fields(out))
 }
 
 // parseNetworkSubnets pulls IPv4 CIDRs out of a `network inspect` document.
@@ -258,22 +284,52 @@ func NetworksFor(nets []ContainerNetwork, subnet string) []string {
 	return out
 }
 
-// PickProbeNetwork chooses the network the egress probe runs on.
+// NoAttachedContainerRefusal is the refusal one step further than
+// NoContainerNetworkRefusal: every network the runtime named has an IPv4
+// subnet, but none has a single container attached to probe from. Kept
+// separate because the remedy is different — start a container on one of
+// them, not create a new network.
+const NoAttachedContainerRefusal = "start a container on one of them (or point this host at the network that already has containers) and re-run; routing the host instead is not an option this verb offers."
+
+// PickProbeNetwork chooses the network the egress probe runs on, and reports
+// why — so the plan text can say which network was picked instead of merely
+// asserting one.
 //
-// The runtime's default is preferred and the choice is otherwise the first by
-// name, so the same host measured twice reports the same number — an egress
-// measurement that silently changes which network it describes is worse than
-// no measurement, because the two answers are both true and not comparable.
-func PickProbeNetwork(rt ContainerRuntime, nets []ContainerNetwork) string {
-	if len(nets) == 0 {
-		return ""
-	}
+// This used to prefer the runtime's DEFAULT-NAMED network unconditionally,
+// which assumed the default network is the populated one. Measured wrong on
+// the aw-remote-host workspace container itself (b614f41828c8, 2026-09-01):
+// `podman` (10.88.0.0/16) is the default-named network and it is EMPTY,
+// while all 75 real containers are on `aw-remote-host` (10.89.0.0/24). A
+// probe run there would have measured nothing while a `--plan` confidently
+// named the empty network.
+//
+// The choice is now MEASURED: a network only qualifies if it has at least
+// one container ATTACHED (ContainerNetwork.Attached, from `ps --filter
+// network=<name>`). Among networks that qualify, the runtime's default name
+// is still preferred and the fallback is still the first by name — nets
+// arrives sorted from ContainerNetworks — so a host measured twice with the
+// same containers attached still reports the same network.
+//
+// Returns "" with the reason when no network qualifies. That is a refusal,
+// not "pick the first one anyway": a host with networks but no attached
+// containers has nothing whose egress this feature could move.
+func PickProbeNetwork(rt ContainerRuntime, nets []ContainerNetwork) (network, reason string) {
+	var populated []ContainerNetwork
 	for _, n := range nets {
-		if n.Name == rt.DefaultNetwork() {
-			return n.Name
+		if n.Attached > 0 {
+			populated = append(populated, n)
 		}
 	}
-	return nets[0].Name
+	if len(populated) == 0 {
+		return "", fmt.Sprintf("none of the %d container network(s) this host defines has a container attached, so there is nothing to measure egress from", len(nets))
+	}
+	for _, n := range populated {
+		if n.Name == rt.DefaultNetwork() {
+			return n.Name, fmt.Sprintf("%s (%d container(s) attached) — the runtime's default network", n.Name, n.Attached)
+		}
+	}
+	n := populated[0]
+	return n.Name, fmt.Sprintf("%s (%d container(s) attached) — the runtime's default network (%s) has none attached", n.Name, n.Attached, rt.DefaultNetwork())
 }
 
 // ContainerEgressResult is one container-egress measurement, with everything
