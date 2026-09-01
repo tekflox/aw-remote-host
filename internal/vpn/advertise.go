@@ -35,11 +35,63 @@ import (
 // the same reason bootstrap/lib/vpn.sh exists.
 const sysctlDropIn = "/etc/sysctl.d/99-aw-vpn-exit-node.conf"
 
-// forwardingSysctls are what the kernel needs before it will pass another
+// forwardingSysctls are what a LINUX kernel needs before it will pass another
 // node's packets at all. Both families: approving only the v4 half leaves a
 // node tailscale still calls an exit node while half of a dual-stack client's
 // traffic goes nowhere.
 var forwardingSysctls = []string{"net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"}
+
+// darwinForwardingSysctls are the same two knobs under the names macOS gives
+// them. Different names, identical stakes.
+var darwinForwardingSysctls = []string{"net.inet.ip.forwarding", "net.inet6.ip6.forwarding"}
+
+// forwarding is one OS's answer to "make this kernel pass another node's
+// packets, and keep it that way across a reboot".
+//
+// It is a small value dispatched on the measured Host.OS rather than a build
+// tag, for the reason usexit_platform.go gives at length: the darwin
+// behaviour has to be testable from the Linux container this project builds
+// in, and a build-tagged darwin file is code nobody here can run a test
+// against until it is already on somebody's laptop.
+type forwarding struct {
+	// keys are the sysctls, set in this order and read back in it.
+	keys []string
+	// persistPath is the file that makes it survive a reboot. Named in every
+	// warning and refusal that mentions it, so a human can go and look.
+	persistPath string
+	// persistScript is the shell that writes persistPath. On Linux it owns a
+	// drop-in of its own and may overwrite it; on macOS there is no
+	// /etc/sysctl.d and the file is SHARED, so the script merges — discarding
+	// somebody's other kernel settings to turn on forwarding would be a
+	// second, unasked-for change to their machine.
+	persistScript string
+}
+
+func forwardingFor(goos string) (forwarding, bool) {
+	switch goos {
+	case "linux":
+		return forwarding{
+			keys:        forwardingSysctls,
+			persistPath: sysctlDropIn,
+			persistScript: fmt.Sprintf("printf '%%s' %q > %s",
+				"net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n", sysctlDropIn),
+		}, true
+	case "darwin":
+		return forwarding{
+			keys:        darwinForwardingSysctls,
+			persistPath: darwinSysctlConf,
+			// Written through a temp file because the read and the write are
+			// the same path: `cat f | ... > f` truncates f before cat opens
+			// it, which would turn "add two keys" into "delete everything
+			// else in it".
+			persistScript: fmt.Sprintf(
+				`{ cat %[1]s 2>/dev/null | grep -v '^net\.inet\.ip\.forwarding=' | grep -v '^net\.inet6\.ip6\.forwarding='; printf 'net.inet.ip.forwarding=1\nnet.inet6.ip6.forwarding=1\n'; } > %[1]s.aw-new && mv %[1]s.aw-new %[1]s`,
+				darwinSysctlConf),
+		}, true
+	default:
+		return forwarding{}, false
+	}
+}
 
 // AdvertiseResult is everything one advertise/withdraw measured, kept whole so
 // a caller reports what happened rather than what it asked for.
@@ -113,13 +165,33 @@ func Advertise(ctx context.Context, r Runner, priv Runner, elig Eligibility, on 
 		return res, nil
 	}
 
+	// Which sysctls, and which file keeps them. Resolve has already refused
+	// every OS that has no answer here; this is the backstop that keeps a
+	// future caller from reaching the kernel steps with none.
+	fwd, ok := forwardingFor(elig.Host.OS)
+	if on && !ok {
+		res.Refused = true
+		res.Refusal = fmt.Sprintf("%s has no exit-gate forwarding implementation in this module — only linux and darwin can be advertised as a gate.", elig.Host.OS)
+		res.Warning = ""
+		return res, nil
+	}
+	// The route reader is picked from the MEASURED host rather than from
+	// runtime.GOOS — `ip route get` on Linux, `route -n get` on macOS — for
+	// the reason usexit_platform.go's header gives: the darwin behaviour has
+	// to be testable from the Linux container this project builds in.
+	// RouteDevice, the exported helper, still dispatches on runtime.GOOS,
+	// which is exact for the callers that have no Host to read it off.
+	plat, platErr := platformForOS(elig.Host.OS)
+
 	// Measured first, so the invariant has a baseline even on the paths that
-	// fail later. RouteDevice's error is not fatal here: it is evidence about
-	// a claim, not a precondition of the change.
-	res.RouteBefore, _ = RouteDevice(ctx, r, publicProbeAddr)
+	// fail later. A route that could not be read is not fatal here: it is
+	// evidence about a claim, not a precondition of the change.
+	if platErr == nil {
+		res.RouteBefore, _ = plat.routeDevice(ctx, r, publicProbeAddr)
+	}
 
 	if on {
-		if err := enableForwarding(ctx, priv, progress); err != nil {
+		if err := enableForwarding(ctx, r, priv, elig.Host, fwd, progress); err != nil {
 			res.Refused = true
 			res.Refusal = fmt.Sprintf(
 				"this host cannot forward another node's packets: %s. Without kernel IP "+
@@ -128,17 +200,19 @@ func Advertise(ctx context.Context, r Runner, priv Runner, elig Eligibility, on 
 			res.Warning = ""
 			return res, nil
 		}
-		res.Forwarding = readForwarding(ctx, r)
+		res.Forwarding = readForwarding(ctx, r, fwd)
 		progress.emit("info", "advertising 0.0.0.0/0 and ::/0 — a control-plane admin still has to approve them")
 	} else {
 		progress.emit("info", "withdrawing this host's exit-route advertisement")
 	}
 
-	if err := setAdvertiseExit(ctx, priv, on); err != nil {
+	if err := setAdvertiseExit(ctx, r, priv, elig.Host, on); err != nil {
 		return res, err
 	}
 
-	res.RouteAfter, _ = RouteDevice(ctx, r, publicProbeAddr)
+	if platErr == nil {
+		res.RouteAfter, _ = plat.routeDevice(ctx, r, publicProbeAddr)
+	}
 	if !res.RouteUnchanged() {
 		// Loud, and not silently corrected. Advertising must never move the
 		// advertiser's own route; if it ever does, the interesting thing is
@@ -170,39 +244,79 @@ func Advertise(ctx context.Context, r Runner, priv Runner, elig Eligibility, on 
 // halves of this package agree about what they are measuring.
 const publicProbeAddr = "1.1.1.1"
 
-func setAdvertiseExit(ctx context.Context, priv Runner, on bool) error {
+// setAdvertiseExit writes the preference, through whichever runner this
+// platform's daemon will actually accept it from.
+//
+// On Linux that is the privileged one and there is nothing to choose. On
+// macOS the order is REVERSED and deliberately so: tailscaled runs as a root
+// LaunchDaemon and gates prefs writes on the CALLING user, granted once by
+// `tailscale set --operator=<user>`. Wrapping that in `sudo -n` on a Mac that
+// has the grant — Mac.Home has it, OperatorUser "aw", measured 2026-09-01 —
+// swaps a working call for "sudo: a password is required", which reports the
+// wrong blocker about a machine that is fine. Same lesson, and the same
+// remedy, as darwinExit.preflight.
+//
+// The FIRST failure is the one reported: on darwin that is the unprivileged
+// attempt, which is the meaningful one. A trailing "a password is required"
+// from the fallback would bury it.
+func setAdvertiseExit(ctx context.Context, r Runner, priv Runner, h Host, on bool) error {
 	arg := "--advertise-exit-node=false"
 	if on {
 		arg = "--advertise-exit-node=true"
 	}
-	out, err := priv.Run(ctx, "tailscale", "set", arg)
-	if err != nil {
-		return fmt.Errorf("tailscale set %s: %w: %s", arg, err, strings.TrimSpace(out))
+	runners := []Runner{priv}
+	if h.OS == "darwin" {
+		runners = []Runner{r, priv}
 	}
-	return nil
+	var firstOut string
+	var firstErr error
+	for _, runner := range runners {
+		out, err := runner.Run(ctx, "tailscale", "set", arg)
+		if err == nil {
+			return nil
+		}
+		if firstErr == nil {
+			firstOut, firstErr = out, err
+		}
+	}
+	return fmt.Errorf("tailscale set %s: %w: %s", arg, firstErr, strings.TrimSpace(firstOut))
 }
 
 // enableForwarding turns both sysctls on for this boot AND persists them,
 // then PROVES it by reading them back.
 //
-// The read-back is the point. `sysctl -w` on a container with a read-only
-// /proc/sys succeeds in some runtimes and changes nothing, and a gate whose
-// kernel silently drops forwarded packets is indistinguishable, from the
-// outside, from a gate nobody approved.
-func enableForwarding(ctx context.Context, priv Runner, progress Progress) error {
-	drop := "net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n"
-	// Persisted to the same drop-in install.sh writes, so a reboot does not
-	// quietly retire a gate other hosts are pointing at.
-	if out, err := priv.Run(ctx, "sh", "-c",
-		fmt.Sprintf("printf '%%s' %q > %s", drop, sysctlDropIn)); err != nil {
-		progress.emit("warning", "could not persist %s (%s) — forwarding will not survive a reboot", sysctlDropIn, strings.TrimSpace(out))
+// The read-back is the point, and it is the only thing here that decides
+// anything. `sysctl -w` on a container with a read-only /proc/sys succeeds in
+// some runtimes and changes nothing, and a gate whose kernel silently drops
+// forwarded packets is indistinguishable, from the outside, from a gate
+// nobody approved.
+//
+// The reads go through the UNPRIVILEGED runner: reading a sysctl needs no
+// root anywhere, and asking through `sudo -n` on a Mac without passwordless
+// sudo would turn a perfectly readable "1" into a permission error about the
+// wrong thing.
+func enableForwarding(ctx context.Context, r Runner, priv Runner, h Host, fwd forwarding, progress Progress) error {
+	if allForwarding(readForwarding(ctx, r, fwd)) && !h.Privileged() {
+		// The Mac an administrator has already prepared. Setting is
+		// unnecessary, persisting is impossible from here, and failing on
+		// `sudo -n` would refuse a machine that forwards perfectly well. What
+		// this process cannot guarantee is said, not silently assumed.
+		progress.emit("warning",
+			"kernel forwarding is already on and this process has no root to write %s — a reboot may retire this gate silently, so re-check `sysctl -n %s` after a restart",
+			fwd.persistPath, fwd.keys[0])
+		return nil
 	}
-	for _, key := range forwardingSysctls {
+	// Persisted to the same file install.sh writes, so a reboot does not
+	// quietly retire a gate other hosts are pointing at.
+	if out, err := priv.Run(ctx, "sh", "-c", fwd.persistScript); err != nil {
+		progress.emit("warning", "could not persist %s (%s) — forwarding will not survive a reboot", fwd.persistPath, strings.TrimSpace(out))
+	}
+	for _, key := range fwd.keys {
 		if out, err := priv.Run(ctx, "sysctl", "-w", key+"=1"); err != nil {
 			return fmt.Errorf("sysctl -w %s=1: %v: %s", key, err, strings.TrimSpace(out))
 		}
 	}
-	for key, ok := range readForwarding(ctx, priv) {
+	for key, ok := range readForwarding(ctx, r, fwd) {
 		if !ok {
 			return fmt.Errorf("%s is still not 1 after being set — this kernel is not letting this host enable forwarding (a container with a read-only /proc/sys is the usual cause)", key)
 		}
@@ -210,11 +324,25 @@ func enableForwarding(ctx context.Context, priv Runner, progress Progress) error
 	return nil
 }
 
-func readForwarding(ctx context.Context, r Runner) map[string]bool {
+func readForwarding(ctx context.Context, r Runner, fwd forwarding) map[string]bool {
 	out := map[string]bool{}
-	for _, key := range forwardingSysctls {
+	for _, key := range fwd.keys {
 		raw, err := r.Run(ctx, "sysctl", "-n", key)
 		out[key] = err == nil && strings.TrimSpace(raw) == "1"
 	}
 	return out
+}
+
+// allForwarding is true only when every family reads 1. An empty map is
+// false: "nothing was measured" is not "everything is on".
+func allForwarding(state map[string]bool) bool {
+	if len(state) == 0 {
+		return false
+	}
+	for _, on := range state {
+		if !on {
+			return false
+		}
+	}
+	return true
 }

@@ -32,12 +32,28 @@ func surfaceWSL() Host {
 	return h
 }
 
-// macHome — Mac.Home / 824decc7. Measured: Darwin 25.5.0, id -u 503,
-// `sudo -n true` -> "sudo: a password is required" (exit 1), brew at
-// /opt/homebrew/bin/brew, /opt/homebrew owned by fredericowu:admin (mode
-// drwxr-xr-x, so uid 503 cannot write to it), tailscale already installed by
-// hand at /opt/homebrew/bin/tailscale.
+// macHome — Mac.Home / 824decc7, as it really is. Measured 2026-09-01:
+// macOS 26.5.1 arm64, id -u 503, `sudo -n -l` -> "sudo: a password is
+// required", brew at /opt/homebrew/bin/brew owned by another account (uid 503
+// cannot write to it), tailscale 1.102.3 at /opt/homebrew/bin/tailscale,
+// BackendState Running at 100.64.0.3 against headscale.aw.tekflox.com,
+// OperatorUser "aw", net.inet.ip.forwarding = 0.
+//
+// Enrolled is the field this fixture existed without for a week, and its
+// absence is what the 2026-09-01 card was about: every test here agreed the
+// Mac "could not enrol" while the Mac was on the mesh.
 func macHome() Host {
+	h := macHomeBeforeEnrolment()
+	h.Enrolled = true
+	return h
+}
+
+// macHomeBeforeEnrolment is the same machine on the day it was NOT yet on the
+// mesh — the shape the installer-side refusals are really about. Kept
+// separate because those refusals are still correct for it, and folding the
+// two would have exactly the effect this card had to undo: an answer about
+// installing tailscale, given to a machine that already runs it.
+func macHomeBeforeEnrolment() Host {
 	return Host{
 		OS: "darwin", Arch: "arm64",
 		UID: 503, PasswordlessSudo: false,
@@ -115,7 +131,7 @@ func TestResolveRefusalsCarryNoWarning(t *testing.T) {
 // proxy and NOT an interface — so a "successful" install would carry none of
 // the machine's traffic while reporting that it had joined.
 func TestResolveMacWithoutSudoIsRefused(t *testing.T) {
-	e := Resolve(macHome())
+	e := Resolve(macHomeBeforeEnrolment())
 	if e.CanEnroll {
 		t.Fatal("Mac.Home has no passwordless sudo and an unwritable brew prefix — it must be refused")
 	}
@@ -140,7 +156,7 @@ func TestResolveMacWithoutSudoIsRefused(t *testing.T) {
 // "no sudo" when the real blocker is the prefix sends the user to fix the
 // wrong thing.
 func TestResolveMacUnwritableBrewIsReportedBeforeSudo(t *testing.T) {
-	h := macHome()
+	h := macHomeBeforeEnrolment()
 	h.PasswordlessSudo = true
 	e := Resolve(h)
 	if e.CanEnroll {
@@ -152,7 +168,7 @@ func TestResolveMacUnwritableBrewIsReportedBeforeSudo(t *testing.T) {
 }
 
 func TestResolveMacWithSudoAndOwnBrewIsEligible(t *testing.T) {
-	h := macHome()
+	h := macHomeBeforeEnrolment()
 	h.PasswordlessSudo = true
 	h.BrewWritable = true
 	e := Resolve(h)
@@ -162,11 +178,101 @@ func TestResolveMacWithSudoAndOwnBrewIsEligible(t *testing.T) {
 	if e.Installer != InstallerHomebrew {
 		t.Fatalf("installer = %q", e.Installer)
 	}
-	// macOS exit nodes need a different sysctl and have not been exercised on
-	// real hardware. Claiming them untested is exactly the silent degradation
-	// this package refuses to produce.
+	// CHANGED 2026-09-01. This used to assert "macOS exit nodes are
+	// deliberately not claimed", which was the honest answer while nothing
+	// here knew how to enable net.inet forwarding. The way to retire a
+	// refusal like that is to implement it, so a Mac with root may now be a
+	// gate — and, like WSL2, it says what that costs.
+	if !e.CanAdvertiseExit {
+		t.Fatalf("a Mac that can elevate may serve as a gate: %s", e.ExitRefusal)
+	}
+	if !strings.Contains(e.ExitWarning, "sysctl.conf") {
+		t.Fatalf("the persistence caveat is the price and must travel with the permission: %q", e.ExitWarning)
+	}
+}
+
+// BUG 1, and the reason this card existed. The Mac is on the mesh, Running at
+// 100.64.0.3, and every refusal in the darwin enrolment branch is about the
+// INSTALLER — a Homebrew prefix owned by another account. Asking "could I
+// install tailscale" about a machine that already runs it produced "NOT
+// eligible to enrol", and that verdict then short-circuited the ADVERTISE
+// decision before the darwin branch was ever evaluated.
+func TestResolveMacAlreadyOnTheMeshIsNotJudgedByItsInstaller(t *testing.T) {
+	e := Resolve(macHome())
+	if !e.CanEnroll {
+		t.Fatalf("a node with BackendState=Running is enrolled, whatever brew would have said: %s", e.EnrollRefusal)
+	}
+	if !e.AlreadyEnrolled {
+		t.Fatal("CanEnroll on an already-enrolled host must say WHY, or `status` reports a week-old decision as a future one")
+	}
+	if e.Installer != InstallerNone {
+		t.Fatalf("nothing needs installing here, installer = %q", e.Installer)
+	}
+	if strings.Contains(e.ExitRefusal, "cannot join the mesh at all") {
+		t.Fatalf("an installation verdict is still short-circuiting the advertise decision: %q", e.ExitRefusal)
+	}
+	if !strings.HasPrefix(e.Describe(), "already enrolled") {
+		t.Fatalf("got %q", e.Describe())
+	}
+}
+
+// The counterpart, and the reason this is darwin-only. Without root, Linux
+// tailscaled falls back to --tun=userspace-networking: it reports
+// BackendState=Running, provides a SOCKS5 proxy, and carries none of the
+// machine's traffic. "Running" is precisely the claim that must not be
+// trusted there, so it does not get to overrule the check that catches it.
+func TestEnrolledDoesNotExcuseALinuxHostWithoutRoot(t *testing.T) {
+	h := bareMetal()
+	h.UID, h.PasswordlessSudo, h.Enrolled = 1000, false, true
+	e := Resolve(h)
+	if e.CanEnroll {
+		t.Fatal("a Running Linux node without root may be userspace-networking — that must still refuse")
+	}
+	if !strings.Contains(e.EnrollRefusal, "userspace-networking") {
+		t.Fatalf("got %q", e.EnrollRefusal)
+	}
+}
+
+// BUG 2. The Mac cannot elevate, so it cannot set the sysctl, so it must NOT
+// advertise — and the refusal is only useful if it hands over the exact
+// command that fixes it. Half of this (advertised, not forwarding) is worse
+// than none: the control plane can approve it, a peer can select it, and the
+// traffic dies silently.
+func TestResolveMacWithoutForwardingRefusesWithTheCommandThatFixesIt(t *testing.T) {
+	e := Resolve(macHome())
 	if e.CanAdvertiseExit {
-		t.Fatal("macOS exit nodes are deliberately not claimed")
+		t.Fatal("net.inet.ip.forwarding is 0 and this process cannot set it — advertising anyway is the silent failure")
+	}
+	for _, want := range []string{
+		"net.inet.ip.forwarding",   // the actual knob, by its macOS name
+		"sudo /usr/sbin/sysctl -w", // the literal command, absolute path
+		"/etc/sysctl.conf",         // and how it survives a reboot
+		"uid 503",                  // why this process cannot do it itself
+	} {
+		if !strings.Contains(e.ExitRefusal, want) {
+			t.Fatalf("the refusal must carry %q, got %q", want, e.ExitRefusal)
+		}
+	}
+	if e.ExitWarning != "" {
+		t.Fatalf("a refusal must not also carry a warning: %q", e.ExitWarning)
+	}
+}
+
+// A Mac whose administrator has already enabled forwarding may advertise as
+// an ORDINARY USER. Refusing it on uid would refuse a machine that works: the
+// prefs write is granted per-user by `tailscale set --operator=`, which needs
+// no root, and the sysctl is already done. What this process cannot promise —
+// keeping it across a reboot — travels out as the warning rather than being
+// assumed either way.
+func TestResolveMacWithForwardingAlreadyOnMayAdvertiseWithoutRoot(t *testing.T) {
+	h := macHome()
+	h.IPForward = true
+	e := Resolve(h)
+	if !e.CanAdvertiseExit {
+		t.Fatalf("forwarding is on; the only other step needs no root: %s", e.ExitRefusal)
+	}
+	if !strings.Contains(e.ExitWarning, "reboot") || !strings.Contains(e.ExitWarning, "/etc/sysctl.conf") {
+		t.Fatalf("what this process cannot guarantee has to be said: %q", e.ExitWarning)
 	}
 }
 
@@ -240,7 +346,7 @@ func TestDescribeSaysWhichOfTheTwoVerdictsFailed(t *testing.T) {
 	if got := Resolve(noSystemd).Describe(); !strings.Contains(got, "NOT eligible") {
 		t.Fatalf("got %q", got)
 	}
-	if got := Resolve(macHome()).Describe(); !strings.HasPrefix(got, "NOT eligible to enrol") {
+	if got := Resolve(macHomeBeforeEnrolment()).Describe(); !strings.HasPrefix(got, "NOT eligible to enrol") {
 		t.Fatalf("got %q", got)
 	}
 }

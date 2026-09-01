@@ -10,39 +10,20 @@ package ops
 
 import (
 	"context"
-	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/tekflox/aw-remote-host/internal/vpn"
 )
 
-// tailscaleSearchPath is where a tailscale binary lives when it is not on the
-// daemon's own PATH. macOS is the case that forced this to exist: Homebrew
-// installs to /opt/homebrew/bin, which a launchd-started process does not
-// inherit, so a bare LookPath on Mac.Home answers "not installed" about a
-// machine that is demonstrably on the mesh.
-var tailscaleSearchPath = []string{
-	"/usr/bin/tailscale",
-	"/usr/local/bin/tailscale",
-	"/opt/homebrew/bin/tailscale",
-	"/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-}
-
 // lookupTailscale resolves the tailscale binary, or "" when this host has
 // none. A var so a test can pin the answer instead of depending on whatever
 // happens to be installed on the machine running `go test`.
-var lookupTailscale = func() string {
-	if path, err := exec.LookPath("tailscale"); err == nil {
-		return path
-	}
-	for _, candidate := range tailscaleSearchPath {
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			return candidate
-		}
-	}
-	return ""
-}
+//
+// The search list itself moved to internal/vpn on 2026-09-01, because
+// vpn.Probe needs the same answer: it now reads whether this node is ALREADY
+// enrolled, and a probe that could not find Homebrew's tailscale would report
+// a Mac as off a mesh it has been on for a week.
+var lookupTailscale = vpn.LookupTailscale
 
 // tailscaleRunner rewrites the bare "tailscale" internal/vpn shells out to
 // into the absolute path lookupTailscale found, so the vpn package keeps its

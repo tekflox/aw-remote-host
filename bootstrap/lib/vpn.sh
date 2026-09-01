@@ -26,10 +26,28 @@ vpn_is_wsl() {
 # vpn_exit_eligible reports whether this host may advertise itself as an exit
 # gate, printing the reason to stderr when it may not.
 vpn_exit_eligible() {
-  if [ "$(uname -s)" != "Linux" ]; then
-    echo "vpn: advertising an exit node needs kernel IP forwarding, which this module only knows how to enable on Linux — $(uname -s) is untested and deliberately not claimed." >&2
-    return 1
-  fi
+  case "$(uname -s)" in
+    Linux) ;;
+    Darwin)
+      # ALLOWED SINCE 2026-09-01, and internal/vpn's Resolve() changed in the
+      # same breath — the two must keep agreeing or the module never
+      # converges (see the header). macOS forwards through net.inet.* rather
+      # than net.ipv4.*/net.ipv6.*, and install.sh below enables and persists
+      # exactly those; there is no /etc/sysctl.d there, so persistence goes
+      # to /etc/sysctl.conf, which sysctl.conf(5) says is read when the
+      # system goes into multi-user mode.
+      #
+      # This branch runs under install.sh, which already needs $SUDO on macOS
+      # for `tailscaled install-system-daemon` — so the privilege the sysctl
+      # needs is the privilege this path already has. A Mac WITHOUT it never
+      # reaches here: Resolve() refuses first, naming the command to run.
+      return 0
+      ;;
+    *)
+      echo "vpn: advertising an exit node needs kernel IP forwarding, which this module only knows how to enable on Linux and macOS — $(uname -s) is untested and deliberately not claimed." >&2
+      return 1
+      ;;
+  esac
   if vpn_is_wsl; then
     # ALLOWED SINCE 2026-08-26, with the cost printed. This used to return 1,
     # and internal/vpn's Resolve() has been changed in the same breath — the

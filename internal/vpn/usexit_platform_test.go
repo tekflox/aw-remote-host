@@ -13,22 +13,28 @@ import (
 // on a build tag is what makes them possible at all — see
 // usexit_platform.go's header.
 
-// THE VERDICT THE WHOLE CARD TURNS ON. Mac.Home can never ENROL: /opt/homebrew
-// belongs to another account, so `brew install tailscale` fails on
-// permissions and CanEnroll is false forever. It can still SELECT a gate —
-// tailscale is already installed there by hand and tailscaled runs as a root
-// LaunchDaemon. Deciding the second question with the first one's answer sent
-// the machine's owner to fix Homebrew, which would have changed nothing.
+// THE VERDICT THIS CARD TURNED ON. A Mac that could never be enrolled FROM
+// HERE — /opt/homebrew belongs to another account, so `brew install tailscale`
+// fails on permissions — can still SELECT a gate, because tailscale is
+// installed there by hand and tailscaled runs as a root LaunchDaemon.
+// Deciding the second question with the first one's answer sent the machine's
+// owner to fix Homebrew, which would have changed nothing.
+//
+// The fixture is macHomeBeforeEnrolment since 2026-09-01: the real Mac is on
+// the mesh now, and Resolve stopped judging an enrolled node by its installer
+// (see TestResolveMacAlreadyOnTheMeshIsNotJudgedByItsInstaller). The
+// three-way split this test guards is unchanged, so it keeps the host that
+// still exercises it.
 func TestMacThatCannotEnrolCanStillSelectAGate(t *testing.T) {
-	e := Resolve(macHome())
+	e := Resolve(macHomeBeforeEnrolment())
 	if e.CanEnroll {
-		t.Fatal("Mac.Home cannot enrol — the brew prefix belongs to someone else")
+		t.Fatal("this Mac cannot enrol — the brew prefix belongs to someone else")
 	}
 	if !e.CanSelectExit {
 		t.Fatalf("but it CAN be pointed at a gate: %s", e.SelectExitRefusal)
 	}
 	if e.CanAdvertiseExit {
-		t.Fatal("selecting a gate must not imply offering one — forwarding needs a sysctl nobody here has exercised")
+		t.Fatal("selecting a gate must not imply offering one")
 	}
 }
 

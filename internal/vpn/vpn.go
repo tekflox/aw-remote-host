@@ -28,6 +28,7 @@
 package vpn
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,6 +36,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Environment variables bootstrap/vpn/install.sh and verify.sh read — the
@@ -97,10 +99,30 @@ type Host struct {
 	PasswordlessSudo bool
 	HasTUN           bool // /dev/net/tun exists and is a device node (Linux)
 	HasSystemd       bool // /run/systemd/system exists — systemd is PID 1
-	IPForward        bool // net.ipv4.ip_forward is already 1
-	BrewPrefix       string
-	BrewWritable     bool
-	TailscalePath    string // "" when tailscale is not on PATH
+	// IPForward is whether this kernel ALREADY forwards another node's
+	// packets, both families. The keys differ per platform —
+	// net.ipv4.ip_forward + net.ipv6.conf.all.forwarding on Linux,
+	// net.inet.ip.forwarding + net.inet6.ip6.forwarding on macOS — and both
+	// halves are required: a gate that forwards v4 and not v6 is a gate half
+	// of a dual-stack client's traffic dies in.
+	IPForward     bool
+	BrewPrefix    string
+	BrewWritable  bool
+	TailscalePath string // "" when tailscale is nowhere this module looks
+	// Enrolled is whether this node is not merely CAPABLE of joining the mesh
+	// but already on it: tailscale is present and its backend reports
+	// Running. It is measured because "could tailscale be installed here" and
+	// "is tailscale already working here" are different questions, and until
+	// 2026-09-01 this module answered the second with the first — refusing
+	// Mac.Home for a Homebrew prefix it no longer needs, on a machine that had
+	// been Running at 100.64.0.3 for a week.
+	//
+	// It deliberately says nothing about WHICH control plane the node answers
+	// to. That comparison needs a login server this pure function is never
+	// given, and it is already made, and reported as drift, by the status
+	// path — see reportVPNStatus's "this node answers to X, but local state
+	// records Y".
+	Enrolled bool
 }
 
 // Privileged reports whether this host can run a command as root at all.
@@ -124,6 +146,11 @@ type Eligibility struct {
 	// against the tenant's headscale, with a real TUN interface.
 	CanEnroll     bool
 	EnrollRefusal string
+	// AlreadyEnrolled is why CanEnroll is true on a host that could never
+	// have been enrolled FROM here. It is carried separately so `status` can
+	// say "already enrolled" rather than "eligible to join", which on
+	// Mac.Home would be a sentence about a decision made a week ago.
+	AlreadyEnrolled bool
 	// CanAdvertiseExit: this node can additionally offer itself as an exit
 	// gate. Strictly narrower than CanEnroll.
 	CanAdvertiseExit bool
@@ -180,6 +207,26 @@ func Resolve(h Host) Eligibility {
 		}
 	case "darwin":
 		switch {
+		case h.Enrolled:
+			// ALREADY ON THE MESH, asked BEFORE "could I install it", and the
+			// order is the fix. Every refusal below is about the INSTALLER —
+			// a Homebrew prefix this user cannot write to, a system daemon
+			// this user cannot install — and none of them is a fact about a
+			// Mac where tailscaled is already running as a root LaunchDaemon
+			// and the node is Running. Asking them first is how Mac.Home read
+			// "NOT eligible to enrol" while sitting at 100.64.0.3, and, worse,
+			// how that installation verdict short-circuited the ADVERTISE
+			// decision below before the darwin branch was ever reached.
+			//
+			// Deliberately darwin-only. The Linux refusals are not about an
+			// installer, they are about whether tailscaled can RUN: without
+			// root it falls back to --tun=userspace-networking, which reports
+			// BackendState=Running and is a SOCKS5 proxy carrying none of the
+			// machine's traffic (this file's header). "Running" there is
+			// exactly the claim that must not be trusted, so it does not get
+			// to overrule the check that catches it.
+			e.CanEnroll, e.AlreadyEnrolled = true, true
+			e.Installer = InstallerNone
 		case h.BrewPrefix == "":
 			e.EnrollRefusal = "Homebrew is not installed and this module has no vendored macOS tailscale to fall back on, so there is no way to install the client here. Install Homebrew, or install tailscale by hand from https://tailscale.com/download/mac and re-run."
 		case !h.BrewWritable:
@@ -207,12 +254,19 @@ func Resolve(h Host) Eligibility {
 	switch {
 	case !e.CanEnroll:
 		e.ExitRefusal = "this host cannot join the mesh at all: " + e.EnrollRefusal
+	case h.OS == "darwin":
+		// IMPLEMENTED 2026-09-01. Until then this branch was the honest
+		// refusal "macOS is untested and is deliberately not claimed", and
+		// the way to retire a refusal like that is to do the work, not to
+		// relax the check — so what decides it now is a measurement of this
+		// kernel, not an assumption about the platform.
+		e.CanAdvertiseExit, e.ExitRefusal, e.ExitWarning = resolveDarwinExit(h)
 	case h.OS != "linux":
-		// macOS can technically be an exit node, but enabling IP forwarding
-		// there is a different sysctl and none of it has been exercised on
-		// real hardware. Claiming it works untested is exactly the silent
-		// degradation this package exists to avoid.
-		e.ExitRefusal = fmt.Sprintf("advertising an exit node needs IP forwarding enabled in the kernel, which this module only knows how to do on Linux — %s is untested and is deliberately not claimed.", h.OS)
+		// The backstop, and unreachable in practice: windows is already
+		// refused above by CanEnroll. Kept for the same reason
+		// platformForOS keeps its default — a future caller that finds a way
+		// past the first gate should meet a sentence, not a silent true.
+		e.ExitRefusal = fmt.Sprintf("advertising an exit node needs IP forwarding enabled in the kernel, which this module only knows how to do on linux and darwin — %s is untested and is deliberately not claimed.", h.OS)
 	case h.WSL:
 		// The Surface. Until 2026-08-26 this was an outright refusal, on the
 		// grounds that forwarding through a second layer of Windows NAT had
@@ -236,6 +290,73 @@ func Resolve(h Host) Eligibility {
 
 	e.CanSelectExit, e.SelectExitRefusal = resolveSelectExit(h)
 	return e
+}
+
+// resolveDarwinExit is the macOS half of "may this node OFFER itself as a
+// gate", and it turns on a fact about the kernel rather than a fact about the
+// user, because the two disagree on the machine this was written for.
+//
+// What a Mac gate needs is exactly two things, and they need different
+// privileges:
+//
+//   - net.inet.ip.forwarding and net.inet6.ip6.forwarding at 1. `sysctl -w`
+//     needs REAL root; the tailscale operator grant does not confer it.
+//   - the prefs write `tailscale set --advertise-exit-node=true`, which on
+//     macOS is granted per-user by `tailscale set --operator=` and needs no
+//     root at all (see darwinExit.preflight).
+//
+// So a Mac whose administrator has already enabled forwarding may advertise
+// while running as an ordinary user, and refusing it on uid would refuse a
+// machine that works. A Mac that has NOT is refused — with the literal
+// command that fixes it, because the one thing this module must never do is
+// apply half of this. Forwarding on with nothing advertised is inert;
+// advertised with forwarding off is a gate the control plane can approve,
+// peers can select, and packets die in silently. Half is worse than none.
+func resolveDarwinExit(h Host) (canAdvertise bool, refusal, warning string) {
+	switch {
+	case h.IPForward:
+		// Somebody with root has already done the part this process cannot
+		// do. Whether it STAYS done across a reboot is a different question,
+		// and the answer travels with the permission rather than after it.
+		if !h.Privileged() {
+			return true, "", fmt.Sprintf("kernel IP forwarding is already on here, but this process runs as uid %d with no passwordless sudo, so it cannot write %s to keep it that way. A reboot may retire this gate silently, and nothing on the mesh would say so. Persist it once from an administrator account on this Mac:\n\n    %s\n", h.UID, darwinSysctlConf, darwinPersistCommand)
+		}
+		return true, "", darwinForwardingWarning
+	case h.Privileged():
+		return true, "", darwinForwardingWarning
+	default:
+		return false, darwinForwardingRefusal(h), ""
+	}
+}
+
+// darwinSysctlConf is macOS's answer to /etc/sysctl.d, and it is a shared
+// file rather than a drop-in directory — which is why everything that writes
+// it here merges instead of overwriting. sysctl.conf(5) on macOS 26.5.1
+// (measured on Mac.Home, 2026-09-01): "The /etc/sysctl.conf file is read in
+// when the system goes into multi-user mode to set default settings for the
+// kernel."
+const darwinSysctlConf = "/etc/sysctl.conf"
+
+// darwinPersistCommand is the one-liner a human runs, and it appends rather
+// than rewrites because a person's own kernel settings are not this module's
+// to discard. Re-running it adds a duplicate line, which is harmless: both
+// say 1, and sysctl.conf takes the last.
+const darwinPersistCommand = `sudo /bin/sh -c 'printf "net.inet.ip.forwarding=1\nnet.inet6.ip6.forwarding=1\n" >> /etc/sysctl.conf'`
+
+// darwinForwardingWarning is the price of a Mac gate, carried on success the
+// same way the WSL2 warning is. It is NOT "this might not work" — the
+// forwarding is read back from the kernel before anything is advertised. It
+// is the one thing this module genuinely cannot prove without rebooting
+// somebody's laptop, said plainly instead of rounded up.
+const darwinForwardingWarning = "this is a Mac. It forwards through net.inet.ip.forwarding / net.inet6.ip6.forwarding, which this module enables and reads back before advertising anything, and persists in " + darwinSysctlConf + " — the file macOS's own sysctl.conf(5) says is read at multi-user boot. That persistence has NOT been proved across a real reboot of this host, so after a restart confirm the gate with `sysctl -n net.inet.ip.forwarding` rather than assuming it came back."
+
+// darwinForwardingRefusal is the deliverable on a Mac that cannot elevate:
+// the exact command its owner has to run, with absolute paths, and the reason
+// on one line. Working around it — advertising anyway and hoping, or enabling
+// only what an unprivileged process can — is the failure this sentence exists
+// instead of.
+func darwinForwardingRefusal(h Host) string {
+	return fmt.Sprintf("this Mac does not forward another node's packets yet (net.inet.ip.forwarding and net.inet6.ip6.forwarding are 0) and this process cannot turn them on: it runs as uid %d and `sudo -n true` fails, so `sysctl -w` is refused. NOTHING was advertised, deliberately — a route the control plane could approve while this kernel drops what arrives is worse than no gate at all. Run these ONCE from an administrator account on this Mac:\n\n    sudo /usr/sbin/sysctl -w net.inet.ip.forwarding=1 net.inet6.ip6.forwarding=1\n    %s\n\nThe first enables forwarding now; the second keeps it across a reboot via %s. After that no further privilege is needed here — tailscale's own preference write is granted per-user by `tailscale set --operator=`, which this host already has.", h.UID, darwinPersistCommand, darwinSysctlConf)
 }
 
 // resolveSelectExit is the client-side verdict: may this node's own default
@@ -303,6 +424,11 @@ func (e Eligibility) Describe() string {
 		return "eligible (can join the mesh and can be advertised as an exit node) — but " + e.ExitWarning
 	case e.CanAdvertiseExit:
 		return "eligible (can join the mesh and can be advertised as an exit node)"
+	case e.AlreadyEnrolled:
+		// A node that has been on the mesh for a week is not "eligible to
+		// join" it, and saying so sent Mac.Home's reader off to fix a
+		// Homebrew prefix that stopped mattering the day it enrolled.
+		return "already enrolled in the mesh, NOT eligible as an exit node — " + e.ExitRefusal
 	case e.CanEnroll:
 		return "eligible to join the mesh, NOT eligible as an exit node — " + e.ExitRefusal
 	default:
@@ -320,18 +446,17 @@ func (e Eligibility) DescribeSelectExit() string {
 }
 
 // Probe reads this machine's facts. Everything it touches is read-only: it
-// stats devices, reads a sysctl, and runs `sudo -n true`, which by definition
-// cannot prompt. It never installs or configures anything, so it is safe to
-// call from `status` on every host, including the ones it will refuse.
+// stats devices, reads sysctls, runs `sudo -n true`, which by definition
+// cannot prompt, and asks tailscale for its own status. It never installs or
+// configures anything, so it is safe to call from `status` on every host,
+// including the ones it will refuse.
 func Probe() Host {
 	h := Host{
 		OS:   runtime.GOOS,
 		Arch: runtime.GOARCH,
 		UID:  os.Getuid(),
 	}
-	if path, err := exec.LookPath("tailscale"); err == nil {
-		h.TailscalePath = path
-	}
+	h.TailscalePath = LookupTailscale()
 	// Root already has every privilege; shelling out to sudo would only add a
 	// way for the probe to fail on a host with no sudo installed at all.
 	if h.UID != 0 {
@@ -353,8 +478,91 @@ func Probe() Host {
 		h.WSL = detectWSL()
 	case "darwin":
 		h.BrewPrefix, h.BrewWritable = probeHomebrew()
+		h.IPForward = probeDarwinForwarding()
 	}
+	h.Enrolled = probeEnrolled(h.TailscalePath)
 	return h
+}
+
+// TailscaleSearchPath is where a tailscale binary lives when it is not on the
+// caller's own PATH. macOS is the case that forced it to exist: Homebrew
+// installs to /opt/homebrew/bin, which a launchd-started process does not
+// inherit, so a bare LookPath on Mac.Home answers "not installed" about a
+// machine that is demonstrably on the mesh.
+var TailscaleSearchPath = []string{
+	"/usr/bin/tailscale",
+	"/usr/local/bin/tailscale",
+	"/opt/homebrew/bin/tailscale",
+	"/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+}
+
+// LookupTailscale resolves the tailscale binary, or "" when this host has
+// none. It lives here rather than in internal/ops because Probe now needs the
+// same answer ops does, and two copies of this list would drift into the
+// state where one half of the module thinks a Mac is enrolled and the other
+// half cannot find the client to ask.
+func LookupTailscale() string {
+	if path, err := exec.LookPath("tailscale"); err == nil {
+		return path
+	}
+	for _, candidate := range TailscaleSearchPath {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// probeTimeout bounds the one thing Probe asks a daemon rather than the
+// filesystem. `tailscale status` answers in milliseconds when tailscaled is
+// up and fails fast when it is not, but Probe is called from `status` on
+// every host and must not be the reason one hangs.
+const probeTimeout = 5 * time.Second
+
+// probeEnrolled answers the question that used to be inferred from the
+// installer: is this node ON the mesh right now?
+//
+// Read from tailscale's own backend state rather than from state.json,
+// because the module can be driven from the control plane with nothing on
+// this side writing state — and because the case this exists for is a Mac
+// enrolled by hand by a human, which no state file here ever recorded.
+func probeEnrolled(tailscalePath string) bool {
+	if tailscalePath == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	st, err := FetchStatus(ctx, probeRunner{bin: tailscalePath})
+	return err == nil && st.Running()
+}
+
+// probeRunner is the one shellout internal/vpn does on its own account.
+// Everything else in this package takes a Runner from its caller so a test
+// can pin it; Probe cannot, because measuring the real machine is the whole
+// of its job — the seam is Host itself, which is why Resolve is pure.
+type probeRunner struct{ bin string }
+
+func (p probeRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	if name == "tailscale" && p.bin != "" {
+		name = p.bin
+	}
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return string(out), err
+}
+
+// probeDarwinForwarding reads BOTH families and returns true only when both
+// are 1. Half-forwarding is not a lesser gate, it is a gate that black-holes
+// every dual-stack client's v6 — so it reads here as not forwarding at all.
+func probeDarwinForwarding() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	for _, key := range darwinForwardingSysctls {
+		out, err := probeRunner{}.Run(ctx, "sysctl", "-n", key)
+		if err != nil || strings.TrimSpace(out) != "1" {
+			return false
+		}
+	}
+	return true
 }
 
 // detectWSL reads /proc/version rather than checking for an env var: the

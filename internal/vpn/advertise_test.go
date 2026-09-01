@@ -201,6 +201,147 @@ func TestWithdrawingNeedsNoEligibilityAndLeavesForwardingAlone(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- darwin ---
+
+// macGateRunner is Mac.Home once an administrator has enabled forwarding:
+// macOS's own sysctl names answer 1, `route -n get` replaces `ip route get`,
+// and tailscale reports the node.
+func macGateRunner() *recordingRunner {
+	r := newRecordingRunner()
+	r.answer("sysctl -n net.inet.ip.forwarding", forwardingOn, nil)
+	r.answer("sysctl -n net.inet6.ip6.forwarding", forwardingOn, nil)
+	r.answer("route -n get 1.1.1.1", "   route to: 1.1.1.1\ndestination: default\n    gateway: 192.168.1.254\n  interface: en0\n", nil)
+	r.answer("tailscale debug prefs", `{"ControlURL":"https://headscale.aw.tekflox.com","Hostname":"aw-mac","AdvertiseRoutes":["0.0.0.0/0","::/0"]}`, nil)
+	r.answer("tailscale status --json", `{"BackendState":"Running","Version":"1.102.3","Self":{"ID":"3","HostName":"aw-mac","DNSName":"aw-mac.mesh.example.com.","OS":"macOS","TailscaleIPs":["100.64.0.3"],"Online":true,"ExitNodeOption":false},"CurrentTailnet":{"Name":"headscale.aw.tekflox.com","MagicDNSSuffix":"mesh.example.com"},"Peer":{}}`, nil)
+	return r
+}
+
+// macWithSudo is the Mac as it would be with a NOPASSWD entry — the only
+// shape that lets this module enable forwarding itself.
+func macWithSudo() Host {
+	h := macHome()
+	h.PasswordlessSudo = true
+	return h
+}
+
+// The kernel knobs are not the Linux ones, and reaching for net.ipv4.ip_forward
+// on a Mac would fail in the one way this package must never fail: `sysctl -w`
+// on an unknown key errors, the refusal blames the kernel, and the machine is
+// fine.
+func TestAdvertisingAMacUsesTheMacSysctlsAndTheMacRouteReader(t *testing.T) {
+	r := macGateRunner()
+	priv := PrivilegedRunner{Inner: r, Sudo: true}
+	res, err := Advertise(context.Background(), r, priv, Resolve(macWithSudo()), true, nil)
+	if err != nil {
+		t.Fatalf("Advertise: %v", err)
+	}
+	if res.Refused {
+		t.Fatalf("refused a Mac that can do this: %s", res.Refusal)
+	}
+	if res.RouteBefore != "en0" || res.RouteAfter != "en0" {
+		t.Fatalf("offering is not using, and it is measured with `route -n get`: %q -> %q", res.RouteBefore, res.RouteAfter)
+	}
+	joined := strings.Join(r.calls, "\n")
+	for _, want := range []string{
+		"sudo -n sysctl -w net.inet.ip.forwarding=1",
+		"sudo -n sysctl -w net.inet6.ip6.forwarding=1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in %v", want, r.calls)
+		}
+	}
+	if strings.Contains(joined, "net.ipv4.ip_forward") || strings.Contains(joined, "ip route get") {
+		t.Fatalf("Linux primitives reached a Mac: %v", r.calls)
+	}
+	if !strings.Contains(joined, darwinSysctlConf) {
+		t.Fatalf("forwarding was never persisted anywhere: %v", r.calls)
+	}
+	if strings.Contains(joined, sysctlDropIn) {
+		t.Fatalf("macOS has no /etc/sysctl.d: %v", r.calls)
+	}
+	for key, on := range res.Forwarding {
+		if !on {
+			t.Fatalf("%s read back as off", key)
+		}
+	}
+}
+
+// Order holds on macOS for the same reason it holds on Linux: a route
+// advertised before the kernel will forward it is a window in which the
+// control plane can approve a gate that drops everything handed to it.
+func TestForwardingIsEnabledBeforeTheRouteIsAdvertisedOnDarwinToo(t *testing.T) {
+	r := macGateRunner()
+	priv := PrivilegedRunner{Inner: r, Sudo: true}
+	if _, err := Advertise(context.Background(), r, priv, Resolve(macWithSudo()), true, nil); err != nil {
+		t.Fatalf("Advertise: %v", err)
+	}
+	forward, advertise := -1, -1
+	for i, c := range r.calls {
+		if strings.Contains(c, "sysctl -w net.inet.ip.forwarding=1") && forward < 0 {
+			forward = i
+		}
+		if strings.Contains(c, "--advertise-exit-node=true") {
+			advertise = i
+		}
+	}
+	if forward < 0 || advertise < 0 {
+		t.Fatalf("missing a step: forward=%d advertise=%d in %v", forward, advertise, r.calls)
+	}
+	if forward > advertise {
+		t.Fatal("the route was advertised before the kernel would forward it")
+	}
+}
+
+// The prefs write is tried UNPRIVILEGED first on macOS, and that is the
+// opposite of Linux. tailscaled there gates writes on the calling user, which
+// `tailscale set --operator=` grants — Mac.Home has it. Wrapping the call in
+// `sudo -n` on a Mac that has the grant reports "a password is required"
+// about a machine that is fine.
+func TestTheMacPrefsWriteIsNotWrappedInSudo(t *testing.T) {
+	r := macGateRunner()
+	priv := PrivilegedRunner{Inner: r, Sudo: true}
+	if _, err := Advertise(context.Background(), r, priv, Resolve(macWithSudo()), true, nil); err != nil {
+		t.Fatalf("Advertise: %v", err)
+	}
+	for _, c := range r.calls {
+		if strings.Contains(c, "advertise-exit-node") && strings.HasPrefix(c, "sudo") {
+			t.Fatalf("the operator grant was bypassed for sudo: %q", c)
+		}
+	}
+}
+
+// A Mac whose administrator has already enabled forwarding, running as an
+// ordinary user: there is nothing to set and no root to set it with, so the
+// sequence must use what is there rather than fail on `sudo -n`. What it
+// cannot do — keep it across a reboot — is said out loud instead.
+func TestAMacThatAlreadyForwardsIsNotFailedForLackingRoot(t *testing.T) {
+	r := macGateRunner()
+	h := macHome()
+	h.IPForward = true
+	var warnings []string
+	progress := Progress(func(level, message string) {
+		if level == "warning" {
+			warnings = append(warnings, message)
+		}
+	})
+
+	res, err := Advertise(context.Background(), r, PrivilegedRunner{Inner: r, Sudo: true}, Resolve(h), true, progress)
+	if err != nil {
+		t.Fatalf("Advertise: %v", err)
+	}
+	if res.Refused {
+		t.Fatalf("refused a Mac that forwards perfectly well: %s", res.Refusal)
+	}
+	for _, c := range r.calls {
+		if strings.Contains(c, "sysctl -w") || strings.Contains(c, darwinSysctlConf) {
+			t.Fatalf("an unprivileged process tried to change kernel state: %q", c)
+		}
+	}
+	if !strings.Contains(strings.Join(warnings, "\n"), "reboot") {
+		t.Fatalf("the one thing this run cannot guarantee was not said: %v", warnings)
+	}
+}
+
 // A `tailscale set` that genuinely fails is a real error, not a refusal: the
 // host CAN do this and something went wrong, which needs a different reaction
 // than "this machine is not able to".

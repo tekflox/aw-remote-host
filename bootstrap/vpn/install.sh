@@ -157,9 +157,23 @@ if [ "$ADVERTISE_EXIT" = "1" ]; then
   # machine nobody selects as an exit node changes nothing about its own
   # traffic.
   echo "vpn: enabling IP forwarding (required to serve as an exit node)"
-  printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
-    | $SUDO tee /etc/sysctl.d/99-aw-vpn-exit-node.conf >/dev/null
-  $SUDO sysctl -p /etc/sysctl.d/99-aw-vpn-exit-node.conf >/dev/null
+  case "$(uname -s)" in
+    Darwin)
+      # Different knobs and a different file. macOS has no /etc/sysctl.d, and
+      # /etc/sysctl.conf is SHARED — so this merges the two keys in rather
+      # than overwriting, because discarding somebody's other kernel settings
+      # to turn on forwarding would be a second, unasked-for change to their
+      # machine. Written through a temp file: `cat f | ... > f` truncates f
+      # before cat opens it. Mirrors internal/vpn's forwardingFor("darwin").
+      $SUDO /bin/sh -c '{ cat /etc/sysctl.conf 2>/dev/null | grep -v "^net\.inet\.ip\.forwarding=" | grep -v "^net\.inet6\.ip6\.forwarding="; printf "net.inet.ip.forwarding=1\nnet.inet6.ip6.forwarding=1\n"; } > /etc/sysctl.conf.aw-new && mv /etc/sysctl.conf.aw-new /etc/sysctl.conf'
+      $SUDO sysctl -w net.inet.ip.forwarding=1 net.inet6.ip6.forwarding=1 >/dev/null
+      ;;
+    *)
+      printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' \
+        | $SUDO tee /etc/sysctl.d/99-aw-vpn-exit-node.conf >/dev/null
+      $SUDO sysctl -p /etc/sysctl.d/99-aw-vpn-exit-node.conf >/dev/null
+      ;;
+  esac
   UP_ARGS+=("--advertise-exit-node")
 fi
 
