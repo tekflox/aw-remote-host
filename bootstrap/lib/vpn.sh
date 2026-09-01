@@ -15,6 +15,30 @@
 # advertised one anyway, which is precisely the silent disagreement that makes
 # a UI list a host as something it is not.
 
+# VPN_SUPERVISOR_MARKER is where a non-systemd process supervisor declares
+# that it keeps tailscaled running here. Kept byte-identical to internal/vpn's
+# SupervisorMarker — the two halves of this module disagreeing about WHERE the
+# declaration lives would produce exactly the split the header warns about,
+# with the Go gate admitting a host the script then refuses.
+VPN_SUPERVISOR_MARKER="/run/aw-remote-host/tailscaled-supervisor"
+
+# vpn_has_supervisor reports whether something other than systemd has declared,
+# and is still alive to back the declaration, that it keeps tailscaled running.
+#
+# The two checks mirror internal/vpn's probeSupervisor one for one, and for the
+# same reason: /run is not a tmpfs in every container, so a marker can outlive
+# the boot that wrote it, and a claim nobody verifies is how "systemd is not
+# the only supervisor" would decay back into "no supervisor at all".
+vpn_has_supervisor() {
+  [ -f "$VPN_SUPERVISOR_MARKER" ] || return 1
+  _name="$(sed -n 's/^name=//p' "$VPN_SUPERVISOR_MARKER" | head -1)"
+  _pid="$(sed -n 's/^pid=//p' "$VPN_SUPERVISOR_MARKER" | head -1)"
+  [ -n "$_name" ] || return 1
+  case "$_pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$_pid" 2>/dev/null || return 1
+  return 0
+}
+
 # vpn_is_wsl reports whether this Linux is a WSL2 kernel. Note that a
 # container running on a WSL2 host inherits that kernel, so containers there
 # answer yes too — which is correct: they sit behind the same extra layer of

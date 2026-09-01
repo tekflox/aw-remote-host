@@ -36,6 +36,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -99,6 +100,21 @@ type Host struct {
 	PasswordlessSudo bool
 	HasTUN           bool // /dev/net/tun exists and is a device node (Linux)
 	HasSystemd       bool // /run/systemd/system exists — systemd is PID 1
+	// SupervisorName is the name a NON-systemd process supervisor gave itself
+	// when it declared, on this boot, that it keeps tailscaled running here —
+	// or "" when nothing has declared that. It exists because systemd is not
+	// the only way to satisfy the requirement HasSystemd stands in for, and on
+	// the machine that forced this it is not an available way at all: the
+	// `aw-remote-host` container is a Linux host that runs 70+ containers of
+	// its own on two podman networks, so it has everything the exit-gate path
+	// needs and will never have systemd as PID 1 (its PID 1 is its entrypoint,
+	// which is the supervisor).
+	//
+	// The requirement was never "systemd"; it was "something will keep
+	// tailscaled up". This is that same requirement, measured rather than
+	// assumed — see probeSupervisor for what makes the declaration hard to
+	// lie with.
+	SupervisorName string
 	// IPForward is whether this kernel ALREADY forwards another node's
 	// packets, both families. The keys differ per platform —
 	// net.ipv4.ip_forward + net.ipv6.conf.all.forwarding on Linux,
@@ -199,7 +215,7 @@ func Resolve(h Host) Eligibility {
 			e.EnrollRefusal = "aw-remote-host is not running as root here and `sudo -n true` fails, so tailscaled cannot be installed as a system daemon. Without root, tailscaled can only run with --tun=userspace-networking, which provides a SOCKS5/HTTP proxy and NOT a network interface — the node would appear enrolled while carrying none of this machine's traffic. Re-run aw-remote-host as root, or add a NOPASSWD sudoers entry for this user."
 		case !h.HasTUN:
 			e.EnrollRefusal = "/dev/net/tun is not present on this host, so tailscaled has no way to create the mesh interface. On a container or a minimal VM this usually means the tun module is not loaded (`modprobe tun`) or the device was not passed through."
-		case !h.HasSystemd:
+		case !h.HasSystemd && h.SupervisorName == "":
 			e.EnrollRefusal = systemdRefusal(h.WSL)
 		default:
 			e.CanEnroll = true
@@ -400,11 +416,15 @@ func resolveSelectExit(h Host) (bool, string) {
 	}
 }
 
+// systemdRefusal is reached only when this host has NEITHER systemd NOR a
+// declared supervisor — "no systemd" on its own stopped being a refusal on
+// 2026-09-01, so the sentence has to name both ways out or it sends the
+// reader of a container to enable something a container cannot have.
 func systemdRefusal(wsl bool) string {
 	if wsl {
 		return "/run/systemd/system does not exist, so systemd is not PID 1 in this WSL2 distro and there is nothing to keep tailscaled running. Add `[boot]\\nsystemd=true` to /etc/wsl.conf, run `wsl --shutdown` from Windows, and re-run."
 	}
-	return "/run/systemd/system does not exist, so systemd is not managing this host and this module has no other way to keep tailscaled running across reboots."
+	return "/run/systemd/system does not exist, so systemd is not managing this host, and nothing else has declared that it keeps tailscaled running either — with no supervisor of any kind the daemon would stop at the first crash or restart and the node would leave the mesh silently. Either run this host under systemd, or have whatever supervises its processes write " + SupervisorMarker + " (see bootstrap/vpn/README.md)."
 }
 
 // Describe renders the ENROLMENT-side verdict for a status line or a log:
@@ -471,6 +491,7 @@ func Probe() Host {
 		if info, err := os.Stat("/run/systemd/system"); err == nil && info.IsDir() {
 			h.HasSystemd = true
 		}
+		h.SupervisorName = probeSupervisor()
 		if raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward"); err == nil {
 			n, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
 			h.IPForward = n == 1
@@ -563,6 +584,79 @@ func probeDarwinForwarding() bool {
 		}
 	}
 	return true
+}
+
+// SupervisorMarker is where a non-systemd process supervisor declares that it
+// keeps tailscaled running on this host. Two lines of `key=value`:
+//
+//	name=<what the supervisor calls itself, shown to a human>
+//	pid=<the supervising process, which must still be alive>
+//
+// Under /run rather than /etc because this is a claim about NOW, not a
+// configuration choice: a supervisor that is no longer running has no business
+// still asserting it supervises anything.
+//
+// A var rather than a const for the same reason TailscaleSearchPath is one: a
+// test has to be able to point the probe at a file it wrote.
+var SupervisorMarker = "/run/aw-remote-host/tailscaled-supervisor"
+
+// probeSupervisor reads that declaration and returns the supervisor's name, or
+// "" when there is no honest one to report.
+//
+// The whole difficulty here is that this replaces a fact (does /run/systemd/
+// system exist) with a claim (something says it supervises tailscaled), and a
+// claim that is merely believed would reopen the bug the systemd requirement
+// closed: a node reported healthy while nothing restarts its daemon. So the
+// claim is checked against the machine on both axes it can go stale on:
+//
+//   - the declared pid must still be alive. /run is not a tmpfs in every
+//     container — measured on the aw-remote-host container 2026-09-01, where
+//     /run is part of the image's own overlay — so a marker CAN outlive the
+//     boot that wrote it, and a dead pid is how that is caught. The writer is
+//     also expected to remove any stale file before writing its own (see
+//     tools/aw-remote-host/entrypoint.sh in agentic-workspace); this is the
+//     half that does not depend on the writer having done so.
+//   - the pid must not be this process. aw-remote-host supervising itself is
+//     not a supervisor of tailscaled, and it is the one pid that is trivially
+//     alive at the moment of asking.
+//
+// What it deliberately does NOT do is ask tailscale whether it is running.
+// This function answers "would the daemon be kept up", which is a question
+// about the host, and it is asked on hosts where tailscale is not installed
+// yet — that is the entire point of an enrolment probe.
+func probeSupervisor() string {
+	raw, err := os.ReadFile(SupervisorMarker)
+	if err != nil {
+		return ""
+	}
+	var name string
+	var pid int
+	for _, line := range strings.Split(string(raw), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "name":
+			name = strings.TrimSpace(value)
+		case "pid":
+			pid, _ = strconv.Atoi(strings.TrimSpace(value))
+		}
+	}
+	if name == "" || pid <= 0 || pid == os.Getpid() {
+		return ""
+	}
+	// Signal 0 delivers nothing and only reports whether the process is there
+	// to receive it — the portable liveness check, and the reason this does
+	// not stat /proc (which a non-Linux caller would not have anyway).
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return ""
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return ""
+	}
+	return name
 }
 
 // detectWSL reads /proc/version rather than checking for an env var: the

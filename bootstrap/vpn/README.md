@@ -40,10 +40,52 @@ is **refused**, with the reason, rather than served:
 | Host | Answer |
 |---|---|
 | Linux with a container runtime and at least one network | **allowed** — container-scoped |
+| **a Linux container that itself runs containers** | **allowed**, container-scoped, exactly like any other Linux host — see below |
 | Linux with no `docker`/`podman` that answers | **refused**: nothing to route but the machine |
 | a runtime that answers but defines no IPv4 network | **refused**: same, one step later |
 | **macOS** | **refused** — see "A Mac as a client" |
 | Windows | refused towards its WSL2 distro, as before |
+
+**Being a container is not a disqualification; having nothing to scope is.**
+That row is not an exception carved out of the invariant above — it is the
+invariant applied literally, and it is written down here because the obvious
+reading of "never the host" is that a container must be a special case, and
+somebody acting on that reading in three months would revert it as a
+regression.
+
+The machine that forced the question is `b614f41828c8`, the container the `aw`
+workspace's whole stack runs inside. Measured in there on 2026-09-01: uid 0,
+`CapEff=000001ffffffffff`, its own netns, `/dev/net/tun`, `ip rule add/del`
+working, and `/usr/bin/podman` answering `network ls` with two bridges — 75
+running containers on `aw-remote-host`/`10.89.0.0/24`. It has containers to
+scope, so the exclusion CIDR exists, so routing it moves those containers and
+nothing else. That is the whole of the test.
+
+The discriminant stays **"are there containers to scope?"** rather than
+becoming "is this a physical machine or a container?", and the reason is not
+convenience:
+
+- the first is a **measurement** — `DetectContainerRuntime` requires the
+  runtime to actually answer `network ls`, the same call the next step makes.
+  The second is an **inference** with no signal that does not lie:
+  `/.dockerenv` is docker-only, `container=` is podman-only, and unified
+  cgroup v2 reports `0::/` either way.
+- applied to this host the second gives the **wrong** answer. It would class
+  `b614f41828c8` as "container, therefore route it whole", moving the entire
+  netns and losing both the per-network granularity and the host bypass — in
+  order to route the 75 containers the existing path already routes safely.
+- the invariant was never about containers versus hosts. It is about blast
+  radius: *nothing beyond the workload someone asked to route may move*.
+  "Are there containers to scope?" is the measurable form of that sentence.
+  This container is not "the host of these containers" in the sense that took
+  a Mac off the internet on 2026-08-26; it is their host in the sense the
+  feature is for.
+
+`NoContainerRuntimeRefusal` is therefore unchanged and must stay that way — it
+is what still protects the bare metal and the Mac. What was wrong in the
+original report about this host was the measurement (`command -v docker podman`
+returns non-zero when *any* argument is missing, which read as "no runtime"),
+not the rule.
 
 `vpn.ScopeRefusal` is that verdict, in two halves: the static one from the OS
 (no probe can change a Mac's answer) and the live one from the machine (is
@@ -192,6 +234,43 @@ The real work of this module is `internal/vpn`'s probe, in the spirit of
 | Linux + root (`aw-baremetal`, uid 0, `/dev/net/tun`, systemd) | joins, and may advertise as exit node |
 | WSL2 + root (`aw-surface-wsl`, uid 0, passwordless sudo, systemd on) | joins; **refused as an exit gate** — its network is NATed again by the Windows host, and forwarding through that has not been validated |
 | macOS without sudo (`Mac.Home`, uid 503) | **refused for ENROLMENT** — `sudo -n` fails so `tailscaled install-system-daemon` cannot run, and `/opt/homebrew` belongs to another account so `brew install` fails on permissions. It can still **select** a gate; that is a third verdict — see "A Mac as a client" |
+
+### systemd, or a supervisor that says so (2026-09-01)
+
+`/run/systemd/system` used to be a hard requirement on Linux. It is not any
+more, and the reason is that it was never the requirement — it was a proxy for
+one: **something has to keep `tailscaled` running**, or the node leaves the
+mesh at the first crash and nothing says so.
+
+A container can satisfy that and can never satisfy the proxy. `b614f41828c8`'s
+PID 1 *is* its supervisor (`tools/aw-remote-host/entrypoint.sh` in
+`agentic-workspace`), so demanding systemd there was demanding something the
+machine cannot have in exchange for something it already does.
+
+So a supervisor may declare itself, in `/run/aw-remote-host/tailscaled-supervisor`:
+
+```
+name=aw-remote-host-entrypoint
+pid=1234
+```
+
+Both halves of this module read it — `internal/vpn`'s `probeSupervisor` and
+`bootstrap/lib/vpn.sh`'s `vpn_has_supervisor`, which must keep agreeing for
+the reason that file's header gives. Two things make the claim hard to lie
+with, and both are needed:
+
+- **the declared pid must still be alive** (signal 0). `/run` is *not* a tmpfs
+  in every container — measured on this one, where it is part of the image's
+  overlay — so a marker can outlive the boot that wrote it. The writer also
+  removes any stale file before writing its own; the liveness check is the
+  half that does not depend on the writer having remembered to.
+- **the pid must not be `aw-remote-host` itself.** A process supervising
+  itself supervises nothing, and its own pid is the one trivially alive at the
+  moment of asking.
+
+A host with neither systemd nor a live declaration is still refused, and the
+refusal names both ways out — telling the reader of a container to enable
+systemd sends them to fix something a container cannot have.
 
 The macOS refusal is the one that matters most, because the failure it
 prevents is silent. Without root, tailscaled can still start with

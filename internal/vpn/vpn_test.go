@@ -1,6 +1,9 @@
 package vpn
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -59,6 +62,112 @@ func macHomeBeforeEnrolment() Host {
 		UID: 503, PasswordlessSudo: false,
 		BrewPrefix: "/opt/homebrew", BrewWritable: false,
 		TailscalePath: "/opt/homebrew/bin/tailscale",
+	}
+}
+
+// awRemoteHostContainer — b614f41828c8 / link 11e8bd4157845a24, the machine
+// the `aw` workspace's whole stack runs inside. Measured 2026-09-01 from in
+// there: Debian 12, PID 1 is `/bin/sh /entrypoint.sh`, id -u 0, CapEff
+// 000001ffffffffff, its own netns, /dev/net/tun present, /run/systemd/system
+// ABSENT and unobtainable, and /usr/bin/podman answering `network ls` with two
+// bridges — `aw-remote-host` at 10.89.0.1/24 carrying 75 running containers,
+// and `podman`, defined and empty.
+//
+// This is the shape the systemd requirement was wrong about. It has every
+// ingredient the exit-gate path needs, including containers to scope, and no
+// way whatsoever to run systemd as PID 1 — its PID 1 IS the supervisor.
+// TailscalePath is empty because that is how the host really is until the
+// image change lands; the fields the supervisor change is about are the two
+// below it.
+func awRemoteHostContainer() Host {
+	return Host{
+		OS: "linux", Arch: "amd64",
+		UID: 0, HasTUN: true,
+		HasSystemd:     false,
+		SupervisorName: "aw-remote-host-entrypoint",
+	}
+}
+
+// The change of 2026-09-01: "no systemd" alone is no longer a refusal, because
+// the requirement it stood in for — something keeps tailscaled up — is met
+// here by the container's own entrypoint.
+func TestResolveLinuxSupervisorSubstitutesForSystemd(t *testing.T) {
+	e := Resolve(awRemoteHostContainer())
+	if !e.CanEnroll {
+		t.Fatalf("a supervised container should enrol: %s", e.EnrollRefusal)
+	}
+	// And the client-side verdict, which is the one the card is about, turns
+	// on tailscale being present and nothing else on this host.
+	h := awRemoteHostContainer()
+	h.TailscalePath = "/usr/bin/tailscale"
+	if got := Resolve(h); !got.CanSelectExit {
+		t.Fatalf("should be able to select a gate once tailscale is here: %s", got.SelectExitRefusal)
+	}
+}
+
+// The other half, and the one that keeps the original bug closed: nothing
+// declared, nothing running, still refused — and the sentence has to name both
+// ways out, because telling the reader of a container to enable systemd sends
+// them to fix something a container cannot have.
+func TestResolveLinuxWithNoSupervisorAtAllIsStillRefused(t *testing.T) {
+	h := awRemoteHostContainer()
+	h.SupervisorName = ""
+	e := Resolve(h)
+	if e.CanEnroll {
+		t.Fatal("no systemd and no supervisor must refuse")
+	}
+	if !strings.Contains(e.EnrollRefusal, SupervisorMarker) {
+		t.Fatalf("refusal must name the alternative, got %q", e.EnrollRefusal)
+	}
+}
+
+// probeSupervisor turns a claim into a measurement, and these are the two ways
+// the claim goes stale. /run is NOT a tmpfs in every container — on
+// b614f41828c8 it is part of the image's own overlay — so a marker can outlive
+// the boot that wrote it, and believing one is how this would reopen the bug
+// the systemd requirement closed.
+func TestProbeSupervisorRefusesToBelieveADeadDeclaration(t *testing.T) {
+	write := func(t *testing.T, body string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "tailscaled-supervisor")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		previous := SupervisorMarker
+		SupervisorMarker = path
+		t.Cleanup(func() { SupervisorMarker = previous })
+	}
+
+	// A process that is genuinely running: this test's own parent, which is
+	// alive by definition for as long as this test is.
+	write(t, fmt.Sprintf("name=aw-remote-host-entrypoint\npid=%d\n", os.Getppid()))
+	if got := probeSupervisor(); got != "aw-remote-host-entrypoint" {
+		t.Fatalf("a live declaration should be believed, got %q", got)
+	}
+
+	// A pid nothing can be running under. Signal 0 is refused, so the claim is
+	// not carried forward as if the supervisor were still there.
+	write(t, "name=ghost\npid=4194303\n")
+	if got := probeSupervisor(); got != "" {
+		t.Fatalf("a dead pid must not count, got %q", got)
+	}
+
+	// aw-remote-host is not its own tailscaled supervisor, and its own pid is
+	// the one pid trivially alive at the moment of asking.
+	write(t, fmt.Sprintf("name=itself\npid=%d\n", os.Getpid()))
+	if got := probeSupervisor(); got != "" {
+		t.Fatalf("this process is not a supervisor of tailscaled, got %q", got)
+	}
+
+	// Half a declaration is not a declaration.
+	write(t, fmt.Sprintf("pid=%d\n", os.Getppid()))
+	if got := probeSupervisor(); got != "" {
+		t.Fatalf("a nameless declaration must not count, got %q", got)
+	}
+
+	SupervisorMarker = filepath.Join(t.TempDir(), "does-not-exist")
+	if got := probeSupervisor(); got != "" {
+		t.Fatalf("no marker at all must not count, got %q", got)
 	}
 }
 

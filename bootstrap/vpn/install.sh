@@ -66,10 +66,18 @@ install_tailscale_linux() {
     echo "vpn: /dev/net/tun is not present, so tailscaled has no way to create the mesh interface (try 'modprobe tun', or pass the device through if this is a container)." >&2
     return 1
   fi
-  if [ ! -d /run/systemd/system ]; then
-    echo "vpn: systemd is not PID 1 here, and this module has no other way to keep tailscaled running." >&2
+  # Since 2026-09-01 systemd is one of two acceptable answers, not the only
+  # one — see bootstrap/lib/vpn.sh's vpn_has_supervisor and internal/vpn's
+  # Resolve(), which changed in the same breath and must keep agreeing (the
+  # lib header says what happens when they do not). The requirement was never
+  # systemd; it was that SOMETHING keeps tailscaled up, and in a container
+  # that something is the entrypoint.
+  if [ ! -d /run/systemd/system ] && ! vpn_has_supervisor; then
+    echo "vpn: systemd is not PID 1 here, and nothing has declared that it keeps tailscaled running either — with no supervisor of any kind the daemon stops at the first crash and the node leaves the mesh silently." >&2
     if grep -qi microsoft /proc/version 2>/dev/null; then
       echo "vpn: this looks like a WSL2 distro — add '[boot]' + 'systemd=true' to /etc/wsl.conf, run 'wsl --shutdown' from Windows, and re-run." >&2
+    else
+      echo "vpn: if this host is supervised by something else, have that supervisor write $VPN_SUPERVISOR_MARKER (name=<supervisor>, pid=<its own pid>) and re-run." >&2
     fi
     return 1
   fi
@@ -82,7 +90,30 @@ install_tailscale_linux() {
     echo "vpn: installing tailscale from https://tailscale.com/install.sh"
     curl -fsSL https://tailscale.com/install.sh | $SUDO sh
   fi
-  $SUDO systemctl enable --now tailscaled
+  if [ -d /run/systemd/system ]; then
+    $SUDO systemctl enable --now tailscaled
+    return 0
+  fi
+  # Supervised host. The supervisor owns tailscaled's lifecycle, so starting a
+  # second copy here would race the one it restarts — but skipping silently
+  # would let `tailscale up` fail below with a socket error that names nothing.
+  # So: wait for the daemon the supervisor is responsible for, and fail with
+  # the reason if it never appears. A supervisor that only just gained a
+  # tailscaled to run (this script may have installed it seconds ago) needs a
+  # moment to pick it up, which is what the loop is for.
+  echo "vpn: no systemd here — waiting for the supervised tailscaled to answer"
+  for _ in $(seq 1 30); do
+    # Matched on the OUTPUT rather than the exit code on purpose: a daemon
+    # that is up but not yet logged in is exactly the state this script runs
+    # in, and `tailscale status` exits non-zero for it. What is being asked
+    # here is only "is there a daemon to talk to".
+    if tailscale status --json 2>/dev/null | grep -q '"BackendState"'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "vpn: tailscaled is not answering on this host and there is no systemd to start it. Its supervisor declared itself in $VPN_SUPERVISOR_MARKER but the daemon never came up — check that supervisor's own logs." >&2
+  return 1
 }
 
 install_tailscale_darwin() {
