@@ -1060,20 +1060,21 @@ func clearExternalRouteState() error {
 	return mutateExternalRouteState(func(v *state.VPNState) { v.ExternalRoute = nil })
 }
 
+// mutateExternalRouteState goes through state.Update so the read and the write
+// are one operation against the file. A load-modify-save spelled out here
+// would be the same race the daemon already lost once — see state.Update's
+// comment for the measurement.
 func mutateExternalRouteState(apply func(*state.VPNState)) error {
 	path, err := state.DefaultPath()
 	if err != nil {
 		return err
 	}
-	st, err := state.Load(path)
-	if err != nil {
-		return err
-	}
-	if st.VPN == nil {
-		st.VPN = &state.VPNState{}
-	}
-	apply(st.VPN)
-	return state.Save(path, st)
+	return state.Update(path, func(st *state.State) {
+		if st.VPN == nil {
+			st.VPN = &state.VPNState{}
+		}
+		apply(st.VPN)
+	})
 }
 
 // loadExternalRouteState returns the recorded route, or nil when there is

@@ -414,7 +414,18 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 			OnRegistered: func(reply *link.RegisteredReply) {
 				if reply.WorkspaceSlug != "" {
 					st.WorkspaceSlug = reply.WorkspaceSlug
-					_ = state.Save(statePath, st)
+					// Update, not Save: this callback fires on every
+					// reconnect, and `st` was loaded when this process
+					// started — possibly days ago. Saving it whole erases
+					// anything a verb has recorded since (the exit-gate
+					// selection, the external route), which is how an
+					// external route confirmed at 17:51 vanished from
+					// state.json at 17:58 while still installed in the
+					// kernel. Only the field this callback actually owns
+					// may be written.
+					if err := state.Update(statePath, func(s *state.State) { s.WorkspaceSlug = reply.WorkspaceSlug }); err != nil {
+						fmt.Fprintf(os.Stderr, "state: could not record the workspace slug: %v\n", err)
+					}
 				}
 				if err := updater.ClearPending(); err != nil {
 					fmt.Fprintf(os.Stderr, "self-update: could not clear rollback marker after registration: %v\n", err)

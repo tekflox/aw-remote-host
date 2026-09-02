@@ -153,3 +153,29 @@ func Save(path string, s *State) error {
 	}
 	return nil
 }
+
+// Update applies mutate to the state ON DISK and writes it back, instead of
+// saving a struct the caller has been holding.
+//
+// Save is whole-file and last-write-wins, which is fine for a command that
+// runs and exits and wrong for the daemon, which loads State once at startup
+// and can then run for days. Anything a VERB writes during that time —
+// vpn.saveExitState's ExitNode, externalroute.go's ExternalRoute — is invisible
+// to that in-memory copy, so the next `Save(path, st)` from the daemon silently
+// erases it.
+//
+// That is not hypothetical: measured on the production bare metal 2026-09-02,
+// an external route recorded at 17:51 was gone from state.json at 17:58,
+// dropped by the daemon re-saving a struct it had loaded at 17:08. The route
+// itself was still installed in the kernel, so nothing looked broken — the
+// record that Reassert needs to put it back after a flush was simply not
+// there any more, which is the silent-degradation shape this house keeps
+// finding.
+func Update(path string, mutate func(*State)) error {
+	s, err := Load(path)
+	if err != nil {
+		return err
+	}
+	mutate(s)
+	return Save(path, s)
+}
