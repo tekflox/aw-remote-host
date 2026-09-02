@@ -486,22 +486,113 @@ func Reassert(ctx context.Context, r Runner) ([]string, error) {
 	if r == nil {
 		return nil, fmt.Errorf("no command runner was supplied to re-assert the external route for %s", plan.Container)
 	}
-	return reassertPlan(ctx, r, *plan)
+	restored, updated, gone, err := reassertPlan(ctx, r, *plan)
+	if err != nil {
+		return restored, err
+	}
+	switch {
+	case gone:
+		// The container this record was built for no longer exists. reassertPlan
+		// already took the rule and its exclusions out; clearing the record is
+		// what keeps the NEXT pass from doing this same work forever, and — the
+		// part that actually matters — keeps a stale record from ever being
+		// re-read as if it still described something real.
+		if cerr := clearExternalRouteState(); cerr != nil {
+			return restored, fmt.Errorf("container %s no longer resolves, and the stale external-route record could not be cleared: %w", plan.Container, cerr)
+		}
+	case updated != nil:
+		// Same container, a new address. Persisted via state.Update
+		// (load-modify-save) so this write cannot clobber whatever else the
+		// daemon recorded between the read above and now — see state.Update's
+		// own comment for the race this replaced.
+		if serr := saveExternalRouteState(*updated); serr != nil {
+			return restored, fmt.Errorf("resolved a new address (%s) for %s but could not persist it: %w", updated.SourceIP, plan.Container, serr)
+		}
+	}
+	return restored, nil
 }
 
-// reassertPlan is Reassert with the state read already done, which is what
-// makes the behaviour testable without a state file on the machine running
-// `go test`.
-func reassertPlan(ctx context.Context, r Runner, plan ExternalRoutePlan) ([]string, error) {
-	var restored []string
+// reassertPlan is Reassert with the state read (and the state write) already
+// factored out, which is what makes the behaviour testable without a state
+// file on the machine running `go test`: it only ever talks to Runner.
+//
+// It re-resolves the container by its recorded ContainerID through the
+// runtime on EVERY pass, not only when the rule is missing — the same lookup
+// PlanExternalRoute used to build this record in the first place. That is the
+// actual fix here, not a defensive extra: a rule that matches the RECORDED
+// SourceIP can be sitting untouched in the kernel while that address now
+// belongs to a different container than the one this record was built for,
+// because Docker handed the old address to whatever it started next.
+// ruleInstalled alone cannot see that — it only proves a rule for the old
+// address still exists, never that the old address still means what the
+// record says it does. One inspect per ReassertInterval pass is the cost of closing that,
+// and ReassertInterval's own comment already treats a cheap check on a short
+// interval as the entire point of this loop.
+//
+// It returns, instead of writing anything itself: what it had to restore,
+// the updated plan when the address moved (nil when it didn't), and whether
+// the container is gone. Reassert turns that into exactly one state write.
+func reassertPlan(ctx context.Context, r Runner, plan ExternalRoutePlan) (restored []string, updated *ExternalRoutePlan, gone bool, err error) {
+	rt := ContainerRuntime{Name: plan.Runtime}
+	_, ip, resolveErr := resolveContainerSource(ctx, r, rt, plan.ContainerID)
+	if resolveErr != nil {
+		// The container this rule was built for no longer resolves under the
+		// id that was recorded — recreated, or removed outright. Putting the
+		// rule back, or leaving it in place, would keep a /32 pointed at an
+		// address any other container on this Docker network is free to
+		// receive next, silently handing it this tunnel. Take the rule and its
+		// exclusions out; there is nothing left here to reassert.
+		if ok, rerr := ruleInstalled(ctx, r, plan); rerr == nil && ok {
+			if _, err := r.Run(ctx, "ip", plan.ruleArgs("del")...); err != nil {
+				return restored, nil, false, fmt.Errorf("container %s (%s) no longer resolves (%v), and the orphaned rule for %s could not be removed: %w", plan.Container, plan.ContainerID, resolveErr, plan.SourceIP, err)
+			}
+			restored = append(restored, "removed orphaned rule from "+plan.SourceIP+"/32 ("+plan.Container+" no longer exists)")
+		}
+		for _, prefix := range plan.Exclusions {
+			ok, rerr := routeInstalled(ctx, r, plan, prefix)
+			if rerr != nil || !ok {
+				continue
+			}
+			if _, err := r.Run(ctx, "ip", plan.excludeArgs("del", prefix)...); err != nil {
+				return restored, nil, false, fmt.Errorf("container %s no longer resolves, and the orphaned exclusion %s could not be removed: %w", plan.Container, prefix, err)
+			}
+			restored = append(restored, "removed orphaned exclusion "+prefix)
+		}
+		return restored, nil, true, nil
+	}
 
-	present, err := ruleInstalled(ctx, r, plan)
-	if err != nil {
-		return nil, err
+	if ip != plan.SourceIP {
+		// Same container id, a new IPAM address — a network reconnect, or a
+		// recreate that happened to keep the id. PlanExternalRoute proves this
+		// invariant on the initial apply; a reassert re-resolving to a new
+		// address has to prove it again before installing anything, or a
+		// container that migrated to host networking would route the host
+		// itself — exactly the failure this invariant exists to prevent.
+		if err := mustNotBeThisHost(ctx, r, ip); err != nil {
+			return restored, nil, false, fmt.Errorf("refusing to re-assert %s at its new address: %w", plan.Container, err)
+		}
+		// The old rule, if it is still there, now matches whoever inherited
+		// that address, not this container, so it has to come out before the
+		// new one goes in; there must be no window with both installed.
+		if ok, rerr := ruleInstalled(ctx, r, plan); rerr == nil && ok {
+			if _, err := r.Run(ctx, "ip", plan.ruleArgs("del")...); err != nil {
+				return restored, nil, false, fmt.Errorf("could not remove the stale rule for %s before re-asserting the new address %s: %w", plan.SourceIP, ip, err)
+			}
+		}
+		next := plan
+		next.SourceIP = ip
+		restored = append(restored, "container "+plan.Container+" moved to "+ip+" — record updated")
+		plan = next
+		updated = &next
+	}
+
+	present, perr := ruleInstalled(ctx, r, plan)
+	if perr != nil {
+		return restored, updated, false, perr
 	}
 	if !present {
 		if _, err := r.Run(ctx, "ip", plan.ruleArgs("add")...); err != nil {
-			return restored, fmt.Errorf("could not re-assert the external route rule for %s: %w", plan.Container, err)
+			return restored, updated, false, fmt.Errorf("could not re-assert the external route rule for %s: %w", plan.Container, err)
 		}
 		restored = append(restored, "ip rule from "+plan.SourceIP+"/32")
 	}
@@ -511,11 +602,11 @@ func reassertPlan(ctx context.Context, r Runner, plan ExternalRoutePlan) ([]stri
 			continue
 		}
 		if _, err := r.Run(ctx, "ip", plan.excludeArgs("add", prefix)...); err != nil {
-			return restored, fmt.Errorf("could not re-assert the exclusion %s: %w", prefix, err)
+			return restored, updated, false, fmt.Errorf("could not re-assert the exclusion %s: %w", prefix, err)
 		}
 		restored = append(restored, "exclusion "+prefix)
 	}
-	return restored, nil
+	return restored, updated, false, nil
 }
 
 // ReassertInterval is how often the daemon re-checks the rule.
