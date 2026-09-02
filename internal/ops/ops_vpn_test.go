@@ -161,6 +161,11 @@ func TestVPNStatusMeasuresDirectVersusRelayPerPeer(t *testing.T) {
 // actually gets executed.
 func TestVPNStatusRunsTheResolvedBinary(t *testing.T) {
 	withTailscale(t, "/opt/homebrew/bin/tailscale")
+	// Isolated from external_tunnels (ops_vpn_external.go), which is not what
+	// this test is about and would otherwise add a real machine's own `wg`
+	// call to r.calls depending on whether the box running `go test` happens
+	// to have it on PATH.
+	withWG(t, "")
 	r := newFakeRunner()
 	r.on(tsStatusJSON, "/opt/homebrew/bin/tailscale", "status", "--json")
 	h := &Handler{Runner: r}
