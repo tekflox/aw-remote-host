@@ -6,6 +6,7 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.sh | sh
 #   curl -fsSL .../install.sh | AW_REMOTE_HOST_VERSION=v0.1.0 sh   # pin a version
+#   curl -fsSL .../install.sh | AW_REMOTE_HOST_FORCE=1 sh          # reinstall anyway
 set -eu
 
 REPO="tekflox/aw-remote-host"
@@ -36,6 +37,31 @@ case "$os" in
   linux|darwin) ;;
   *) echo "aw-remote-host: unsupported OS $os" >&2; exit 1 ;;
 esac
+
+# Already at the pinned version? Then there is nothing to do, and saying so
+# is the answer — not a download that produces a byte-identical file.
+#
+# This sits AFTER `latest` has been resolved to a tag, because "latest" is
+# not a version you can compare against, and BEFORE the download, because
+# skipping the work is the whole point.
+#
+# It compares the binary ON DISK, which is not necessarily the one RUNNING:
+# a process started before an earlier install keeps its old image (readlink
+# /proc/<pid>/exe shows a `(deleted)` suffix) until whatever supervises it
+# restarts it. This script installs; it does not restart anything, and it
+# must not claim otherwise.
+#
+# AW_REMOTE_HOST_FORCE=1 reinstalls regardless — for a binary that is the
+# right version and the wrong bytes (truncated download, corrupted disk).
+if [ -z "${AW_REMOTE_HOST_FORCE:-}" ] && [ -x "${INSTALL_DIR}/aw-remote-host" ]; then
+  installed=$("${INSTALL_DIR}/aw-remote-host" version 2>/dev/null || true)
+  if [ "$installed" = "$VERSION" ]; then
+    echo "aw-remote-host: already at ${VERSION} in ${INSTALL_DIR} — nothing to do"
+    echo "note: this checks the binary on disk, not a running process — restart the service to pick it up"
+    echo "note: set AW_REMOTE_HOST_FORCE=1 to reinstall anyway"
+    exit 0
+  fi
+fi
 
 asset="aw-remote-host_${VERSION}_${os}_${arch}.tar.gz"
 base_url="https://github.com/${REPO}/releases/download/${VERSION}"

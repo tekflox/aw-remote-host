@@ -110,6 +110,51 @@ commit `753214a`) only takes effect on the target machine once the
    `install.sh` logic actually ran — e.g. check that the podman socket is
    mounted with `--security-opt label=disable` on the recreated container.
 
+Step 2 is safe to re-run: `install.sh` compares the resolved tag against
+`${INSTALL_DIR}/aw-remote-host version` and exits 0 with "already at
+&lt;tag&gt;" instead of downloading again. It compares the binary **on disk**,
+which is not necessarily the one **running** — see step 3, and the
+`(deleted)` note below. `AW_REMOTE_HOST_FORCE=1` reinstalls anyway, for a
+binary that is the right version and the wrong bytes.
+
+### Why a CONTAINERISED host never reaches a release version on its own
+
+Measured 2026-09-02 on the host that serves the `aw` workspace: its
+`/usr/local/bin/aw-remote-host` was dated **Aug 6**, and reported `dev`,
+although the checkout beside it was at v0.1.66 and the container had been
+recreated that same day. Three separate mechanisms, and each one has to be
+known before the version on such a host makes any sense:
+
+1. **The image build never stamps a version.** `main.go`'s `var version =
+   "dev"` is overwritten only by `-ldflags "-X main.version=${VERSION}"`,
+   which lives in `.github/workflows/release.yml`. The Dockerfile that
+   builds this binary for the workspace host (in the *legacy* repo,
+   `tools/aw-remote-host/Dockerfile`) runs a plain `go build`, so **every**
+   binary born from that image reports `dev` — including one built from a
+   v0.1.66 checkout, five minutes ago.
+2. **`dev` is refused on purpose.** `parseAgentVersion` (aw-workspace-ui
+   `src/lib/networkingApi.js`) and `_parse_agent_version` (aw-backend
+   `src/api/routes/host_link.py`) both return null for it, and both
+   callers treat null as too old. A version nobody can compare proves
+   nothing about what is inside the binary, and exit-gate selection on a
+   pre-v0.1.58 agent would move the *machine's* default route. Do not
+   loosen this to make a rebuild pass — rebuilding is not the fix.
+3. **Nothing self-updates it.** The container's entrypoint re-execs
+   `bootstrap-workspace` in a `while true` loop; it never re-installs.
+
+So on a containerised host, `install.sh` with a pinned release tag is the
+only path to a comparable version — and it is **ephemeral**: `/usr/local/bin`
+lives in the image layer, so the next container recreation reverts the
+binary to the `dev` build and the host is refused again. The durable fix is
+`-ldflags` plus a pinned release in that Dockerfile, in the legacy repo.
+
+Restarting the agent on such a host means killing the process and letting
+the entrypoint's loop respawn it ~10-15s later. Two things bite:
+`pkill` may not exist in the running image (scan `/proc/*/comm` and
+`kill -TERM` instead), and the kill has to be **detached**
+(`sh -c 'sleep 3; …' &`) because the process being killed is the parent of
+the exec call doing the killing.
+
 ## Usage
 
 ```sh
