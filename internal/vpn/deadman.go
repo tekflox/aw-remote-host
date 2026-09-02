@@ -99,6 +99,13 @@ type ArmSpec struct {
 	// PATH it inherits — and on a machine whose network is broken is the
 	// worst possible moment to discover a binary is not where it was assumed
 	// to be.
+	//
+	// Empty is legitimate for a selection that has no mesh selection to clear
+	// — the external-tunnel path (externalroute.go) moves ONE container with
+	// an `ip rule` and never calls `tailscale set`, so there is no binary for
+	// it to resolve. Arm requires that such a spec supply ExclusionRevert
+	// instead, because a switch that would run nothing is worse than no switch:
+	// it reports a guarantee it does not provide.
 	TailscalePath string
 	// ExclusionRevert is the platform's extra shell for undoing whatever it
 	// pinned outside the tunnel, with every path already absolute and every
@@ -123,17 +130,25 @@ func (s ArmSpec) revertScript() string {
 	if exclusions == "" {
 		exclusions = "# nothing to unpin on this platform"
 	}
+	// The mesh line is omitted rather than emitted with an empty path when
+	// there is no selection to clear. A bare ` set --exit-node=` would run
+	// whatever the shell resolved first, on a machine whose network has just
+	// gone — the one moment where a surprising binary is least affordable.
+	clearSelection := "# no mesh selection to clear on this path"
+	if s.TailscalePath != "" {
+		clearSelection = s.TailscalePath + " set --exit-node= --exit-node-allow-lan-access=false --accept-dns=false"
+	}
 	return fmt.Sprintf(`# %s
 sleep %d
-echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) dead-man's switch FIRED: reverting exit-node selection (%s) that was never confirmed"
-%s set --exit-node= --exit-node-allow-lan-access=false --accept-dns=false
+echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) dead-man's switch FIRED: reverting selection (%s) that was never confirmed"
+%s
 %s
 echo "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ) dead-man's switch: revert complete"
 `,
 		deadmanMarker,
 		int(s.After.Seconds()),
 		s.ExitNode,
-		s.TailscalePath,
+		clearSelection,
 		exclusions,
 	)
 }
@@ -147,8 +162,12 @@ func Arm(spec ArmSpec) (*Deadman, error) {
 	if spec.After <= 0 {
 		return nil, errors.New("dead-man's switch needs a positive timeout")
 	}
-	if spec.TailscalePath == "" {
-		return nil, errors.New("dead-man's switch needs an absolute path for tailscale, resolved before the route is touched")
+	// One of the two has to do something. A spec with neither would arm a
+	// switch whose whole body is comments — the worst possible outcome,
+	// because every layer above reports "ARMED" and none of them would be
+	// wrong about anything except the part that matters.
+	if spec.TailscalePath == "" && strings.TrimSpace(spec.ExclusionRevert) == "" {
+		return nil, errors.New("dead-man's switch needs either an absolute path for tailscale or an explicit revert to run, resolved before the route is touched — a switch with nothing to run would report a guarantee it does not provide")
 	}
 	if _, err := Disarm(); err != nil {
 		return nil, fmt.Errorf("stand down the previously armed switch: %w", err)

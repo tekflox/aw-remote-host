@@ -28,6 +28,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/tcpproxy"
 	"github.com/tekflox/aw-remote-host/internal/tunnelproxy"
 	"github.com/tekflox/aw-remote-host/internal/updater"
+	"github.com/tekflox/aw-remote-host/internal/vpn"
 	"github.com/tekflox/aw-remote-host/internal/wsl"
 )
 
@@ -390,6 +391,23 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	if err := firewall.SelfHeal(ctx, ops.DefaultRunner); err != nil {
 		fmt.Fprintf(os.Stderr, "firewall: self-heal failed (continuing): %v\n", err)
 	}
+
+	// Same bargain for an external-tunnel route (internal/vpn/externalroute.go),
+	// and it is not optional here: this rule is a routing POLICY rule, and
+	// systemd-networkd flushes every one it does not own whenever it restarts
+	// — which on the production bare metal is whatever the daily unattended
+	// apt upgrade decides. Measured 2026-09-02: networkd restarted at 06:48:54
+	// and the aw-vpn-hub rules installed at boot were gone, on a container
+	// that had not restarted. tailscaled survives that only because it does
+	// exactly this. A no-op on every host that has no external route recorded.
+	reassertRunner := vpn.PrivilegedRunner{Inner: ops.DefaultRunner, Sudo: runtime.GOOS != "darwin" && runtime.GOOS != "windows" && os.Geteuid() != 0}
+	go vpn.ReassertLoop(ctx, reassertRunner, func(restored []string, err error) {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "vpn: could not re-assert the external route (continuing): %v\n", err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "vpn: re-asserted the external route after something flushed it: %s\n", strings.Join(restored, ", "))
+	})
 
 	go func() {
 		runDone <- c.Run(ctx, credPath, link.RunCallbacks{

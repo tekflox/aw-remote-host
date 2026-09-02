@@ -78,6 +78,38 @@ type VPNState struct {
 	// when the gate was selected, kept for reporting. `status` lists what the
 	// kernel actually has rather than this, and compares the two.
 	ExitExclusions []string `json:"exit_exclusions,omitempty"`
+	// ExternalRoute is the container this host is routing out through an
+	// external tunnel it terminates itself — internal/vpn/externalroute.go,
+	// which is a different mechanism from the mesh gate above and can be in
+	// force at the same time as one.
+	//
+	// Unlike ExitNode this record is not only for reporting: it is what
+	// Reassert re-applies on a timer, because systemd-networkd flushes foreign
+	// routing policy rules whenever it restarts and takes this rule with it.
+	// So it is still written only after a confirmed apply — a record for an
+	// apply that never confirmed would be re-asserted forever.
+	ExternalRoute *ExternalRouteState `json:"external_route,omitempty"`
+}
+
+// ExternalRouteState is one container's egress pinned to an external tunnel.
+//
+// SourceIP is runtime IPAM and moves whenever the container is recreated,
+// which is why ContainerID and Container are both kept: they are what a
+// re-resolve can key on, and what makes a stale SourceIP detectable rather
+// than silently re-applied to whatever moved into that address.
+type ExternalRouteState struct {
+	Container   string   `json:"container"`
+	ContainerID string   `json:"container_id,omitempty"`
+	SourceIP    string   `json:"source_ip"`
+	Table       int      `json:"table"`
+	Priority    int      `json:"priority"`
+	Runtime     string   `json:"runtime,omitempty"`
+	TunnelDev   string   `json:"tunnel_dev,omitempty"`
+	MainGateway string   `json:"main_gateway,omitempty"`
+	MainDev     string   `json:"main_dev,omitempty"`
+	Exclusions  []string `json:"exclusions,omitempty"`
+	// RoutedAt is RFC3339.
+	RoutedAt string `json:"routed_at,omitempty"`
 }
 
 // DefaultPath returns ~/.aw-remote-host/state.json.

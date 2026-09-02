@@ -113,7 +113,8 @@ type Handler struct {
 // "exec_kill"|"list_processes"|"fs_stat"|"fs_list"|"fs_mkdir"|"fs_delete"|
 // "fs_read_chunk"|"fs_write_chunk"|"firewall_apply"|"firewall_status"|
 // "vpn_status"|"vpn_bootstrap"|"vpn_advertise_exit"|"vpn_use_exit"|
-// "vpn_clear_exit"|"vpn_public_ip") — the
+// "vpn_clear_exit"|"vpn_public_ip"|"vpn_external_route"|
+// "vpn_external_unroute") — the
 // switchboard link.go's cmd-frame handling calls into. args carries optional
 // per-verb parameters such as the exact aw-workspace image version to
 // install for workspace updates, the shell command/timeout/job_id the
@@ -181,6 +182,10 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.VPNClearExit(ctx, args, emit)
 	case "vpn_public_ip":
 		return h.VPNPublicIP(ctx)
+	case "vpn_external_route":
+		return h.VPNExternalRoute(ctx, args, emit)
+	case "vpn_external_unroute":
+		return h.VPNExternalUnroute(ctx, args, emit)
 	default:
 		return nil, fmt.Errorf("unknown verb %q", verb)
 	}
