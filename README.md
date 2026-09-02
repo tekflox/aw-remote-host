@@ -158,7 +158,7 @@ the exec call doing the killing.
 ## Usage
 
 ```sh
-aw-remote-host bootstrap-workspace --token <token> [--with-workspace] [--plan] [--yes] [--foreground|--background] [--control-plane https://api.aw.tekflox.com]
+aw-remote-host bootstrap-workspace --token <token> [--with-workspace] [--force] [--plan] [--yes] [--foreground|--background] [--control-plane https://api.aw.tekflox.com]
 aw-remote-host status [--plan]
 aw-remote-host vpn --login-server <headscale-url> [--authkey <key>] [--hostname <name>] [--advertise-exit-node] [--accept-dns] [--plan]
 aw-remote-host vpn use-exit <node> [--expect-egress <ip>] [--exclude <cidrs>] [--deadman 2m] [--confirm-timeout 45s] [--persist-across-reboot] [--plan]
@@ -199,6 +199,22 @@ Do this immediately at link time, or defer it — both are equivalent:
 health checks are skipped — nothing was installed, so nothing to check) and
 switches to the full per-module health report once either path above has
 completed successfully.
+
+### Downgrade guard on a full bootstrap
+
+Either path above — `--with-workspace` here, or the control plane's
+`"bootstrap"` verb — runs every module's `install.sh` from scratch, which
+can silently reset postgres/redis onto empty storage if it happens to run
+under an OLDER binary than the one that already bootstrapped this host (see
+`internal/state.CheckDowngrade`; this is what caused a real incident on
+2026-09-02, where an outer container recreation both wiped nested podman's
+own container registry — see `bootstrap/lib/podman_storage.sh` — and rolled
+the running binary back to a pre-fix build baked into a never-rebuilt image).
+
+Once a host has completed a full bootstrap, a later one from an older
+binary is refused with a loud error instead of silently reinitializing
+everything. Pass `--force` if that downgrade is genuinely intentional; the
+control-plane `"bootstrap"` verb takes the same opt-out via `args.force`.
 
 ### `--foreground` vs `--background`
 

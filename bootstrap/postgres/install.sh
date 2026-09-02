@@ -14,8 +14,19 @@ POSTGRES_PASSWORD="${AW_POSTGRES_PASSWORD:-postgres}"
 # it — taking the workspace's entire database with it. $HOME is the durable
 # mount. Same ${HOME}/<name> + AW_*_HOST_DIR override convention as
 # bootstrap/workspace/install.sh's HOST_DIR.
-DEFAULT_DATA_DIR="${HOME}/postgres-data"
-DATA_DIR="${AW_POSTGRES_HOST_DIR:-${DEFAULT_DATA_DIR}}"
+#
+# Resolved through bootstrap/lib/container.sh's resolve_data_dir(), NOT
+# inline — verify.sh computes this exact same path the exact same way, and
+# that file's header explains why they must never be allowed to drift.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/publish.sh
+source "$SCRIPT_DIR/../lib/publish.sh"
+# shellcheck source=../lib/network.sh
+source "$SCRIPT_DIR/../lib/network.sh"
+# shellcheck source=../lib/container.sh
+source "$SCRIPT_DIR/../lib/container.sh"
+
+DATA_DIR="$(resolve_data_dir AW_POSTGRES_HOST_DIR postgres-data)"
 LEGACY_VOLUME="aw-remote-host-postgres-data"
 CONTAINER_DATA_DIR="/var/lib/postgresql/data"
 # The `postgres` user baked into the pgvector image.
@@ -24,11 +35,6 @@ POSTGRES_GID="999"
 
 # Host-port publish is optional — see bootstrap/lib/publish.sh for why a taken
 # port must not fail the install.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../lib/publish.sh
-source "$SCRIPT_DIR/../lib/publish.sh"
-# shellcheck source=../lib/network.sh
-source "$SCRIPT_DIR/../lib/network.sh"
 mapfile -t PUBLISH_ARGS < <(publish_args postgres 5432 "${AW_POSTGRES_PUBLISH:-}")
 
 # Shared network so the workspace container reaches postgres by name (a BYOD
@@ -41,8 +47,7 @@ ensure_network "$NETWORK_NAME"
 # container leaves that volume (and its data) untouched, so the copy below has
 # something to migrate from and a rollback stays available.
 if podman container exists "$CONTAINER_NAME"; then
-  current_src="$(podman inspect "$CONTAINER_NAME" \
-    --format "{{range .Mounts}}{{if eq .Destination \"$CONTAINER_DATA_DIR\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null || true)"
+  current_src="$(mount_source "$CONTAINER_NAME" "$CONTAINER_DATA_DIR")"
   if [ "$current_src" = "$DATA_DIR" ]; then
     echo "postgres: container already exists on $DATA_DIR, ensuring it's running"
     podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true

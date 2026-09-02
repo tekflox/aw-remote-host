@@ -10,8 +10,19 @@ NETWORK_NAME="aw-remote-host"
 # this data is meant to survive, and a named volume does not: see the long
 # comment in bootstrap/postgres/install.sh for why podman storage is ephemeral
 # on a containerised BYOD host.
-DEFAULT_DATA_DIR="${HOME}/redis-data"
-DATA_DIR="${AW_REDIS_HOST_DIR:-${DEFAULT_DATA_DIR}}"
+#
+# Resolved through bootstrap/lib/container.sh's resolve_data_dir(), NOT
+# inline — verify.sh computes this exact same path the exact same way, and
+# that file's header explains why they must never be allowed to drift.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/publish.sh
+source "$SCRIPT_DIR/../lib/publish.sh"
+# shellcheck source=../lib/network.sh
+source "$SCRIPT_DIR/../lib/network.sh"
+# shellcheck source=../lib/container.sh
+source "$SCRIPT_DIR/../lib/container.sh"
+
+DATA_DIR="$(resolve_data_dir AW_REDIS_HOST_DIR redis-data)"
 LEGACY_VOLUME="aw-remote-host-redis-data"
 CONTAINER_DATA_DIR="/data"
 # The `redis` user baked into the redis image.
@@ -20,19 +31,13 @@ REDIS_GID="999"
 
 # Host-port publish is optional — see bootstrap/lib/publish.sh for why a taken
 # port must not fail the install.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../lib/publish.sh
-source "$SCRIPT_DIR/../lib/publish.sh"
-# shellcheck source=../lib/network.sh
-source "$SCRIPT_DIR/../lib/network.sh"
 mapfile -t PUBLISH_ARGS < <(publish_args redis 6379 "${AW_REDIS_PUBLISH:-}")
 
 # Shared network so the workspace container reaches redis by name.
 ensure_network "$NETWORK_NAME"
 
 if podman container exists "$CONTAINER_NAME"; then
-  current_src="$(podman inspect "$CONTAINER_NAME" \
-    --format "{{range .Mounts}}{{if eq .Destination \"$CONTAINER_DATA_DIR\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null || true)"
+  current_src="$(mount_source "$CONTAINER_NAME" "$CONTAINER_DATA_DIR")"
   if [ "$current_src" = "$DATA_DIR" ]; then
     echo "redis: container already exists on $DATA_DIR, ensuring it's running"
     podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true

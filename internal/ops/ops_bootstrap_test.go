@@ -2,9 +2,12 @@ package ops
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
+	"github.com/tekflox/aw-remote-host/internal/state"
 )
 
 // stubRunModule swaps the package's module runner for one that records the
@@ -91,5 +94,87 @@ func TestReinstallRunsWorkspaceModuleOnly(t *testing.T) {
 	}
 	if len(*ran) != 1 || (*ran)[0] != "workspace" {
 		t.Fatalf("Reinstall should run only the workspace module, ran=%v", *ran)
+	}
+}
+
+// This is the control-plane path for incident:byod-postgres-lost-bind-mount-2026-09-02:
+// the "bootstrap" verb, dispatched against a host whose running binary is
+// older than the one that already bootstrapped it, must be refused rather
+// than silently re-running every module from scratch.
+func TestBootstrapRefusesADowngrade(t *testing.T) {
+	ran := stubRunModule(t)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	if err := state.RecordBootstrapVersion(statePath, "v0.1.72"); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{
+		ExtractDir: t.TempDir(),
+		StatePath:  statePath,
+		CLIVersion: "v0.1.66",
+	}}
+	emit, _ := collectEmits()
+	_, err := h.Dispatch(context.Background(), "bootstrap", nil, emit)
+	if err == nil {
+		t.Fatal("expected Dispatch(bootstrap) to refuse a downgrade")
+	}
+	if !strings.Contains(err.Error(), "v0.1.66") || !strings.Contains(err.Error(), "v0.1.72") {
+		t.Fatalf("error should name both versions, got: %v", err)
+	}
+	if len(*ran) != 0 {
+		t.Fatalf("no module should have run once the guard refused, ran=%v", *ran)
+	}
+}
+
+// args["force"] must bypass the guard for exactly the one call it was set
+// on — mirroring the CLI's --force flag.
+func TestBootstrapForceArgBypassesTheGuard(t *testing.T) {
+	ran := stubRunModule(t)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	if err := state.RecordBootstrapVersion(statePath, "v0.1.72"); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{
+		ExtractDir: t.TempDir(),
+		StatePath:  statePath,
+		CLIVersion: "v0.1.66",
+	}}
+	emit, _ := collectEmits()
+	if _, err := h.Dispatch(context.Background(), "bootstrap", map[string]any{"force": true}, emit); err != nil {
+		t.Fatalf("Dispatch(bootstrap) with force=true: %v", err)
+	}
+	if len(*ran) == 0 {
+		t.Fatal("force=true should have let the manifest run")
+	}
+}
+
+// A successful full bootstrap must record ITS OWN version, not just flip
+// Provisioned once — an in-place upgrade has to move the recorded version
+// forward too, or a later downgrade back to the PREVIOUS release would look
+// like same-or-newer and slip past the guard.
+func TestBootstrapRecordsItsOwnVersionOnSuccess(t *testing.T) {
+	stubRunModule(t)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+
+	h := &Handler{Runner: newFakeRunner(), Opts: BootstrapOpts{
+		ExtractDir: t.TempDir(),
+		StatePath:  statePath,
+		CLIVersion: "v0.1.72",
+	}}
+	emit, _ := collectEmits()
+	if _, err := h.Dispatch(context.Background(), "bootstrap", nil, emit); err != nil {
+		t.Fatalf("Dispatch(bootstrap): %v", err)
+	}
+
+	st, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LastBootstrapVersion != "v0.1.72" {
+		t.Fatalf("LastBootstrapVersion = %q, want v0.1.72", st.LastBootstrapVersion)
+	}
+	if !st.Provisioned {
+		t.Fatal("Provisioned should also be set true, as before this change")
 	}
 }

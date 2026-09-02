@@ -97,6 +97,18 @@ type BootstrapOpts struct {
 	// by hand. Left empty by callers (tests, or any future non-CLI caller)
 	// that don't care about persisting this — a no-op, not an error.
 	StatePath string
+	// CLIVersion is this running binary's own version (main.version) — the
+	// value runModulesWithEnv compares against state.LastBootstrapVersion
+	// before a FULL bootstrap, so a full manifest re-run from an older
+	// binary is refused instead of silently reinitializing everything. See
+	// state.CheckDowngrade. Blank/"dev" (a developer's own unreleased
+	// build) never blocks anything.
+	CLIVersion string
+	// Force bypasses the CheckDowngrade guard above for one Bootstrap call.
+	// Not part of the standing Handler.Opts a caller assembles once — see
+	// Bootstrap, which sets it per-call from the "bootstrap" verb's own
+	// args["force"], mirroring the CLI's --force flag.
+	Force bool
 }
 
 // Handler executes lifecycle/health verbs against the local podman runtime.
@@ -137,7 +149,7 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 	case "reinstall":
 		return h.Reinstall(ctx, h.Opts, emit)
 	case "bootstrap":
-		return h.Bootstrap(ctx, h.Opts, emit)
+		return h.Bootstrap(ctx, h.Opts, args, emit)
 	case "update":
 		return h.Update(ctx, h.Opts, args, emit)
 	case "self-update":
@@ -554,7 +566,16 @@ func restartHostServiceSoon(slug string) error {
 // on an already-running workspace): the full manifest (podman, postgres,
 // redis, workspace), each module skipped if its own verify.sh already
 // passes.
-func (h *Handler) Bootstrap(ctx context.Context, opts BootstrapOpts, emit Emit) (map[string]any, error) {
+//
+// Guarded by state.CheckDowngrade (see runModulesWithEnv) against exactly
+// what caused incident:byod-postgres-lost-bind-mount-2026-09-02: the
+// control plane dispatching this verb against a host whose running binary
+// is older than the one that last bootstrapped it. args["force"] (bool)
+// bypasses that guard for this one call, mirroring the CLI's --force flag.
+func (h *Handler) Bootstrap(ctx context.Context, opts BootstrapOpts, args map[string]any, emit Emit) (map[string]any, error) {
+	if force, _ := args["force"].(bool); force {
+		opts.Force = true
+	}
 	return h.runModules(ctx, opts, true, emit)
 }
 
@@ -717,6 +738,16 @@ func (h *Handler) runModulesWithEnv(ctx context.Context, opts BootstrapOpts, ful
 	if emit == nil {
 		emit = noopEmit
 	}
+	// Only a FULL run re-initializes podman/postgres/redis from scratch —
+	// the risky case the guard exists for. opts.StatePath is empty for
+	// tests and any caller that never wired one up; nothing to compare
+	// against there, so this is a no-op, not an error.
+	if full && opts.StatePath != "" {
+		if err := state.CheckDowngrade(opts.StatePath, opts.CLIVersion, opts.Force); err != nil {
+			emit("error", "bootstrap", err.Error())
+			return nil, err
+		}
+	}
 	m, err := bootstrap.LoadEmbeddedManifest()
 	if err != nil {
 		return nil, fmt.Errorf("load manifest: %w", err)
@@ -752,6 +783,11 @@ func (h *Handler) runModulesWithEnv(ctx context.Context, opts BootstrapOpts, ful
 			st.Provisioned = true
 			_ = state.Save(opts.StatePath, st) // best-effort — a save failure here shouldn't fail the bootstrap that already succeeded
 		}
+		// Recorded on EVERY successful full bootstrap, not just the first
+		// (unlike Provisioned above) — an in-place upgrade must move this
+		// forward too, or CheckDowngrade would keep comparing against a
+		// stale version from this host's very first bootstrap.
+		_ = state.RecordBootstrapVersion(opts.StatePath, opts.CLIVersion) // best-effort, same rationale as above
 	}
 	return map[string]any{"bootstrapped": true}, nil
 }

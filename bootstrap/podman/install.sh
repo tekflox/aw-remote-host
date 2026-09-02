@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/deps.sh
 source "$SCRIPT_DIR/../lib/deps.sh"
+# shellcheck source=../lib/podman_storage.sh
+source "$SCRIPT_DIR/../lib/podman_storage.sh"
 
 # Pinned, validated on a real brew-less Mac (see bootstrap/podman/README.md).
 PODMAN_VENDORED_VERSION="6.0.2"
@@ -120,6 +122,14 @@ install_podman_linux() {
 }
 
 ensure_cmd podman install_podman_linux
+# Only a ROOTFUL host (id -u == 0) needs this — see podman_storage.sh for
+# why, and for the incident that made it necessary. Written BEFORE anything
+# below touches podman (the socket bring-up next, and every module after
+# this one) so no container/image is ever created against the default
+# graphroot first.
+if [ "$(id -u)" = "0" ]; then
+  configure_podman_graphroot /etc/containers/storage.conf "$HOME"
+fi
 echo "podman installed: $(podman --version)"
 
 # Tier-2 (container-per-app) support needs a running podman API socket —

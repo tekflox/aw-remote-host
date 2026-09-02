@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
@@ -41,6 +43,18 @@ type State struct {
 	// VPN records this host's enrolment in the tenant mesh. Nil on every host
 	// that never ran the vpn module, which is the default.
 	VPN *VPNState `json:"vpn,omitempty"`
+	// LastBootstrapVersion is the aw-remote-host CLI version that last
+	// completed a full (non-workspace-only) bootstrap on this host. Empty on
+	// every host that has never run one, or whose only bootstrap so far ran
+	// a "dev" build. See RecordBootstrapVersion / CheckDowngrade — the guard
+	// this backs exists because of a real incident (2026-09-02,
+	// incident:byod-postgres-lost-bind-mount-2026-09-02): an outer container
+	// recreation lost this host's nested-podman container registry (fixed
+	// separately, see bootstrap/lib/podman_storage.sh) AND rolled the running
+	// binary back to a pre-fix August build baked into a docker image that
+	// had never been rebuilt, which then silently re-ran the full manifest
+	// from scratch straight onto empty named volumes.
+	LastBootstrapVersion string `json:"last_bootstrap_version,omitempty"`
 }
 
 // VPNState is what the vpn bootstrap module needs to remember between runs:
@@ -178,4 +192,110 @@ func Update(path string, mutate func(*State)) error {
 	}
 	mutate(s)
 	return Save(path, s)
+}
+
+// RecordBootstrapVersion updates the state at path with runningVersion as
+// the version that just completed a full bootstrap. Blank/"dev" versions (a
+// developer's own unreleased build) are never recorded — they have no
+// meaningful order against a real release and would make every subsequent
+// release look like a downgrade.
+func RecordBootstrapVersion(path, runningVersion string) error {
+	runningVersion = strings.TrimSpace(runningVersion)
+	if runningVersion == "" || runningVersion == "dev" {
+		return nil
+	}
+	return Update(path, func(s *State) { s.LastBootstrapVersion = runningVersion })
+}
+
+// CheckDowngrade returns a descriptive error if runningVersion is OLDER
+// than the LastBootstrapVersion already recorded at path — unless force is
+// true. This exists because a full bootstrap re-runs every module's
+// install.sh from scratch, which is exactly what silently reset postgres/
+// redis onto empty storage on 2026-09-02: the binary that ran that
+// bootstrap was older than the fixes this host had already been running
+// with for weeks, and nothing stopped it from reinitializing everything.
+//
+// Never blocks when there is nothing meaningful to compare: a blank or
+// "dev" runningVersion, no version recorded yet at path, or either string
+// failing to parse as a plain "vX.Y.Z" release tag — the only shape this
+// CLI's release process produces, so an unparsable value means state.json
+// predates this field or was hand-edited, not a real downgrade signal.
+func CheckDowngrade(path, runningVersion string, force bool) error {
+	if force {
+		return nil
+	}
+	runningVersion = strings.TrimSpace(runningVersion)
+	if runningVersion == "" || runningVersion == "dev" {
+		return nil
+	}
+	s, err := Load(path)
+	if err != nil {
+		return err
+	}
+	if s.LastBootstrapVersion == "" {
+		return nil
+	}
+	cmp, ok := compareVersions(runningVersion, s.LastBootstrapVersion)
+	if !ok || cmp >= 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing a full bootstrap: this binary is %s, but %s already completed one on this host. "+
+			"A full bootstrap re-runs every module from scratch (podman/postgres/redis, and workspace where "+
+			"applicable), which can silently reset postgres/redis onto empty storage even though the real data "+
+			"on disk is untouched. Pass --force if running an older binary here is intentional.",
+		runningVersion, s.LastBootstrapVersion,
+	)
+}
+
+// compareVersions compares a and b as "vX.Y.Z"-style dotted-integer
+// versions and returns -1/0/1, or ok=false if either fails to parse that
+// way — callers must not treat that as a meaningful comparison in either
+// direction.
+func compareVersions(a, b string) (cmp int, ok bool) {
+	pa, aok := parseVersion(a)
+	pb, bok := parseVersion(b)
+	if !aok || !bok {
+		return 0, false
+	}
+	n := len(pa)
+	if len(pb) > n {
+		n = len(pb)
+	}
+	for i := 0; i < n; i++ {
+		var va, vb int
+		if i < len(pa) {
+			va = pa[i]
+		}
+		if i < len(pb) {
+			vb = pb[i]
+		}
+		if va != vb {
+			if va < vb {
+				return -1, true
+			}
+			return 1, true
+		}
+	}
+	return 0, true
+}
+
+// parseVersion parses "v0.1.66" (an optional leading "v", dot-separated
+// non-negative integers) into [0, 1, 66]. Returns ok=false for anything
+// else, including an empty string.
+func parseVersion(v string) ([]int, bool) {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if v == "" {
+		return nil, false
+	}
+	parts := strings.Split(v, ".")
+	nums := make([]int, len(parts))
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return nil, false
+		}
+		nums[i] = n
+	}
+	return nums, true
 }

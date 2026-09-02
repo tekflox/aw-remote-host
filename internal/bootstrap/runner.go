@@ -109,6 +109,21 @@ func Verify(ctx context.Context, mod Module, opts RunOptions) (string, error) {
 // RunModule performs the full idempotent detect->install->verify cycle for
 // one module: if Detect already reports healthy, install.sh is skipped
 // entirely; otherwise install.sh runs and verify.sh confirms it worked.
+//
+// THE INVARIANT THIS PUTS ON EVERY MODULE: anything install.sh guarantees
+// about HOW its container/state was created — a config flag, WHICH volume
+// it's mounted on, anything a re-run would otherwise fix — is unreachable
+// unless verify.sh checks for it too. A verify.sh that only checks "is it
+// up" makes every install.sh guarantee apply solely to hosts that had
+// nothing yet; a host that already has a container skips install.sh
+// forever, however wrong that container's state actually is. See
+// bootstrap/workspace/verify.sh (missing --init) and
+// bootstrap/{postgres,redis}/verify.sh + bootstrap/lib/container.sh
+// (container mounted on the wrong storage, 2026-09-02 incident) for two
+// modules that had to learn this the hard way. Do not "fix" this by making
+// install.sh unconditional here — some modules' install.sh is expensive or
+// has side effects (e.g. the vpn module) that must only run when verify.sh
+// says they're actually needed.
 func RunModule(ctx context.Context, mod Module, opts RunOptions) ModuleStatus {
 	status := ModuleStatus{Module: mod.Name}
 

@@ -26,6 +26,8 @@ jobs:
         run: |
           bash tests/bootstrap/publish_test.sh
           bash tests/bootstrap/network_test.sh
+          bash tests/bootstrap/container_test.sh
+          bash tests/bootstrap/podman_storage_test.sh
       - name: shellcheck bootstrap scripts
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then

@@ -168,10 +168,11 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	background := fs.Bool("background", false, "install and start a background service (launchd on macOS, systemd on Linux), then detach")
 	detach := fs.Bool("detach", false, "alias for --background")
 	elevated := fs.Bool("elevated", false, "Windows only: register the background task to run with administrative rights (RunLevel=HighestAvailable). Needs an elevated prompt to register — without it the link runs as a standard user, which is enough for exec/file/shell but cannot restart a Windows service or write under C:\\Program Files. Ignored on macOS/Linux.")
-	var withWorkspace, full *bool
+	var withWorkspace, full, force *bool
 	if allowProvision {
 		withWorkspace = fs.Bool("with-workspace", false, "also install/start the full local runtime (podman, postgres+pgvector, redis, the aw-workspace container) — default is a LEAN link: register this machine and hold /link (enables exec_* + control-plane-driven \"bootstrap\") without provisioning anything locally. Re-run with this flag later (no --token needed once linked) to provision, or trigger it remotely via the control plane's own \"bootstrap\" verb (see README) — no need to re-run by hand.")
 		full = fs.Bool("full", false, "alias for --with-workspace")
+		force = fs.Bool("force", false, "provision anyway even though this binary's version is older than the one that last completed a full bootstrap on this host (state.CheckDowngrade) — a full bootstrap re-runs podman/postgres/redis from scratch, which can silently reset them onto empty storage, so this refusal is the default and --force is an explicit opt-out")
 	}
 	hostPower := fs.String("host-power", "", "comma-separated elevated host access to grant app containers on this machine (default: none). Grants:\n"+hostpower.Help()+
 		"Only what this host can actually deliver is granted — each grant is probed, and anything undeliverable is reported, not silently assumed. An app must ALSO declare it in runtime.host_power and hold the matching host:* permission. Re-run with a different value to change it; pass --host-power=none to revoke.")
@@ -342,6 +343,14 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	// control-plane-driven "bootstrap" verb (src/api/placement/
 	// remote_host_driver.py) don't need any module installed locally first.
 	if provisionWorkspace {
+		// See state.CheckDowngrade: refuses to re-run podman/postgres/redis
+		// from scratch when this binary is older than the one that last
+		// bootstrapped this host, unless --force opted out. force is
+		// non-nil here — allowProvision is guaranteed true whenever
+		// provisionWorkspace is.
+		if err := state.CheckDowngrade(statePath, version, *force); err != nil {
+			return err
+		}
 		// Default() drops the opt-in modules (vpn): provisioning a workspace
 		// must never also enrol the machine in a network.
 		infra := m.Default().Except("workspace")
@@ -353,6 +362,9 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		reportStatuses(statuses)
 		if err != nil {
 			return err
+		}
+		if err := state.RecordBootstrapVersion(statePath, version); err != nil {
+			fmt.Fprintf(os.Stderr, "state: could not record bootstrap version: %v\n", err)
 		}
 	}
 
@@ -446,6 +458,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 					ControlPlane:     *controlPlane,
 					HostCredential:   hostCredential,
 					StatePath:        statePath,
+					CLIVersion:       version,
 				}
 				fmt.Printf("link: registered (remote_host_id=%s, workspace=%s)\n", reply.RemoteHostID, reply.WorkspaceSlug)
 				if reply.WorkspaceSlug != "" {
