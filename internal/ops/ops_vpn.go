@@ -98,15 +98,18 @@ func eligibilityPayload(e vpn.Eligibility) map[string]any {
 // mesh at all — a host with no tailscale is precisely the one whose reader
 // wants to know whether it could have it.
 func (h *Handler) VPNStatus(ctx context.Context) (map[string]any, error) {
-	eligibility := eligibilityPayload(probeEligibility())
+	elig := probeEligibility()
+	eligibility := eligibilityPayload(elig)
+	externalTunnels := externalTunnelsPayload(ctx, h.runner(), elig.Host)
 
 	bin := lookupTailscale()
 	if bin == "" {
 		return map[string]any{
-			"installed":   false,
-			"running":     false,
-			"reason":      "the tailscale CLI is not installed on this host",
-			"eligibility": eligibility,
+			"installed":        false,
+			"running":          false,
+			"reason":           "the tailscale CLI is not installed on this host",
+			"eligibility":      eligibility,
+			"external_tunnels": externalTunnels,
 		}, nil
 	}
 	runner := tailscaleRunner{inner: h.runner(), bin: bin}
@@ -114,26 +117,28 @@ func (h *Handler) VPNStatus(ctx context.Context) (map[string]any, error) {
 	status, err := vpn.FetchStatus(ctx, runner)
 	if err != nil {
 		return map[string]any{
-			"installed":   true,
-			"running":     false,
-			"reason":      "could not read tailscale status: " + err.Error(),
-			"eligibility": eligibility,
+			"installed":        true,
+			"running":          false,
+			"reason":           "could not read tailscale status: " + err.Error(),
+			"eligibility":      eligibility,
+			"external_tunnels": externalTunnels,
 		}, nil
 	}
 
 	out := map[string]any{
-		"eligibility":   eligibility,
-		"installed":     true,
-		"running":       status.Running(),
-		"backend_state": status.BackendState,
-		"version":       status.Version,
-		"node_name":     status.NodeName,
-		"dns_name":      status.DNSName,
-		"tailnet":       status.Tailnet,
-		"mesh_ip":       primaryMeshIP(status.MeshIPs),
-		"mesh_ips":      status.MeshIPs,
-		"online":        status.Online,
-		"offers_exit":   status.OffersExit,
+		"eligibility":      eligibility,
+		"external_tunnels": externalTunnels,
+		"installed":        true,
+		"running":          status.Running(),
+		"backend_state":    status.BackendState,
+		"version":          status.Version,
+		"node_name":        status.NodeName,
+		"dns_name":         status.DNSName,
+		"tailnet":          status.Tailnet,
+		"mesh_ip":          primaryMeshIP(status.MeshIPs),
+		"mesh_ips":         status.MeshIPs,
+		"online":           status.Online,
+		"offers_exit":      status.OffersExit,
 	}
 	if !status.Running() {
 		out["reason"] = "tailscale is installed but the node is not up (BackendState=" + status.BackendState + ")"
