@@ -545,6 +545,81 @@ func TestSelfUpdateInstallsRequestedVersion(t *testing.T) {
 	}
 }
 
+// The POSIX installer invocation, pinned independently of SelfUpdate so a
+// change to one platform's branch cannot quietly alter the other's.
+func TestInstallerCommandPOSIXPipesInstallSh(t *testing.T) {
+	name, args := installerCommandFor("linux", "v0.1.72", "/home/fred/.local/bin")
+	if name != "sh" || len(args) != 2 || args[0] != "-c" {
+		t.Fatalf("want sh -c <script>, got %s %v", name, args)
+	}
+	for _, want := range []string{
+		"install.sh",
+		"AW_REMOTE_HOST_VERSION='v0.1.72'",
+		"AW_REMOTE_HOST_INSTALL_DIR='/home/fred/.local/bin'",
+	} {
+		if !strings.Contains(args[1], want) {
+			t.Errorf("missing %q in: %s", want, args[1])
+		}
+	}
+}
+
+// The actual Windows blocker on this card: SelfUpdate hardcoded
+// `sh -c "curl … install.sh | sh"`, and a Windows host has neither sh nor
+// curl — so even with the workspaceLifecycleVerbs gate removed, the verb
+// would still have failed, just with a less honest message.
+func TestInstallerCommandWindowsRunsInstallPS1(t *testing.T) {
+	name, args := installerCommandFor("windows", "v0.1.72", `C:\Users\fred\AppData\Local\Programs\aw-remote-host`)
+
+	if name != "powershell.exe" {
+		t.Errorf("want powershell.exe, got %q — a Windows host has no sh", name)
+	}
+	script := args[len(args)-1]
+	if strings.Contains(script, "install.sh") || strings.Contains(script, "curl ") {
+		t.Errorf("must not reach for the POSIX installer on Windows: %s", script)
+	}
+	if !strings.Contains(script, "install.ps1") {
+		t.Errorf("must run install.ps1: %s", script)
+	}
+	// Piped to Invoke-Expression, so there is no param() to bind to — the
+	// two values can only arrive as environment variables.
+	for _, want := range []string{
+		`$env:AW_REMOTE_HOST_VERSION = 'v0.1.72'`,
+		`$env:AW_REMOTE_HOST_INSTALL_DIR = 'C:\Users\fred\AppData\Local\Programs\aw-remote-host'`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("missing %q in: %s", want, script)
+		}
+	}
+	// Windows PowerShell 5.1 does not enable TLS 1.2 by default, and the
+	// line inside install.ps1 runs too late to protect the request that
+	// downloads install.ps1 itself.
+	if !strings.Contains(script, "Tls12") {
+		t.Errorf("must set TLS 1.2 before fetching the installer: %s", script)
+	}
+	// Flags, not script text: -NonInteractive makes a command that would
+	// have prompted fail fast instead of hanging until the timeout, and
+	// -NoProfile keeps a user's $PROFILE out of the installer's output.
+	flags := strings.Join(args, " ")
+	for _, want := range []string{"-NoProfile", "-NonInteractive", "-Command"} {
+		if !strings.Contains(flags, want) {
+			t.Errorf("missing %q in argv: %v", want, args)
+		}
+	}
+}
+
+// Both installers read the same two env vars from the same ref — one
+// constant, so a branch rename cannot leave the platforms disagreeing.
+func TestInstallerCommandSharesOneBaseURL(t *testing.T) {
+	_, posix := installerCommandFor("linux", "v1", "/d")
+	_, win := installerCommandFor("windows", "v1", `C:\d`)
+	if !strings.Contains(posix[len(posix)-1], installerBaseURL) {
+		t.Error("POSIX installer does not use installerBaseURL")
+	}
+	if !strings.Contains(win[len(win)-1], installerBaseURL) {
+		t.Error("Windows installer does not use installerBaseURL")
+	}
+}
+
 func TestDispatchRoutesToSelfUpdate(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("AW_REMOTE_HOST_SKIP_SERVICE_RESTART", "1")

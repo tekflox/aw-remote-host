@@ -27,7 +27,7 @@ func TestWorkspaceRuntimeSupportedOnPOSIX(t *testing.T) {
 // consults is shared — so at least pin its membership. exec_*/fs_* must
 // never be in it: those are the whole point of a lean Windows link.
 func TestWorkspaceLifecycleVerbsMembership(t *testing.T) {
-	for _, verb := range []string{"stop", "restart", "uninstall", "reinstall", "bootstrap", "update", "self-update"} {
+	for _, verb := range []string{"stop", "restart", "uninstall", "reinstall", "bootstrap", "update"} {
 		if !workspaceLifecycleVerbs[verb] {
 			t.Errorf("%q should be gated behind a local workspace runtime", verb)
 		}
@@ -38,6 +38,14 @@ func TestWorkspaceLifecycleVerbsMembership(t *testing.T) {
 		// health degrades to {"offline": true} by itself — gating it would
 		// turn an honest "no workspace here" into a tunnel-level error.
 		"health",
+		// "self-update" drives the aw-remote-host BINARY, not the podman
+		// workspace container, so the runtime gate never applied to it. It
+		// used to be in the list above, which is precisely what made a lean
+		// host — every Windows host, and a podman-less Linux one — unable to
+		// update itself from the console: it was refused with "needs the
+		// local workspace runtime", a true statement about the workspace and
+		// an irrelevant one about replacing a binary.
+		"self-update",
 	} {
 		if workspaceLifecycleVerbs[verb] {
 			t.Errorf("%q must stay available on a host with no workspace runtime", verb)

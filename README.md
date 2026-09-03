@@ -449,18 +449,25 @@ there. What a Windows machine gets is the `/link` connection itself:
 | Works | Does not |
 |---|---|
 | `exec_start` / `exec_status` / `exec_wait` / `exec_kill` | `stop` / `restart` / `reinstall` / `bootstrap` / `update` |
-| `list_processes` | `self-update` (its rollback monitor is a `sh -c` script) |
-| every `fs_*` verb (stat/list/mkdir/delete/read/write) | a PTY on the `workspace` target — there is no container here |
+| `list_processes` | a PTY on the `workspace` target — there is no container here |
+| every `fs_*` verb (stat/list/mkdir/delete/read/write) | |
 | the interactive PTY shell, via ConPTY | |
 | `health` (reports `offline: true` — there is no workspace to report on) | |
+| `self-update` — updates the **binary**, not the workspace | |
 
-Because `self-update` is refused, **updating a Windows host is manual**:
+`self-update` **works on a lean host**, Windows included. It used to be
+refused, because it sat in `workspaceLifecycleVerbs` alongside the
+podman-backed verbs and so inherited their "needs the local workspace
+runtime" gate. That was a miscategorisation: it replaces the
+`aw-remote-host` binary and has nothing to do with the workspace container.
+A lean host — every Windows host, and a podman-less Linux one — was told to
+install a Linux container runtime in order to update an executable.
 
-```powershell
-irm https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.ps1 | iex
-schtasks /End /TN aw-remote-host
-aw-remote-host bootstrap-workspace --background
-```
+On Windows the verb drives `install.ps1` through `powershell.exe` (there is
+no `sh` or `curl` on a stock host), then bounces the Scheduled Task. The
+rollback monitor has a PowerShell twin of the POSIX script, with the binary
+restore slotted between a stop and a start because Windows locks a running
+image.
 
 The installer handles the running binary being locked — Windows forbids
 overwriting a running image but permits renaming one, so it moves the old
@@ -469,8 +476,21 @@ violation. The timestamp matters: a fixed `.old` collides with a still-
 running predecessor from a previous update, and the rename then fails
 partway through and leaves the directory with no usable binary at all.
 Displaced copies are swept on later runs; anything still locked is left
-alone. The task still has to be restarted to pick the new
-binary up, hence the last two lines.
+alone.
+
+Updating by hand is still available, and is the fallback if the link itself
+is down:
+
+```powershell
+irm https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.ps1 | iex
+taskkill /F /IM aw-remote-host.exe
+taskkill /F /IM aw-remote-hostw.exe
+schtasks /Run /TN aw-remote-host
+```
+
+`taskkill` and not `schtasks /End`: Task Scheduler ends a task by killing
+its whole process tree, which from inside a session spawned by that task
+would kill the shell issuing the command.
 
 The verbs in the right column are refused **by name** with an explanation,
 rather than failing with a bare "podman: executable file not found" that

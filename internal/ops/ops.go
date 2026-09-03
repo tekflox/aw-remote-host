@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -211,14 +212,30 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 // have podman in the first place. workspaceRuntimeSupported is the
 // build-tagged switch — see proc_unix.go / proc_windows.go.
 var workspaceLifecycleVerbs = map[string]bool{
-	"stop":        true,
-	"restart":     true,
-	"uninstall":   true,
-	"reinstall":   true,
-	"bootstrap":   true,
-	"update":      true,
-	"self-update": true,
+	"stop":      true,
+	"restart":   true,
+	"uninstall": true,
+	"reinstall": true,
+	"bootstrap": true,
+	"update":    true,
 }
+
+// "self-update" is deliberately NOT in that list, and this is the whole
+// reason a lean host could not be updated from the console. It drives the
+// aw-remote-host BINARY — download a release, swap the executable, bounce
+// the service — while every verb above drives the podman workspace
+// CONTAINER. The two only looked alike because "update" and "self-update"
+// share a word.
+//
+// Gating it on workspaceRuntimeSupported made a Windows host permanently
+// unupdatable: it refused with "needs the local workspace runtime (podman +
+// a Linux container image), which does not exist on this host", which is
+// true of the workspace and irrelevant to replacing a binary. A lean LINUX
+// host hit the same refusal for the same wrong reason.
+//
+// The other verbs still need that gate and still have it — this removal
+// narrows it to the verbs it actually describes rather than switching it
+// off.
 
 // "health" is deliberately NOT in that list. It already degrades correctly
 // on its own — a failed `podman inspect` returns {"healthy": false,
@@ -526,12 +543,8 @@ func (h *Handler) SelfUpdate(ctx context.Context, args map[string]any, emit Emit
 		return nil, err
 	}
 	installDir := updater.InstallDirFor(currentPath)
-	installCmd := fmt.Sprintf(
-		"curl -fsSL https://raw.githubusercontent.com/tekflox/aw-remote-host/main/install.sh | AW_REMOTE_HOST_VERSION=%s AW_REMOTE_HOST_INSTALL_DIR=%s sh",
-		updater.ShellQuote(version),
-		updater.ShellQuote(installDir),
-	)
-	if out, err := h.runner().Run(ctx, "sh", "-c", installCmd); err != nil {
+	installName, installArgs := installerCommand(version, installDir)
+	if out, err := h.runner().Run(ctx, installName, installArgs...); err != nil {
 		emit("error", "self-update", "install failed: "+err.Error())
 		_ = updater.ClearPending()
 		return nil, fmt.Errorf("install aw-remote-host %s: %w: %s", version, err, strings.TrimSpace(out))
@@ -554,12 +567,77 @@ func (h *Handler) SelfUpdate(ctx context.Context, args map[string]any, emit Emit
 	}, nil
 }
 
+// installerBaseURL is where both installers are fetched from. Kept as one
+// constant so a branch rename can't leave the two platforms pointing at
+// different refs of the same script.
+const installerBaseURL = "https://raw.githubusercontent.com/tekflox/aw-remote-host/main"
+
+// installerCommand returns the argv that runs this platform's public
+// installer with the version and install dir pinned. Same shape as
+// proc_{unix,windows}.go's shellCommand, but branched at RUNTIME rather
+// than by build tag, because the caller is in a file that both platforms
+// compile.
+//
+// The two installers share a contract — read AW_REMOTE_HOST_VERSION and
+// AW_REMOTE_HOST_INSTALL_DIR from the environment, verify a SHA-256 against
+// the release's checksums.txt, install without admin rights — so only the
+// plumbing to hand them those two values differs.
+func installerCommand(version, installDir string) (string, []string) {
+	return installerCommandFor(runtime.GOOS, version, installDir)
+}
+
+// installerCommandFor takes goos explicitly so the Windows branch is
+// assertable from the Linux CI runner, matching servicemgr.New's shape.
+func installerCommandFor(goos, version, installDir string) (string, []string) {
+	if goos == "windows" {
+		// install.ps1 handles the one problem that makes updating a live
+		// Windows link hard: Windows refuses to overwrite a RUNNING image,
+		// and on a linked host one always is — the Scheduled Task is holding
+		// the /link socket open as this runs. The installer renames the old
+		// exe aside under a TIMESTAMPED name (a fixed ".old" collides with a
+		// still-locked previous one and destroyed a working install once;
+		// commits e84348b/136df7e), which Windows does permit on a running
+		// image, freeing the name for the new binary.
+		//
+		// Env vars rather than parameters because install.ps1 is piped to
+		// Invoke-Expression, and a script consumed that way cannot be passed
+		// arguments — there is no param() to bind them to.
+		//
+		// The TLS line is not redundant with the one inside install.ps1.
+		// That one runs too late to protect the request that DOWNLOADS
+		// install.ps1: Windows PowerShell 5.1 — still what a stock Win10/11
+		// box runs, and what startDetached deliberately targets — does not
+		// enable TLS 1.2 by default, so the outer Invoke-RestMethod fails
+		// first with "could not create SSL/TLS secure channel".
+		script := fmt.Sprintf(
+			"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\n"+
+				"$env:AW_REMOTE_HOST_VERSION = %s\n"+
+				"$env:AW_REMOTE_HOST_INSTALL_DIR = %s\n"+
+				"Invoke-RestMethod -Uri %s -UseBasicParsing | Invoke-Expression",
+			updater.PowerShellQuote(version),
+			updater.PowerShellQuote(installDir),
+			updater.PowerShellQuote(installerBaseURL+"/install.ps1"),
+		)
+		return "powershell.exe", []string{"-NoProfile", "-NonInteractive", "-Command", script}
+	}
+	return "sh", []string{"-c", fmt.Sprintf(
+		"curl -fsSL %s/install.sh | AW_REMOTE_HOST_VERSION=%s AW_REMOTE_HOST_INSTALL_DIR=%s sh",
+		installerBaseURL,
+		updater.ShellQuote(version),
+		updater.ShellQuote(installDir),
+	)}
+}
+
+// restartHostServiceSoon bounces this host's own service a beat from now,
+// via updater.StartServiceRestart — which picks the right shell and the
+// right restart command for the platform. The delay is what lets SelfUpdate
+// return its reply over the tunnel before the process carrying that tunnel
+// goes away.
 func restartHostServiceSoon(slug string) error {
 	if os.Getenv("AW_REMOTE_HOST_SKIP_SERVICE_RESTART") == "1" {
 		return nil
 	}
-	cmd := "sleep 1; " + updater.RestartCommand(slug)
-	return exec.Command("sh", "-c", cmd).Start()
+	return updater.StartServiceRestart(slug)
 }
 
 // Bootstrap brings the runtime up from nothing (idempotent — safe to call
