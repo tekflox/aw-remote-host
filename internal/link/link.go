@@ -69,6 +69,12 @@ type RegisterInfo struct {
 	// symptom otherwise shows up as a guest VM that is mysteriously slow.
 	HostPower          string
 	HostPowerRequested string
+	// Elevated reports whether the aw-remote-host process itself is running
+	// with elevated privileges (root euid on Unix, an elevated token on
+	// Windows) — not whether the host CAN escalate, which is a different
+	// question already answered by internal/vpn's Privileged(). This is what
+	// lets the console show a "running as root" badge.
+	Elevated bool
 }
 
 // RegisteredReply is the server's response to a register frame.
@@ -161,6 +167,9 @@ func (c *Client) registerFrame() map[string]any {
 	// able to say so. An empty string is a real state here, not a missing one.
 	frame["host_power"] = c.Info.HostPower
 	frame["host_power_requested"] = c.Info.HostPowerRequested
+	// Sent unconditionally, including false: a host that stopped running as
+	// root has to be able to say so, same reasoning as host_power above.
+	frame["elevated"] = c.Info.Elevated
 	return frame
 }
 

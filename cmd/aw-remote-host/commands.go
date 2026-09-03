@@ -36,6 +36,21 @@ import (
 // /link registration reply before giving up.
 const registerTimeout = 30 * time.Second
 
+// processIsElevated reports whether this process is running with elevated
+// privileges right now — the honest answer to "what am I running as", as
+// opposed to vpn.Probe's Privileged() which answers "could this host
+// escalate". On Windows that means an elevated token (isElevated, which
+// checks the token's own flag rather than Administrators group membership).
+// Everywhere else it's euid 0 — os.Geteuid(), not os.Getuid(): a setuid-root
+// binary invoked by a non-root user is running elevated right now even
+// though its real uid says otherwise.
+func processIsElevated() bool {
+	if runtime.GOOS == "windows" {
+		return isElevated()
+	}
+	return os.Geteuid() == 0
+}
+
 // workspaceSelfHealMinBackoff/MaxBackoff bound the retry loop
 // bootstrapWorkspaceSelfHeal uses when the workspace module's
 // detect->install->verify cycle fails (typically a readiness timeout —
@@ -377,6 +392,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		CLIVersion:         version,
 		HostPower:          hostPowerEnv,
 		HostPowerRequested: hostpower.Format(st.HostPower),
+		Elevated:           processIsElevated(),
 	}
 
 	type registration struct {
