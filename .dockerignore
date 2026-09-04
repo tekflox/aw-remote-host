@@ -1,0 +1,8 @@
+# The build context is this whole repo now (see Dockerfile's header), so the
+# things that are neither Go source nor packaging are excluded here rather
+# than shipped into the build stage on every commit.
+.git/
+dist/
+*.tar.gz
+__pycache__/
+.pytest_cache/
