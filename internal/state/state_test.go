@@ -35,6 +35,22 @@ func TestProvisionedRoundTrips(t *testing.T) {
 	}
 }
 
+// Zero (never configured) must fall back to 1, the Dockerfile's own baked
+// default — not 0 workers, which would break the container.
+func TestEffectiveWorkersDefaultsToOne(t *testing.T) {
+	st := &State{}
+	if got := st.EffectiveWorkers(); got != 1 {
+		t.Fatalf("EffectiveWorkers() = %d, want 1", got)
+	}
+}
+
+func TestEffectiveWorkersReturnsConfiguredValue(t *testing.T) {
+	st := &State{Workers: 4}
+	if got := st.EffectiveWorkers(); got != 4 {
+		t.Fatalf("EffectiveWorkers() = %d, want 4", got)
+	}
+}
+
 // The daemon holds a State loaded at startup and can run for days. Saving that
 // struct whole erases anything a VERB recorded in the meantime — measured on
 // the production bare metal 2026-09-02, where an external route confirmed at

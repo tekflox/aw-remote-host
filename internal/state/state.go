@@ -40,6 +40,23 @@ type State struct {
 	//
 	// Empty on every host that never opted in, which is the default.
 	HostPower []string `json:"host_power,omitempty"`
+	// Workers is the persisted AW_WORKSPACE_WORKERS value for this host's
+	// workspace container — same "operator's request survives a recreate"
+	// pattern as HostPower above, and for the same reason: the Dockerfile
+	// only bakes a default into the IMAGE, so without this every container
+	// recreation (bootstrap re-run, host reboot, image update) silently
+	// reset a manually-set worker count back to that default.
+	//
+	// Zero means "never configured" — the effective value (EffectiveWorkers)
+	// falls back to 1, the Dockerfile's own default, not 0 workers.
+	//
+	// Raising this above 1 is not yet safe: aw-workspace still has several
+	// call sites (src/api/app.py and others) that assume a single worker's
+	// in-memory state — see aw-workspace-multiworker card
+	// "worker-count-not-persisted-resets-to-1" (W1-W6 track making the code
+	// safe for it). This field only makes whatever value IS configured
+	// survive a container recreation; it does not change today's default.
+	Workers int `json:"workers,omitempty"`
 	// VPN records this host's enrolment in the tenant mesh. Nil on every host
 	// that never ran the vpn module, which is the default.
 	VPN *VPNState `json:"vpn,omitempty"`
@@ -192,6 +209,18 @@ func Update(path string, mutate func(*State)) error {
 	}
 	mutate(s)
 	return Save(path, s)
+}
+
+// EffectiveWorkers returns the persisted AW_WORKSPACE_WORKERS value, or the
+// Dockerfile's own baked default of 1 when nothing has been configured yet
+// (Workers == 0). Kept on State rather than duplicated at each call site
+// (cmd/aw-remote-host and internal/ops both need it) so the default lives
+// in exactly one place.
+func (s *State) EffectiveWorkers() int {
+	if s.Workers > 0 {
+		return s.Workers
+	}
+	return 1
 }
 
 // RecordBootstrapVersion updates the state at path with runningVersion as

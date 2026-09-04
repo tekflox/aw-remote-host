@@ -877,6 +877,7 @@ func runModuleEnv(opts BootstrapOpts, extraEnv []string) []string {
 		"AW_BACKEND_URL="+opts.ControlPlane,
 		"AW_WORKSPACE_HOST_TOKEN="+opts.HostCredential,
 		"AW_HOST_POWER="+effectiveHostPower(opts.StatePath),
+		"AW_WORKSPACE_WORKERS="+effectiveWorkers(opts.StatePath),
 	)
 	return append(env, extraEnv...)
 }
@@ -901,6 +902,23 @@ func effectiveHostPower(statePath string) string {
 		return ""
 	}
 	return hostpower.Format(hostpower.Resolve(st.HostPower).Effective)
+}
+
+// effectiveWorkers reads this host's persisted worker-process count for the
+// workspace container, mirroring effectiveHostPower above. Falls back to
+// "1" (the Dockerfile's own baked default) when nothing is configured yet,
+// including when statePath is empty (tests, or any caller that never wired
+// one up) — never "" or "0", which would reach install.sh's
+// AW_WORKSPACE_WORKERS and break the int() parse in src/start/workspace.py.
+func effectiveWorkers(statePath string) string {
+	if statePath == "" {
+		return "1"
+	}
+	st, err := state.Load(statePath)
+	if err != nil {
+		return "1"
+	}
+	return strconv.Itoa(st.EffectiveWorkers())
 }
 
 // Health gathers {healthy, uptime_s, disk, cpu_pct, mem, offline} — the

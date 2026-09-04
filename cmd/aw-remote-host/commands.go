@@ -113,6 +113,26 @@ func parseHostPowerFlag(fs *flag.FlagSet, raw string) ([]string, bool, error) {
 	return grants, true, nil
 }
 
+// parseWorkersFlag reads --workers, mirroring parseHostPowerFlag: the bool
+// says whether the flag was GIVEN, so a plain re-run never silently resets
+// an already-configured worker count back to the default.
+func parseWorkersFlag(fs *flag.FlagSet, raw string) (int, bool, error) {
+	given := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "workers" {
+			given = true
+		}
+	})
+	if !given {
+		return 0, false, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 1 {
+		return 0, false, fmt.Errorf("--workers must be a positive integer, got %q", raw)
+	}
+	return n, true, nil
+}
+
 // resolveHostPower probes the requested grants and returns the wire value for
 // AW_HOST_POWER — the EFFECTIVE set, never the requested one.
 //
@@ -191,6 +211,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	}
 	hostPower := fs.String("host-power", "", "comma-separated elevated host access to grant app containers on this machine (default: none). Grants:\n"+hostpower.Help()+
 		"Only what this host can actually deliver is granted — each grant is probed, and anything undeliverable is reported, not silently assumed. An app must ALSO declare it in runtime.host_power and hold the matching host:* permission. Re-run with a different value to change it; pass --host-power=none to revoke.")
+	workers := fs.String("workers", "", "worker-process count for this host's workspace container (default: 1, matching the image). Persists across a container recreation, the same way --host-power does. Re-run with a different value to change it. NOTE: this workspace's code does not yet support running with more than 1 worker safely — leave this unset until told otherwise.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -198,6 +219,10 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	// Parse before anything else touches the disk: a typo'd grant name must
 	// abort here, not halfway through provisioning.
 	hostPowerRequested, hostPowerChanged, err := parseHostPowerFlag(fs, *hostPower)
+	if err != nil {
+		return err
+	}
+	workersRequested, workersChanged, err := parseWorkersFlag(fs, *workers)
 	if err != nil {
 		return err
 	}
@@ -348,6 +373,16 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	if err != nil {
 		return err
 	}
+	// Same "only rewrite when the flag was actually given" rule as HostPower
+	// above, for the same reason: a plain re-run must never silently reset
+	// an already-configured worker count back to the default.
+	if workersChanged {
+		st.Workers = workersRequested
+		if err := state.Save(statePath, st); err != nil {
+			return err
+		}
+	}
+	workersEnv := strconv.Itoa(st.EffectiveWorkers())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -533,6 +568,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 				"AW_BACKEND_URL="+*controlPlane,
 				"AW_WORKSPACE_HOST_TOKEN="+reg.hostCredential,
 				"AW_HOST_POWER="+hostPowerEnv,
+				"AW_WORKSPACE_WORKERS="+workersEnv,
 			),
 		}
 		// Run the workspace module's bootstrap in the background with its

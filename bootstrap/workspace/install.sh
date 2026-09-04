@@ -72,6 +72,16 @@ RUNNER_WARM_CONTAINER="${RUNNER_WARM_CONTAINER:-}"
 # the app that needs it unchanged.
 AW_HOST_POWER="${AW_HOST_POWER:-}"
 
+# Worker-process count for this container — persisted HOST state (see
+# internal/state.State.Workers / EffectiveWorkers), NOT baked into the image
+# beyond its own ENV default of 1. Set by the Go layer the same way
+# AW_HOST_POWER is; defaults to 1 here too so a direct invocation of this
+# script (local dev, or any caller that never wired the env var up) still
+# gets a valid value instead of `-e AW_WORKSPACE_WORKERS=` with an empty
+# string, which would break `int(os.environ["AW_WORKSPACE_WORKERS"])` in
+# src/start/workspace.py.
+AW_WORKSPACE_WORKERS="${AW_WORKSPACE_WORKERS:-1}"
+
 if [ -z "${AW_WORKSPACE_HOST_DIR:-}" ] && [ ! -e "$DEFAULT_HOST_DIR" ] && [ -e "$LEGACY_HOST_DIR" ]; then
   if podman container exists "$CONTAINER_NAME"; then
     echo "workspace: removing existing container before host-dir migration"
@@ -264,6 +274,13 @@ if podman container exists "$CONTAINER_NAME"; then
       | sed -n 's/^AW_HOST_POWER=//p' | head -n1)" != "$AW_HOST_POWER" ]; then
     echo "workspace: AW_HOST_POWER changed (now '${AW_HOST_POWER:-none}') — recreating to pick it up"
     podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  # Same rationale as the AW_HOST_POWER check above: env is fixed at
+  # container creation, so a persisted worker-count change only reaches the
+  # workspace through a recreate.
+  elif [ "$(podman inspect "$CONTAINER_NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+      | sed -n 's/^AW_WORKSPACE_WORKERS=//p' | head -n1)" != "$AW_WORKSPACE_WORKERS" ]; then
+    echo "workspace: AW_WORKSPACE_WORKERS changed (now '${AW_WORKSPACE_WORKERS}') — recreating to pick it up"
+    podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 fi
 
@@ -300,6 +317,7 @@ else
     -e AW_WORKSPACE_HOME_HOST_DIR="$HOME_HOST_DIR" \
     ${RUNNER_WARM_CONTAINER:+-e RUNNER_WARM_CONTAINER="$RUNNER_WARM_CONTAINER"} \
     -e AW_HOST_POWER="$AW_HOST_POWER" \
+    -e AW_WORKSPACE_WORKERS="$AW_WORKSPACE_WORKERS" \
     "$IMAGE"
 fi
 
