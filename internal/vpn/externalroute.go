@@ -307,7 +307,7 @@ func PlanExternalRoute(ctx context.Context, spec ExternalRouteSpec) (*ExternalRo
 	}
 	plan.MainGateway, plan.MainDev = gw, mdev
 
-	plan.Exclusions = planExternalExclusions(ctx, runner, rt, id, spec.ControlPlane)
+	plan.Exclusions = planExternalExclusions(ctx, spec.ControlPlane)
 	return plan, nil
 }
 
@@ -800,33 +800,52 @@ func mainDefault(ctx context.Context, r Runner) (gw, dev string, err error) {
 	return "", "", fmt.Errorf("this host has no default route with both a gateway and a device, so there is nowhere to send the exclusions")
 }
 
-// planExternalExclusions is the answer to the one defect this path actually
-// has, and it was measured rather than predicted: with the rule in place ICMP
-// passes, TCP passes, and UDP/53 does not — `nslookup` answers ";; connection
-// timed out; no servers could be reached" because the query enters the tunnel
-// and dies on the far side. Untreated, "the workspace leaves via the hub"
-// becomes "the workspace has no DNS", which is indistinguishable from a total
-// outage to whoever is using it.
+// planExternalExclusions holds the CONTROL PLANE outside the tunnel, and
+// nothing else.
 //
-// The fix is the same shape usexit.go already uses to hold the control plane
-// outside the tunnel: /32 routes inside the tunnel's own table, pointing back
-// at the main gateway, which beat that table's default.
+// DNS GOES THROUGH THE VPN — decided by Frederico, 2026-09-05, and this
+// function used to do the opposite. It pinned every nameserver it could find
+// outside the tunnel, which meant a user who turned the VPN on still resolved
+// through their ISP: the single most recognisable way a VPN leaks, and it was
+// on by default. Those exclusions are gone.
 //
-// The list is MEASURED, never invented, and from two places because a
-// container on a user-defined network does not see the real resolvers at all:
+// The reasoning that ORIGINALLY put them here was real but narrower than it
+// looked. With the rule in place ICMP passed, TCP passed and UDP/53 did not,
+// so "the workspace leaves via the hub" became "the workspace has no DNS".
+// What was actually missing was the local fabric, not the resolvers: the
+// tunnel's table had a default and no route to the networks the container
+// talks to. That is now fixed properly and at the right layer — externalup.go
+// builds the table with every CONNECTED route before the default (its
+// invariant 1) — so the container reaches its own resolver the same way it
+// reaches Postgres and Redis, over the bridge route, with no /32 exclusion
+// involved. Measured on this deployment: the resolver a container asks is
+// 10.89.0.1 (aardvark, in this netns), which is inside 10.89.0.0/24 dev
+// podman1 — a connected route, already in the table. Dropping the nameserver
+// exclusions therefore does not break internal name resolution.
 //
-//   - the container's own /etc/resolv.conf. On the default bridge this is the
-//     real uplink list (measured: 185.12.64.1, 185.12.64.2).
-//   - this host's uplink resolvers. On a user-defined network the container
-//     sees only Docker's embedded resolver at 127.0.0.11, which is loopback
-//     inside its netns — but dockerd forwards those queries from that same
-//     netns, so the packets still carry the container's source address and
-//     still need the exclusion. Measured on aw-remote-host (172.18.0.4),
-//     whose resolv.conf shows 127.0.0.11 and nothing else.
+// THE CONTROL PLANE EXCLUSION STAYS, and it is not a nicety — it is the kill
+// switch. The core has to reach aw-backend to issue `external-down`, so
+// without this pin a half-broken tunnel would block its own Disconnect: the
+// recovery surface would go down with the thing being recovered, which is the
+// exact failure this whole module is built around. Frederico's instruction
+// carved it out explicitly ("e o que mais for imprescindível pro controle").
+// It rides the same reasoning, and the same mechanism, as usexit.go's: a /32
+// inside the tunnel's own table pointing back at the main gateway, which beats
+// that table's default.
+//
+// KNOWN AND DELIBERATE GAP: this makes the routed container's DNS leave
+// through the tunnel only for the resolvers it addresses DIRECTLY. On this
+// deployment glibc sends essentially everything to 10.89.0.1 first, and from
+// aardvark onward the query no longer carries the container's source address,
+// so no source-anchored rule can reach it — those queries still leave via the
+// host. Closing that needs aardvark's own upstream to move, which podman 4.3.1
+// cannot express and a POSIX-sh dead-man cannot revert; see the card. Until
+// then ExternalStatusReport.DNSTunneled reports this honestly rather than
+// letting a screen imply otherwise.
 //
 // Loopback and link-local are dropped: a /32 exclusion for 127.0.0.11 would be
 // meaningless and a route for it on the main gateway would be wrong.
-func planExternalExclusions(ctx context.Context, r Runner, rt ContainerRuntime, containerID, controlPlane string) []string {
+func planExternalExclusions(ctx context.Context, controlPlane string) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(ip string) {
@@ -842,36 +861,8 @@ func planExternalExclusions(ctx context.Context, r Runner, rt ContainerRuntime, 
 		out = append(out, prefix)
 	}
 
-	if cat, err := r.Run(ctx, rt.Name, "exec", containerID, "cat", "/etc/resolv.conf"); err == nil {
-		for _, ip := range parseNameservers(cat) {
-			add(ip)
-		}
-	}
-	if cat, err := r.Run(ctx, "cat", "/run/systemd/resolve/resolv.conf"); err == nil {
-		for _, ip := range parseNameservers(cat) {
-			add(ip)
-		}
-	}
-	if cat, err := r.Run(ctx, "cat", "/etc/resolv.conf"); err == nil {
-		for _, ip := range parseNameservers(cat) {
-			add(ip)
-		}
-	}
-	// The control plane rides the same reasoning as usexit.go's: the
-	// management path that must survive is the one this link is on.
 	for _, ip := range resolveControlPlaneIPs(ctx, controlPlane) {
 		add(ip)
-	}
-	return out
-}
-
-func parseNameservers(resolvConf string) []string {
-	var out []string
-	for _, line := range strings.Split(resolvConf, "\n") {
-		f := strings.Fields(line)
-		if len(f) >= 2 && f[0] == "nameserver" {
-			out = append(out, f[1])
-		}
 	}
 	return out
 }

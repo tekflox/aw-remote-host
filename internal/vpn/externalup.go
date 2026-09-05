@@ -89,6 +89,23 @@ import (
 // it and what table 200's default has always pointed at here.
 const DefaultExternalIface = "wg0"
 
+// KeepaliveZeroRefusal is the sentence a profile with no persistent keepalive
+// gets, and it is a constant because it is printed VERBATIM on a screen — the
+// user has to be able to act on it without anyone translating it first.
+//
+// It is a real limitation of this tool and not a footnote: such a profile
+// cannot be dialled here at all. See PlanExternalUp for the mechanism.
+const KeepaliveZeroRefusal = "this VPN profile sets persistent_keepalive to 0, and this tool cannot dial it. WireGuard only begins a handshake when it has traffic to send or when a keepalive fires, and nothing sends traffic through a tunnel that has only just been brought up — so the handshake this dial waits for to prove the tunnel works would never happen, and the tunnel would be torn back down as unconfirmed. Set PersistentKeepalive in the profile (25 is what providers ship, NordLynx included) and try again."
+
+// hostPublicIP measures THIS machine's own egress address, indirected for the
+// same reason ops indirects ExternalUp itself: it is a live HTTPS round trip,
+// and a unit test that reached the internet to check a sentence would be slow,
+// flaky, and dependent on the network of whoever runs `go test`.
+//
+// It is a var rather than a parameter because every caller wants the real one
+// — only a test ever wants anything else.
+var hostPublicIP = PublicIP
+
 // lookupExternalBinary resolves the tools this file shells out to, as absolute
 // paths, at plan time.
 //
@@ -605,6 +622,22 @@ func PlanExternalUp(ctx context.Context, spec ExternalUpSpec) (*ExternalUpPlan, 
 		return plan, nil
 	}
 
+	// A PRODUCT LIMITATION, refused up front and in plain words, because this
+	// sentence goes on a screen verbatim.
+	//
+	// WireGuard starts a handshake only when it has traffic to send or when a
+	// persistent keepalive fires. Nothing sends traffic through a tunnel that
+	// has just been brought up — the table is built but no rule points at it
+	// yet, that is `vpn external-route`'s separate job — so with keepalive at
+	// 0 the handshake this dial waits for never happens and the tunnel is torn
+	// back down as unconfirmed. Refusing HERE rather than discovering it after
+	// the confirmation window costs the user 45 seconds less and, more
+	// importantly, changes nothing on the machine before saying so.
+	if spec.Profile.Peer.PersistentKeepalive == 0 {
+		plan.Refusal = KeepaliveZeroRefusal
+		return plan, nil
+	}
+
 	// The binaries first, because without them nothing below can happen and
 	// the honest failure is "this host cannot do this at all". Absolute paths,
 	// resolved here, for the dead-man's script.
@@ -928,7 +961,7 @@ func ExternalUp(ctx context.Context, spec ExternalUpSpec, progress Progress) (Ex
 	// The host's baseline is not optional: it is what the confirmation asserts
 	// held, and without it there is no way to prove afterwards that this
 	// machine was left alone.
-	host, err := PublicIP(ctx)
+	host, err := hostPublicIP(ctx)
 	if err != nil {
 		return res, fmt.Errorf("could not measure this host's own public IP before the change, so there would be no way to prove afterwards that the machine's egress did not move — refusing to touch anything: %w", err)
 	}
@@ -1180,7 +1213,7 @@ func confirmExternalUpOnce(ctx context.Context, r Runner, plan ExternalUpPlan, h
 
 	// The host's address is checked FIRST and a move short-circuits the rest:
 	// a tunnel that looks right is meaningless if the machine came with it.
-	host, err := PublicIP(ctx)
+	host, err := hostPublicIP(ctx)
 	if err != nil {
 		c.reason = fmt.Sprintf("this host's own public IP could not be re-measured (%v), so it cannot be proven the machine stayed put", err)
 		return c
@@ -1209,7 +1242,11 @@ func confirmExternalUpOnce(ctx context.Context, r Runner, plan ExternalUpPlan, h
 
 	c.handshakeAt = latestHandshake(ctx, r, plan)
 	if c.handshakeAt == 0 {
-		c.reason = fmt.Sprintf("the peer on %s has never completed a handshake, so the interface exists but the tunnel does not carry traffic", plan.Iface)
+		// PlanExternalUp already refuses a profile with no keepalive, so
+		// reaching here means one WAS configured and the peer still did not
+		// answer — which is a peer or a network problem, not the product
+		// limitation. Saying so keeps the two apart on screen.
+		c.reason = fmt.Sprintf("the peer on %s has never completed a handshake, so the interface exists but the tunnel does not carry traffic. The profile does set a keepalive, so the peer should have answered by now — check the endpoint and the keys", plan.Iface)
 		return c
 	}
 	c.ok = true

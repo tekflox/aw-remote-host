@@ -255,3 +255,106 @@ func TestExternalUpAndDownAreRegisteredVerbs(t *testing.T) {
 		t.Fatalf("vpn_external_down is not routed: %v", err)
 	}
 }
+
+// withExternalStatus swaps the live query for a fixed answer, so this verb's
+// reply shape is tested without measuring the machine running `go test`.
+func withExternalStatus(t *testing.T, report vpn.ExternalStatusReport, err error) *vpn.ExternalStatusSpec {
+	t.Helper()
+	var got vpn.ExternalStatusSpec
+	original := externalStatus
+	externalStatus = func(_ context.Context, spec vpn.ExternalStatusSpec) (vpn.ExternalStatusReport, error) {
+		got = spec
+		return report, err
+	}
+	t.Cleanup(func() { externalStatus = original })
+	return &got
+}
+
+func strPtr(s string) *string { return &s }
+
+// The workspace core is ALREADY BUILT against this exact shape and currently
+// degrades to state "unknown" because the verb did not exist. A key spelled
+// differently here would leave it degrading forever against a verb that now
+// answers — a worse failure than the one being fixed, because it looks fixed.
+func TestExternalStatusReplyMatchesTheContractedShape(t *testing.T) {
+	withExternalStatus(t, vpn.ExternalStatusReport{
+		Iface: "wg0", Up: true, Table: 200, RuleInstalled: true,
+		Container:         strPtr("aw-remote-host-workspace"),
+		ContainerEgressIP: strPtr("203.0.113.9"),
+		HostEgressIP:      strPtr("65.109.66.88"),
+		DeadmanArmed:      false,
+		Since:             strPtr("2026-09-05T17:30:00Z"),
+	}, nil)
+
+	out, err := upHandler().VPNExternalStatus(context.Background(), map[string]any{})
+	if err != nil {
+		t.Fatalf("VPNExternalStatus: %v", err)
+	}
+	for key, want := range map[string]any{
+		"iface": "wg0", "up": true, "table": 200, "rule_installed": true,
+		"container":           "aw-remote-host-workspace",
+		"container_egress_ip": "203.0.113.9", "host_egress_ip": "65.109.66.88",
+		"deadman_armed": false, "since": "2026-09-05T17:30:00Z",
+	} {
+		if out[key] != want {
+			t.Fatalf("%s = %#v, want %#v", key, out[key], want)
+		}
+	}
+	// Present-and-null, not absent: the contract spells these `"<v>"|null`.
+	v, ok := out["deadman_expires_at"]
+	if !ok || v != nil {
+		t.Fatalf("deadman_expires_at = %#v (present=%v), want present and null", v, ok)
+	}
+}
+
+// An unset pointer has to reach the wire as JSON null, never as "". A caller
+// that has to treat "" as a second kind of "nothing" is a caller that will get
+// it wrong once.
+func TestExternalStatusNullsMarshalAsNull(t *testing.T) {
+	withExternalStatus(t, vpn.ExternalStatusReport{Iface: "wg0", Table: 200}, nil)
+	out, err := upHandler().VPNExternalStatus(context.Background(), map[string]any{})
+	if err != nil {
+		t.Fatalf("VPNExternalStatus: %v", err)
+	}
+	blob, _ := json.Marshal(out)
+	for _, want := range []string{`"container":null`, `"since":null`, `"host_egress_ip":null`} {
+		if !strings.Contains(string(blob), want) {
+			t.Fatalf("missing %s in %s", want, blob)
+		}
+	}
+}
+
+// The optional arguments have to reach internal/vpn, or --skip-egress on a
+// polled screen would silently still pay for two network round trips.
+func TestExternalStatusForwardsItsArguments(t *testing.T) {
+	spec := withExternalStatus(t, vpn.ExternalStatusReport{}, nil)
+	if _, err := upHandler().VPNExternalStatus(context.Background(), map[string]any{
+		"iface": "wg7", "table": float64(202), "skip_egress": true,
+	}); err != nil {
+		t.Fatalf("VPNExternalStatus: %v", err)
+	}
+	if spec.Iface != "wg7" || spec.Table != 202 || !spec.SkipEgress {
+		t.Fatalf("arguments were dropped: %+v", spec)
+	}
+}
+
+// "Nothing is up" is a true ANSWER, not a refusal and not an error. A status
+// verb that errored on an unconfigured host would make every such host look
+// broken on the screen.
+func TestExternalStatusOnAnIdleHostIsNotAnError(t *testing.T) {
+	withExternalStatus(t, vpn.ExternalStatusReport{Iface: "wg0", Table: 200}, nil)
+	out, err := upHandler().VPNExternalStatus(context.Background(), map[string]any{})
+	if err != nil {
+		t.Fatalf("an idle host must not error: %v", err)
+	}
+	if out["up"] != false || out["refused"] != nil {
+		t.Fatalf("idle host reply = %v", out)
+	}
+}
+
+func TestExternalStatusIsARegisteredVerb(t *testing.T) {
+	withExternalStatus(t, vpn.ExternalStatusReport{Iface: "wg0", Table: 200}, nil)
+	if _, err := upHandler().Dispatch(context.Background(), "vpn_external_status", map[string]any{}, nil); err != nil {
+		t.Fatalf("vpn_external_status is not routed: %v", err)
+	}
+}

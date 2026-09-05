@@ -40,6 +40,8 @@ func runVPN(args []string) error {
 			return runVPNExternalUp(args[1:])
 		case "external-down":
 			return runVPNExternalDown(args[1:])
+		case "external-status":
+			return runVPNExternalStatus(args[1:])
 		case "external-route":
 			return runVPNExternalRoute(args[1:])
 		case "external-unroute":

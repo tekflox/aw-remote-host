@@ -61,10 +61,20 @@ func healthyHost() *tableRunner {
 
 func planOn(t *testing.T, r Runner) *ExternalRoutePlan {
 	t.Helper()
+	return planOnWithControlPlane(t, r, "")
+}
+
+// planOnWithControlPlane pins the control plane to an IP LITERAL. Go's
+// resolver short-circuits a literal, so this exercises the one exclusion that
+// still exists without the test depending on DNS — which would be a poor
+// dependency for a test about DNS.
+func planOnWithControlPlane(t *testing.T, r Runner, controlPlane string) *ExternalRoutePlan {
+	t.Helper()
 	plan, err := PlanExternalRoute(context.Background(), ExternalRouteSpec{
-		Container: "aw-remote-host",
-		Runner:    r,
-		Runtime:   ContainerRuntime{Name: "docker"},
+		Container:    "aw-remote-host",
+		Runner:       r,
+		Runtime:      ContainerRuntime{Name: "docker"},
+		ControlPlane: controlPlane,
 	})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
@@ -155,25 +165,50 @@ func TestRefusesAContainerOnSeveralNetworks(t *testing.T) {
 	}
 }
 
-// The DNS defect is the only real one this path has: with the rule in place
-// ICMP and TCP pass and UDP/53 does not, so an untreated apply turns "the
-// workspace leaves via the hub" into "the workspace has no DNS".
+// DNS GOES THROUGH THE VPN — Frederico's decision, 2026-09-05. This test used
+// to assert the exact opposite, and that is the point of keeping it here
+// rather than deleting it: pinning the resolvers outside the tunnel meant a
+// user who switched the VPN on still resolved through their ISP, which is the
+// single most recognisable way a VPN leaks, and it was the default.
 //
-// The list has to be MEASURED from both places, because a container on a
-// user-defined network sees only Docker's embedded resolver at 127.0.0.11 —
-// loopback inside its own netns, useless as an exclusion — while the queries
-// dockerd forwards on its behalf still carry the container's source address
-// and still need the real uplink resolvers held outside the tunnel.
-func TestExclusionsComeFromTheHostWhenTheContainerOnlySeesEmbeddedDNS(t *testing.T) {
-	plan := planOn(t, healthyHost())
+// The fixture still ANSWERS the resolv.conf reads. That is deliberate: if the
+// nameservers came back as exclusions this test would fail, so the assertion
+// cannot pass merely because the fixture went quiet.
+func TestNameserversAreNoLongerHeldOutsideTheTunnel(t *testing.T) {
+	r := healthyHost()
+	plan := planOn(t, r)
 	got := strings.Join(plan.Exclusions, " ")
-	if !strings.Contains(got, "185.12.64.1/32") || !strings.Contains(got, "185.12.64.2/32") {
-		t.Fatalf("the host's real resolvers were not excluded: %v", plan.Exclusions)
+	for _, resolver := range []string{"185.12.64.1", "185.12.64.2", "127.0.0.11"} {
+		if strings.Contains(got, resolver) {
+			t.Fatalf("%s is still pinned outside the tunnel, so DNS would leak to the ISP: %v", resolver, plan.Exclusions)
+		}
 	}
-	// 127.0.0.11 is loopback in the container's namespace. A /32 route for it
-	// on the main gateway would be meaningless at best.
-	if strings.Contains(got, "127.0.0.11") {
-		t.Fatalf("loopback leaked into the exclusions: %v", plan.Exclusions)
+	// Not merely absent from the output — never asked for. A read whose answer
+	// is discarded is a resolver list one refactor away from coming back.
+	for _, probe := range []string{
+		"docker exec e91aacf5a3a39a17 cat /etc/resolv.conf",
+		"cat /run/systemd/resolve/resolv.conf",
+		"cat /etc/resolv.conf",
+	} {
+		if r.ran(probe) {
+			t.Fatalf("the planner still reads the resolver list (%q); it has no reason to", probe)
+		}
+	}
+}
+
+// THE ONE EXCLUSION THAT STAYS, and it is the kill switch rather than a
+// nicety: core has to reach aw-backend to issue `external-down`, so without
+// this pin a half-broken tunnel blocks its own Disconnect — the recovery
+// surface goes down with the thing being recovered.
+func TestControlPlaneStaysOutsideTheTunnelBecauseItIsTheKillSwitch(t *testing.T) {
+	plan := planOnWithControlPlane(t, healthyHost(), "https://198.51.100.7:8443")
+	if len(plan.Exclusions) != 1 || plan.Exclusions[0] != "198.51.100.7/32" {
+		t.Fatalf("the control plane is not held outside the tunnel: %v", plan.Exclusions)
+	}
+	// And with no control plane there is nothing left to pin at all — the
+	// resolvers used to fill this list, and no longer do.
+	if bare := planOn(t, healthyHost()); len(bare.Exclusions) != 0 {
+		t.Fatalf("something other than the control plane is still being excluded: %v", bare.Exclusions)
 	}
 }
 
@@ -201,10 +236,17 @@ func TestExclusionRoutesAreOnlinkAndInsideTheTunnelTable(t *testing.T) {
 // binary — a self-referential revert dies with any update of the tool that
 // armed it.
 func TestDeadmanScriptUndoesExactlyWhatWasInstalled(t *testing.T) {
-	plan := planOn(t, healthyHost())
+	// A control plane is supplied so the exclusion loop below actually has
+	// something to check. Without one the plan now has NO exclusions at all
+	// (DNS goes through the VPN), and a loop over an empty slice asserts
+	// nothing while still reporting a pass.
+	plan := planOnWithControlPlane(t, healthyHost(), "https://198.51.100.7:8443")
 	script := externalRevertScript(PrivilegedRunner{Sudo: true}, *plan)
 	if !strings.Contains(script, "ip rule del from 172.18.0.4/32 lookup 200 priority 5399") {
 		t.Fatalf("script does not remove the rule:\n%s", script)
+	}
+	if len(plan.Exclusions) == 0 {
+		t.Fatal("the fixture produced no exclusions, so this test would assert nothing")
 	}
 	for _, ex := range plan.Exclusions {
 		if !strings.Contains(script, ex) {
@@ -454,10 +496,13 @@ func TestReassertClearsTheRecordWhenTheContainerIsGone(t *testing.T) {
 // fails the container is already off the tunnel rather than on it with half
 // its pins gone. Same ordering usexit.go's revert makes, for the same reason.
 func TestRevertRemovesTheRuleBeforeTheExclusions(t *testing.T) {
-	plan := planOn(t, healthyHost())
+	// The control plane is what produces an exclusion now that the resolvers
+	// no longer do; without it there is no second thing to be ordered against
+	// and this test would pass vacuously.
+	plan := planOnWithControlPlane(t, healthyHost(), "https://198.51.100.7:8443")
 	r := &tableRunner{answers: map[string]string{
 		"ip rule show":            "5399:\tfrom 172.18.0.4 lookup 200\n",
-		"ip route show table 200": "default via 10.8.0.2 dev wg0 \n185.12.64.1/32 via 65.109.66.65 dev enp41s0 onlink \n",
+		"ip route show table 200": "default via 10.8.0.2 dev wg0 \n198.51.100.7/32 via 65.109.66.65 dev enp41s0 onlink \n",
 	}}
 	_ = revertExternalRoute(context.Background(), r, *plan, nil)
 	var ruleAt, routeAt = -1, -1

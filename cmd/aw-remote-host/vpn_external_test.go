@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tekflox/aw-remote-host/internal/vpn"
 )
 
 // An OpenVPN profile is refused by PlanExternalUp before it looks up a single
@@ -133,5 +136,45 @@ func TestUsageDocumentsEveryExternalSubcommand(t *testing.T) {
 		if !strings.Contains(vpnExternalUsage, want) {
 			t.Fatalf("usage does not mention %q", want)
 		}
+	}
+}
+
+// `vpn external-status --json` is the exact command the workspace core calls.
+// It must be routed, take --json, and — unlike external-up — exit 0 even when
+// the answer is "nothing is up", because that is a true answer to this
+// question rather than a failure to answer it.
+func TestExternalStatusIsRoutedAndSucceedsOnAnIdleHost(t *testing.T) {
+	if err := runVPN([]string{"external-status", "--json", "--skip-egress"}); err != nil {
+		t.Fatalf("`vpn external-status --json` failed on a host with no tunnel: %v", err)
+	}
+	if err := runVPNExternalStatus([]string{"--skip-egress"}); err != nil {
+		t.Fatalf("the human rendering failed: %v", err)
+	}
+}
+
+// The CLI's JSON and the link verb's payload are two hand-built maps of the
+// same struct. The workspace parses whichever surface it reached, so they must
+// not disagree about what a field is called — asserted here rather than hoped
+// for.
+func TestStatusJSONCarriesEveryContractedKey(t *testing.T) {
+	blob, err := json.Marshal(externalStatusJSON(vpn.ExternalStatusReport{Iface: "wg0", Table: 200}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(blob, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{
+		"iface", "up", "table", "rule_installed", "container",
+		"container_egress_ip", "host_egress_ip", "deadman_armed",
+		"deadman_expires_at", "since",
+	} {
+		if _, ok := decoded[key]; !ok {
+			t.Fatalf("the CLI's --json is missing the contracted key %q: %s", key, blob)
+		}
+	}
+	if decoded["container"] != nil || decoded["since"] != nil {
+		t.Fatalf("unset fields must be null, not empty strings: %s", blob)
 	}
 }

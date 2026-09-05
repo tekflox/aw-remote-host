@@ -176,3 +176,80 @@ func externalProfileArg(args map[string]any) (vpn.ExternalProfile, string, error
 	p, err := vpn.ParseExternalProfile(encoded)
 	return p, "", err
 }
+
+// externalStatus is internal/vpn's live query, indirected so a test can
+// exercise this verb's reply shape without measuring the machine that runs
+// `go test` — same reason externalUp and externalRoute are indirected.
+var externalStatus = vpn.ExternalStatus
+
+// VPNExternalStatus answers what is ACTUALLY in force right now.
+//
+// args:
+//
+//	iface       (string, optional) fallback interface when nothing is
+//	            recorded. Default wg0.
+//	table       (number, optional) fallback table when nothing is recorded.
+//	            Default 200.
+//	skip_egress (bool, optional) omit the two measurements that cost a
+//	            network round trip (this host's public IP, and the probe
+//	            container in the routed container's namespace). Both fields
+//	            then report null, which the reply shape already allows.
+//
+// WHY IT IS A VERB OF ITS OWN rather than a block on vpn_status, and the repo
+// already wrote this rule: internal/ops/ops_vpn.go:51-56 puts a cheap LOCAL
+// fact on vpn_status (the eligibility precedent), and ops_vpn_exit.go:362-369
+// gives anything that makes a network round trip its own verb, because
+// vpn_status is asked of EVERY host in the account in parallel on every
+// render. This measures a public IP and starts a probe container, so: its own
+// verb.
+//
+// It reports rather than refuses. "Nothing is set up" is a real and common
+// answer — up:false with nulls — not a refusal, and an error here means the
+// query itself could not be performed.
+func (h *Handler) VPNExternalStatus(ctx context.Context, args map[string]any) (map[string]any, error) {
+	report, err := externalStatus(ctx, vpn.ExternalStatusSpec{
+		Runner:     h.externalRunner(),
+		Iface:      strings.TrimSpace(stringArg(args, "iface")),
+		Table:      intArg(args, "table"),
+		SkipEgress: boolArg(args, "skip_egress", false),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return externalStatusPayload(report), nil
+}
+
+// externalStatusPayload is the reply, and its keys are FIXED by the contract
+// the workspace core was already built against — core currently degrades to
+// state "unknown" because this verb did not exist, so a key spelled
+// differently here would leave it degrading forever against a verb that
+// answers.
+//
+// Built field by field rather than by marshalling the struct so that the
+// contract is readable in one place, and so a field added to the struct
+// cannot silently change what the link plane sends.
+func externalStatusPayload(r vpn.ExternalStatusReport) map[string]any {
+	return map[string]any{
+		"iface":               r.Iface,
+		"up":                  r.Up,
+		"table":               r.Table,
+		"rule_installed":      r.RuleInstalled,
+		"container":           nilString(r.Container),
+		"container_egress_ip": nilString(r.ContainerEgressIP),
+		"host_egress_ip":      nilString(r.HostEgressIP),
+		"deadman_armed":       r.DeadmanArmed,
+		"deadman_expires_at":  nilString(r.DeadmanExpiresAt),
+		"since":               nilString(r.Since),
+		"dns_tunneled":        r.DNSTunneled,
+	}
+}
+
+// nilString keeps a nil pointer marshalling as JSON null rather than "". The
+// contract spells these fields `"<value>"|null`, and an empty string is a
+// second kind of "nothing" every caller would have to special-case.
+func nilString(s *string) any {
+	if s == nil {
+		return nil
+	}
+	return *s
+}

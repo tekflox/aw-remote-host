@@ -772,3 +772,80 @@ func TestDefaultInTableMustPointAtThisTunnel(t *testing.T) {
 		t.Fatalf("this tunnel's own default was not recognised (%v)", err)
 	}
 }
+
+// A PRODUCT LIMITATION, and it has to reach the screen in plain words rather
+// than as a 45-second dial that silently reverts.
+//
+// WireGuard begins a handshake only when it has traffic to send or a keepalive
+// fires. Nothing sends traffic through a freshly-built tunnel — the table
+// exists but no rule points at it yet — so with keepalive at 0 the handshake
+// this dial waits for never happens.
+func TestAProfileWithNoKeepaliveIsRefusedUpFrontInPlainWords(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+
+	raw := strings.Replace(wireguardProfileJSON, `"persistent_keepalive": 25`, `"persistent_keepalive": 0`, 1)
+	p, err := ParseExternalProfile([]byte(raw))
+	if err != nil {
+		t.Fatalf("keepalive 0 is a VALID profile — it is refused for what it means, not rejected as malformed: %v", err)
+	}
+
+	r := upHost()
+	plan := planUpOn(t, r, p)
+	if plan.Refusal != KeepaliveZeroRefusal {
+		t.Fatalf("refusal = %q, want the verbatim KeepaliveZeroRefusal sentence", plan.Refusal)
+	}
+	// Plain words a user can act on, not jargon.
+	for _, phrase := range []string{"persistent_keepalive", "cannot dial it", "PersistentKeepalive", "25"} {
+		if !strings.Contains(plan.Refusal, phrase) {
+			t.Fatalf("the refusal does not say %q in plain words: %s", phrase, plan.Refusal)
+		}
+	}
+	// Refused BEFORE anything is touched, and before the binaries are even
+	// hunted for — the whole point of doing it at plan time.
+	for _, forbidden := range []string{"wg-quick", "ip route", "ip rule"} {
+		if r.ran(forbidden) {
+			t.Fatalf("a refused profile still touched the machine (%q): %v", forbidden, r.calls)
+		}
+	}
+	// And the ordinary profile is unaffected.
+	if planUpOn(t, upHost(), mustProfile(t)).Refusal != "" {
+		t.Fatal("a profile WITH a keepalive was refused")
+	}
+}
+
+// The confirm-time failure has to read differently from the plan-time refusal.
+// Reaching it means a keepalive WAS configured and the peer still did not
+// answer — a peer or network problem, not the product limitation — and
+// conflating the two would send a user to change a field that is already set.
+func TestNoHandshakeWithAKeepaliveBlamesThePeerNotTheProfile(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	plan := planUpOn(t, upHost(), mustProfile(t))
+
+	// The host's egress is stubbed and UNCHANGED, so the confirmation gets
+	// past the host-moved short-circuit and reaches the handshake check —
+	// which is the thing under test. Stubbed rather than measured because a
+	// unit test must not depend on the network of whoever runs `go test`.
+	original := hostPublicIP
+	hostPublicIP = func(context.Context) (Egress, error) {
+		return Egress{IP: "65.109.66.88", Via: "test"}, nil
+	}
+	t.Cleanup(func() { hostPublicIP = original })
+
+	r := upHost()
+	r.answers["wg show wg0 peers"] = testPeerKey + "\n"
+	r.answers["ip route show table 200"] = "default dev wg0 \n"
+	r.answers["wg show wg0 latest-handshakes"] = testPeerKey + "\t0\n"
+
+	c := confirmExternalUpOnce(context.Background(), r, *plan, "65.109.66.88")
+	if c.ok {
+		t.Fatal("a peer that never handshaked was confirmed")
+	}
+	if strings.Contains(c.reason, "cannot dial it") {
+		t.Fatalf("the confirm-time failure repeats the plan-time refusal: %s", c.reason)
+	}
+	if !strings.Contains(c.reason, "does set a keepalive") {
+		t.Fatalf("the reason does not distinguish itself from the keepalive limitation: %s", c.reason)
+	}
+}

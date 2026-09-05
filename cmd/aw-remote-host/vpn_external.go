@@ -267,6 +267,82 @@ func runVPNExternalUnroute(args []string) error {
 	return runErr
 }
 
+// runVPNExternalStatus is `vpn external-status` — what is ACTUALLY in force,
+// measured, not replayed from state.json.
+//
+// The contract the workspace core calls is exactly:
+//
+//	aw-remote-host vpn external-status --json
+//
+// and the object it prints is fixed by that contract, which core was already
+// built against — it currently degrades to state "unknown" because this verb
+// did not exist.
+//
+// Exit status is 0 whenever the QUERY succeeded, including when the answer is
+// "nothing is up". That is deliberate and it is the opposite of external-up's
+// posture: "there is no tunnel" is a true answer to this question, not a
+// failure to answer it, and a non-zero exit would make a caller treat an
+// honest "disconnected" as a broken host.
+func runVPNExternalStatus(args []string) error {
+	fs := flag.NewFlagSet("vpn external-status", flag.ContinueOnError)
+	iface := fs.String("iface", "", "interface to report on IF nothing is recorded (default wg0)")
+	table := fs.Int("table", 0, "routing table to report on IF nothing is recorded (default 200)")
+	asJSON := fs.Bool("json", false, "print one machine-readable object on stdout and nothing else")
+	skipEgress := fs.Bool("skip-egress", false, "omit the two measurements that cost a network round trip (this host's public IP, and a probe container in the routed container's namespace); both report null instead")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	report, err := vpn.ExternalStatus(context.Background(), vpn.ExternalStatusSpec{
+		Runner:     externalRunner(),
+		Iface:      *iface,
+		Table:      *table,
+		SkipEgress: *skipEgress,
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(externalStatusJSON(report))
+	}
+	for _, line := range report.Describe() {
+		fmt.Printf("vpn: %s\n", line)
+	}
+	return nil
+}
+
+// externalStatusJSON is the CLI's rendering of the report.
+//
+// It is built here, field by field, from the same struct the link verb's
+// payload is built from — the two are asserted equal by a test rather than by
+// hope, because the workspace parses whichever surface it reached and a key
+// spelled differently on one of them is a bug nobody sees until a screen says
+// "unknown" forever.
+func externalStatusJSON(r vpn.ExternalStatusReport) map[string]any {
+	return map[string]any{
+		"iface":               r.Iface,
+		"up":                  r.Up,
+		"table":               r.Table,
+		"rule_installed":      r.RuleInstalled,
+		"container":           nullable(r.Container),
+		"container_egress_ip": nullable(r.ContainerEgressIP),
+		"host_egress_ip":      nullable(r.HostEgressIP),
+		"deadman_armed":       r.DeadmanArmed,
+		"deadman_expires_at":  nullable(r.DeadmanExpiresAt),
+		"since":               nullable(r.Since),
+		"dns_tunneled":        r.DNSTunneled,
+	}
+}
+
+// nullable keeps a nil pointer marshalling as JSON null rather than "" — the
+// contract spells these fields `"<value>"|null`.
+func nullable(s *string) any {
+	if s == nil {
+		return nil
+	}
+	return *s
+}
+
 // externalRunner is the privileged shellout both external paths need, and it
 // is the same bargain the `vpn_external_route` verb makes: `sudo -n` never
 // prompts, so a host with neither root nor a NOPASSWD entry fails immediately
@@ -389,6 +465,19 @@ var vpnExternalUsage = strings.Trim(`
   vpn external-down     Take the RECORDED tunnel back down and remove the
                         routes that dial installed. --iface/--table are a
                         fallback used only when nothing is recorded.
+
+  vpn external-status   What is ACTUALLY in force, MEASURED — the interface
+                        from "wg show", the policy rule from "ip rule show",
+                        both egress addresses probed, and whether a dead-man's
+                        switch is still armed. It never replays state.json:
+                        the dead-man reverts on its own and writes nothing
+                        back, so a status built from the record would keep
+                        saying "connected" after the tunnel was already torn
+                        down. Exits 0 whenever the QUERY worked, including
+                        when the answer is "nothing is up".
+      --json            print one machine-readable object and nothing else
+      --skip-egress     omit the two network round trips (host public IP and
+                        the in-namespace probe); both report null instead
 
   vpn external-route <container>
                         Point ONE container's egress at a tunnel this host
