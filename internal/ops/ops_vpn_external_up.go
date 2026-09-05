@@ -84,12 +84,18 @@ func (h *Handler) VPNExternalUp(ctx context.Context, args map[string]any, emit E
 		return nil, err
 	}
 
+	controlPlane := strings.TrimSpace(stringArg(args, "control_plane"))
+	if controlPlane == "" {
+		controlPlane = strings.TrimSpace(h.Opts.ControlPlane)
+	}
+
 	spec := vpn.ExternalUpSpec{
 		Profile:        profile,
 		Iface:          strings.TrimSpace(stringArg(args, "iface")),
 		Table:          intArg(args, "table"),
 		Deadman:        secondsArg(args, "deadman_s", 120*time.Second),
 		ConfirmTimeout: secondsArg(args, "confirm_s", 45*time.Second),
+		ControlPlane:   controlPlane,
 		Runner:         h.externalRunner(),
 	}
 
@@ -240,7 +246,13 @@ func externalStatusPayload(r vpn.ExternalStatusReport) map[string]any {
 		"deadman_armed":       r.DeadmanArmed,
 		"deadman_expires_at":  nilString(r.DeadmanExpiresAt),
 		"since":               nilString(r.Since),
-		"dns_tunneled":        r.DNSTunneled,
+
+		// The honest summary, same three keys on every surface. warnings is
+		// `[]` and never null — a caller that has to handle both is a caller
+		// that will handle one of them wrong.
+		"dns_tunneled": r.DNSTunneled,
+		"kill_switch":  r.KillSwitch,
+		"warnings":     vpn.OrEmptyStrings(r.Warnings),
 	}
 }
 

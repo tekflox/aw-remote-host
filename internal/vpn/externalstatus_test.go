@@ -290,10 +290,25 @@ func TestStatusIsHonestThatDNSIsNotFullyTunnelled(t *testing.T) {
 	if got.DNSTunneled {
 		t.Fatal("dns_tunneled=true; aardvark's upstream has not moved, so this would be a claim the deployment does not deliver")
 	}
+	// Asserted against the constant, not a paraphrase of it: these strings are
+	// rendered verbatim to a person, so a test that matched a fragment would
+	// keep passing while the sentence they actually read drifted.
+	if !containsString(got.Warnings, DNSNotTunnelledWarning) {
+		t.Fatalf("the DNS gap is not in warnings: %v", got.Warnings)
+	}
 	joined := strings.Join(got.Describe(), " ")
-	if !strings.Contains(joined, "not fully tunnelled") {
+	if !strings.Contains(joined, DNSNotTunnelledWarning) {
 		t.Fatalf("the human rendering does not admit the gap:\n%s", joined)
 	}
+}
+
+func containsString(haystack []string, want string) bool {
+	for _, s := range haystack {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // state.json must never gain key material through this path either — the

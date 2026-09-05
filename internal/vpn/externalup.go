@@ -477,6 +477,14 @@ type ExternalUpSpec struct {
 	// ConfirmTimeout is how long to wait for a handshake. Clamped inside
 	// Deadman, same as ExternalRouteSpec's.
 	ConfirmTimeout time.Duration
+	// ControlPlane is the base URL whose addresses have to stay reachable
+	// outside the tunnel for Disconnect to work. Nothing is PINNED here —
+	// installing that route is vpn_external_route's job and stays there, so
+	// there is exactly one owner of it — but it is resolved at dial time so
+	// the reply can tell the user BEFORE anything is routed that the kill
+	// switch will be missing. An early warning beats the same warning
+	// delivered after a container's egress has already moved.
+	ControlPlane string
 	// Runner is how every shellout is made. Required and never defaulted —
 	// same field, same reason, as ExternalRouteSpec.Runner.
 	Runner Runner
@@ -535,6 +543,13 @@ type ExternalUpPlan struct {
 	// invariant 6, and assume the invocation may be delivered twice.
 	AlreadyUp bool   `json:"already_up"`
 	Refusal   string `json:"refusal,omitempty"`
+
+	// Guarantees is what this dial can honestly promise. KillSwitch here
+	// means "the control plane resolved, so it CAN be pinned when a container
+	// is routed onto this tunnel" — the pin itself is installed by
+	// vpn_external_route. Reporting it at dial time is what lets a user find
+	// out before their egress moves rather than after.
+	ExternalGuarantees
 
 	// wgQuickPath / ipPath / wgPath are resolved absolute at plan time so the
 	// dead-man's revert can name them without depending on PATH — see
@@ -602,6 +617,9 @@ func PlanExternalUp(ctx context.Context, spec ExternalUpSpec) (*ExternalUpPlan, 
 		PeerPublicKey: strings.TrimSpace(spec.Profile.Peer.PublicKey),
 		DNS:           spec.Profile.DNS,
 		ProfileSHA256: spec.Profile.Fingerprint(),
+		// Non-nil from the very first line, so every early return below —
+		// every refusal — still marshals `"warnings": []` rather than null.
+		ExternalGuarantees: ExternalGuarantees{Warnings: []string{}},
 	}
 	runner := spec.Runner
 	if runner == nil {
@@ -711,6 +729,13 @@ func PlanExternalUp(ctx context.Context, spec ExternalUpSpec) (*ExternalUpPlan, 
 	plan.Runtime = rt.Name
 
 	plan.AlreadyUp = externalTunnelAlreadyUp(ctx, runner, *plan)
+
+	// Resolved, never installed — see ExternalUpSpec.ControlPlane. This is the
+	// same question vpn_external_route asks when it actually writes the pin,
+	// asked one step earlier so the answer reaches the user before their
+	// egress moves rather than after.
+	_, killSwitch := planExternalExclusions(ctx, spec.ControlPlane)
+	plan.ExternalGuarantees = newExternalGuarantees(true, killSwitch)
 	return plan, nil
 }
 
@@ -903,6 +928,10 @@ func (r ExternalUpResult) Payload() map[string]any {
 		"reason":           r.Reason,
 		"warning":          r.Warning,
 
+		"dns_tunneled": r.Plan.DNSTunneled,
+		"kill_switch":  r.Plan.KillSwitch,
+		"warnings":     OrEmptyStrings(r.Plan.Warnings),
+
 		"deadman_expires_at":  r.DeadmanExpiresAt,
 		"deadman_still_armed": r.DeadmanStillArmed,
 	}
@@ -956,6 +985,13 @@ func ExternalUp(ctx context.Context, spec ExternalUpSpec, progress Progress) (Ex
 	progress.emit("info", "  %s (the tunnel endpoint) is pinned to %s dev %s so the tunnel's own traffic cannot route into itself", plan.endpointPrefix(), plan.MainGateway, plan.MainDev)
 	if len(plan.DNS) > 0 {
 		progress.emit("info", "the profile's resolvers (%s) are recorded and NOT written into the config: wg-quick's DNS= rewrites the whole host's resolver, which is the same lockout arriving through DNS instead of routing", strings.Join(plan.DNS, ", "))
+	}
+
+	// The warnings go out with the narration as well as in the reply. A user
+	// watching a dial happen should not have to read a JSON field afterwards
+	// to learn the kill switch is missing.
+	for _, w := range plan.Warnings {
+		progress.emit("warning", "%s", w)
 	}
 
 	// The host's baseline is not optional: it is what the confirmation asserts

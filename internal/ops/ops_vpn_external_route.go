@@ -182,6 +182,13 @@ func externalRoutePayload(res vpn.ExternalRouteResult) map[string]any {
 
 		"deadman_expires_at":  res.DeadmanExpiresAt,
 		"deadman_still_armed": res.DeadmanStillArmed,
+
+		// The honest summary, same three keys on every surface. warnings is
+		// `[]` and never null — a caller that has to handle both is a caller
+		// that will handle one of them wrong.
+		"dns_tunneled": res.Plan.DNSTunneled,
+		"kill_switch":  res.Plan.KillSwitch,
+		"warnings":     vpn.OrEmptyStrings(res.Plan.Warnings),
 	}
 }
 

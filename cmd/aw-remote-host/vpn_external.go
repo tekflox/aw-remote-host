@@ -51,6 +51,7 @@ func runVPNExternalUp(args []string) error {
 	table := fs.Int("table", 0, "routing table to build the tunnel's default in (default 200 — the same table `vpn external-route` points a container at)")
 	deadmanS := fs.Int("deadman-s", 0, "seconds before an unconfirmed dial tears itself down and flushes the table (default 120)")
 	confirmS := fs.Int("confirm-s", 0, "seconds to keep trying to confirm the tunnel before giving up and reverting (default 45)")
+	controlPlane := fs.String("control-plane", defaultControlPlane, "control plane base URL. Nothing is pinned here — `vpn external-route` installs that route — but it is resolved now so the reply can say BEFORE anything is routed whether the kill switch will be there")
 	asJSON := fs.Bool("json", false, "print one machine-readable object on stdout and nothing else")
 	plan := fs.Bool("plan", false, "resolve everything, print it, and change NOTHING")
 	if err := fs.Parse(args); err != nil {
@@ -71,6 +72,7 @@ func runVPNExternalUp(args []string) error {
 		Table:          *table,
 		Deadman:        secondsFlag(*deadmanS),
 		ConfirmTimeout: secondsFlag(*confirmS),
+		ControlPlane:   *controlPlane,
 		Runner:         externalRunner(),
 	}
 	ctx := context.Background()
@@ -331,6 +333,8 @@ func externalStatusJSON(r vpn.ExternalStatusReport) map[string]any {
 		"deadman_expires_at":  nullable(r.DeadmanExpiresAt),
 		"since":               nullable(r.Since),
 		"dns_tunneled":        r.DNSTunneled,
+		"kill_switch":         r.KillSwitch,
+		"warnings":            vpn.OrEmptyStrings(r.Warnings),
 	}
 }
 
@@ -396,6 +400,10 @@ func externalRouteJSON(res vpn.ExternalRouteResult) map[string]any {
 
 		"deadman_expires_at":  res.DeadmanExpiresAt,
 		"deadman_still_armed": res.DeadmanStillArmed,
+
+		"dns_tunneled": res.Plan.DNSTunneled,
+		"kill_switch":  res.Plan.KillSwitch,
+		"warnings":     vpn.OrEmptyStrings(res.Plan.Warnings),
 	}
 }
 
@@ -432,6 +440,9 @@ func printExternalUpPlan(p vpn.ExternalUpPlan, warning string) {
 	fmt.Printf("vpn:   %-20s dev %s\n", "default", p.Iface)
 	if len(p.DNS) > 0 {
 		fmt.Printf("vpn: the profile's resolvers (%s) would be RECORDED and NOT written into the config — wg-quick's DNS= rewrites the whole host's resolver\n", strings.Join(p.DNS, ", "))
+	}
+	for _, w := range p.Warnings {
+		fmt.Printf("vpn: WARNING — %s\n", w)
 	}
 	fmt.Println("vpn: would arm a dead-man's switch BEFORE the first route change, reverting with `wg-quick down` plus a flush of that table if this run does not confirm the tunnel")
 	fmt.Println("vpn: this MACHINE's own public IP would NOT change. That is asserted before and after, and a host whose address moved is a failed apply that reverts.")

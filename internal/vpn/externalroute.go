@@ -178,6 +178,13 @@ type ExternalRoutePlan struct {
 	MainGateway string   `json:"main_gateway"`
 	MainDev     string   `json:"main_dev"`
 	Refusal     string   `json:"refusal,omitempty"`
+
+	// Guarantees is what this apply can honestly promise — whether the kill
+	// switch is really there, whether DNS is really tunnelled, and the
+	// sentences to show when either is false. Embedded so `dns_tunneled`,
+	// `kill_switch` and `warnings` appear at the top level of the JSON, which
+	// is the shape core and the UI were given.
+	ExternalGuarantees
 }
 
 // Rule is the exact `ip rule` this plan installs, as a printable string. Used
@@ -237,6 +244,9 @@ func PlanExternalRoute(ctx context.Context, spec ExternalRouteSpec) (*ExternalRo
 		Container: spec.Container,
 		Table:     spec.Table,
 		Priority:  spec.Priority,
+		// Non-nil from the very first line, so every early return below —
+		// every refusal — still marshals `"warnings": []` rather than null.
+		ExternalGuarantees: ExternalGuarantees{Warnings: []string{}},
 	}
 	if strings.TrimSpace(spec.Container) == "" {
 		return nil, fmt.Errorf("container is required: it names the workload whose egress moves, and resolving it is also what proves the rule cannot match this machine")
@@ -307,7 +317,12 @@ func PlanExternalRoute(ctx context.Context, spec ExternalRouteSpec) (*ExternalRo
 	}
 	plan.MainGateway, plan.MainDev = gw, mdev
 
-	plan.Exclusions = planExternalExclusions(ctx, spec.ControlPlane)
+	exclusions, killSwitch := planExternalExclusions(ctx, spec.ControlPlane)
+	plan.Exclusions = exclusions
+	// A route that is about to be applied IS in force for the purposes of the
+	// warning: this plan is what the apply will do, and the warning has to
+	// reach the screen with the result rather than after somebody notices.
+	plan.ExternalGuarantees = newExternalGuarantees(true, killSwitch)
 	return plan, nil
 }
 
@@ -349,6 +364,11 @@ func ExternalRoute(ctx context.Context, spec ExternalRouteSpec, progress Progres
 	progress.emit("info", "the rule is anchored on %s/32 — a single host address that belongs to that container and cannot be this machine.", plan.SourceIP)
 	for _, ex := range plan.Exclusions {
 		progress.emit("info", "  %s stays OUTSIDE the tunnel", ex)
+	}
+	// Loudly, and in the same stream as everything else that just happened.
+	// The kill switch going missing used to be completely silent.
+	for _, w := range plan.Warnings {
+		progress.emit("warning", "%s", w)
 	}
 
 	// TWO baselines, and the host's is the one that is not optional: it is
@@ -845,7 +865,16 @@ func mainDefault(ctx context.Context, r Runner) (gw, dev string, err error) {
 //
 // Loopback and link-local are dropped: a /32 exclusion for 127.0.0.11 would be
 // meaningless and a route for it on the main gateway would be wrong.
-func planExternalExclusions(ctx context.Context, controlPlane string) []string {
+// It returns the list AND whether the kill switch is actually there, because
+// after Layer 1 those two are no longer the same question. The exclusion list
+// used to be kept non-empty by the nameserver pins, so "empty" could only mean
+// "nothing to pin". Now an apply whose control plane failed to resolve
+// produces zero exclusions and is byte-for-byte identical to a healthy one —
+// the kill switch silently absent, on the one path whose whole job is to
+// survive the tunnel going bad. A bool is the difference between "computed
+// successfully, nothing to add" and "could not pin the thing that lets you
+// switch this off".
+func planExternalExclusions(ctx context.Context, controlPlane string) (exclusions []string, killSwitch bool) {
 	seen := map[string]bool{}
 	var out []string
 	add := func(ip string) {
@@ -864,7 +893,11 @@ func planExternalExclusions(ctx context.Context, controlPlane string) []string {
 	for _, ip := range resolveControlPlaneIPs(ctx, controlPlane) {
 		add(ip)
 	}
-	return out
+	// The kill switch is the ROUTES, not the intent: a control plane that was
+	// configured but resolved to nothing usable (no A record, only IPv6, a
+	// resolver that timed out) pins nothing, and saying otherwise would be the
+	// exact false reassurance this return value exists to remove.
+	return out, len(out) > 0
 }
 
 // resolveControlPlaneIPs is best-effort by design: a control plane that cannot

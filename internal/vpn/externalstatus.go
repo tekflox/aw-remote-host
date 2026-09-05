@@ -75,21 +75,13 @@ type ExternalStatusReport struct {
 	DeadmanExpiresAt  *string `json:"deadman_expires_at"`
 	Since             *string `json:"since"`
 
-	// DNSTunneled is ADDITIVE — not part of the shape core was built against,
-	// and a caller that ignores it loses nothing.
-	//
-	// It exists because the honest answer to "is my DNS going through the VPN"
-	// is currently "partly", and a screen with no way to say that will imply
-	// "yes". The resolvers are no longer pinned outside the tunnel
-	// (planExternalExclusions), so a query the container addresses DIRECTLY to
-	// an external resolver now goes through it — but on this deployment glibc
-	// sends essentially everything to the local aardvark first, and from that
-	// hop on the packet no longer carries the container's source address, so
-	// no source-anchored rule can reach it. Until aardvark's own upstream can
-	// be moved (podman 4.3.1 cannot express it and a POSIX-sh dead-man cannot
-	// revert it) this is false whenever a route is in force, and saying so is
-	// the point.
-	DNSTunneled bool `json:"dns_tunneled"`
+	// Guarantees carries dns_tunneled, kill_switch and warnings at the top
+	// level of the JSON. Unlike the two apply verbs, which report what they
+	// just DID, this one MEASURES the kill switch: it checks that the
+	// exclusion routes the record says were installed are still in the
+	// kernel. A pin that a rule flush took away is a kill switch that is
+	// gone, and the record would never know.
+	ExternalGuarantees
 }
 
 // ExternalStatusSpec is one live query.
@@ -169,10 +161,25 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 		report.RuleInstalled = err == nil && installed
 	}
 
-	// A route in force means the container's egress is supposed to have
-	// moved. DNS is only as tunnelled as that rule makes it — see
-	// DNSTunneled's own comment for why "partly" is the honest answer.
-	report.DNSTunneled = false
+	// THE KILL SWITCH, MEASURED. The record lists the exclusions the apply
+	// installed; this asks the kernel whether they are still there. Both
+	// halves can fail independently and silently: the control plane may never
+	// have resolved (so the record lists none), or systemd-networkd's daily
+	// restart may have flushed the routes out from under a healthy record —
+	// the same flush Reassert exists for. Either way Disconnect may not reach
+	// the workspace, and either way nothing else would say so.
+	killSwitch := false
+	if route != nil && len(route.Exclusions) > 0 {
+		killSwitch = true
+		for _, prefix := range route.Exclusions {
+			installed, err := routeInstalled(ctx, runner, ExternalRoutePlan{Table: route.Table}, prefix)
+			if err != nil || !installed {
+				killSwitch = false
+				break
+			}
+		}
+	}
+	report.ExternalGuarantees = newExternalGuarantees(report.Up || report.RuleInstalled, killSwitch)
 
 	if d, err := LoadDeadman(); err == nil && d != nil {
 		expires := d.ExpiresAt
@@ -279,7 +286,12 @@ func (r ExternalStatusReport) Describe() []string {
 		out = append(out, "in force since "+*r.Since)
 	}
 	if r.Up || r.RuleInstalled {
-		out = append(out, "DNS through the tunnel: "+dnsWord(r.DNSTunneled)+" — queries this container sends DIRECTLY to an external resolver go through the tunnel, but the ones it sends to the local container resolver are forwarded from a different source address and still leave via this host.")
+		out = append(out, "kill switch: "+killSwitchWord(r.KillSwitch))
+	}
+	// The warnings are the sentences a person is meant to read, so they are
+	// printed verbatim rather than summarised into a word.
+	for _, w := range r.Warnings {
+		out = append(out, "WARNING — "+w)
 	}
 	return out
 }
@@ -298,9 +310,9 @@ func installedWord(in bool) string {
 	return "NOT installed"
 }
 
-func dnsWord(full bool) string {
-	if full {
-		return "fully tunnelled"
+func killSwitchWord(ok bool) string {
+	if ok {
+		return "the control plane is pinned outside the tunnel, so Disconnect stays reachable"
 	}
-	return "PARTLY — not fully tunnelled"
+	return "MISSING"
 }
