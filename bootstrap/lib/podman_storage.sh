@@ -31,23 +31,44 @@
 #
 # Not meant to be executed directly — only sourced.
 
+
 # configure_podman_graphroot <conf_file> <home_dir>
 #
 # Idempotently writes <conf_file> (podman's storage.conf) so its [storage]
 # graphroot points at <home_dir>/.local/share/containers/storage instead of
 # whatever podman's package default is. Safe to call on every bootstrap —
-# a no-op once the graphroot already matches.
+# a no-op once the conf already says what this function would write.
+#
+# runroot is written TOO, and deliberately NOT under $HOME. Podman refuses to
+# start at all when a storage.conf exists but omits it —
+# "Failed to obtain podman configuration: runroot must be set" — so writing a
+# graphroot-only conf installs podman and bricks it in the same step, which is
+# exactly what happened on the aw workspace host on 2026-09-05: every module
+# after podman (postgres, redis, workspace) never ran. Unlike graphroot, this
+# one holds per-boot runtime state (lock files, active mounts); on $HOME it
+# would survive a container recreate as stale locks pointing at mounts that no
+# longer exist, so /run — podman's own rootful default — is the correct place.
+#
+# The early-return also checks runroot, not just graphroot: a host already
+# bootstrapped by the graphroot-only version has a conf whose graphroot is
+# ALREADY correct, so a graphroot-only guard would return early and leave that
+# host permanently broken instead of repairing it.
+PODMAN_RUNROOT="${PODMAN_RUNROOT:-/run/containers/storage}"
+
 configure_podman_graphroot() {
   local conf_file="$1" home_dir="$2"
   local storage_root="$home_dir/.local/share/containers/storage"
   mkdir -p "$storage_root" "$(dirname "$conf_file")"
-  if [ -f "$conf_file" ] && grep -q "graphroot = \"$storage_root\"" "$conf_file" 2>/dev/null; then
+  if [ -f "$conf_file" ] \
+    && grep -q "graphroot = \"$storage_root\"" "$conf_file" 2>/dev/null \
+    && grep -q "runroot = \"$PODMAN_RUNROOT\"" "$conf_file" 2>/dev/null; then
     return 0
   fi
   cat > "$conf_file" <<EOF
 [storage]
 driver = "overlay"
+runroot = "$PODMAN_RUNROOT"
 graphroot = "$storage_root"
 EOF
-  echo "podman: graphroot set to $storage_root (survives this container being recreated; the package default /var/lib/containers/storage does not)"
+  echo "podman: graphroot set to $storage_root (survives this container being recreated; the package default /var/lib/containers/storage does not), runroot at $PODMAN_RUNROOT"
 }

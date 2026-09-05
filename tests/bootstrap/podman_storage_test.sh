@@ -65,4 +65,30 @@ expect "graphroot follows \$HOME, not hardcoded" \
   "graphroot = \"$OTHER_HOME/.local/share/containers/storage\"" \
   "$(grep 'graphroot' "$OTHER_CONF")"
 
+# runroot must be written as well. Podman refuses to start at all against a
+# storage.conf that omits it ("runroot must be set"), so a graphroot-only conf
+# installs podman and bricks it in the same step.
+expect "writes runroot" \
+  "runroot = \"/run/containers/storage\"" "$(grep 'runroot' "$CONF")"
+
+# ...and it must NOT be under $HOME: runroot is per-boot runtime state (locks,
+# active mounts). Persisted on the volume it would outlive a container recreate
+# as stale locks pointing at mounts that no longer exist.
+expect "runroot is not under \$HOME" "0" "$(grep -c "runroot = \"$HOME_DIR" "$CONF")"
+
+# The repair case: a host bootstrapped by the graphroot-only version already
+# has the CORRECT graphroot, so a guard that only checked graphroot would
+# return early and leave podman permanently unable to start. This is the exact
+# conf that broke the aw workspace host on 2026-09-05.
+cat > "$CONF" <<EOF
+[storage]
+driver = "overlay"
+graphroot = "$EXPECTED_ROOT"
+EOF
+configure_podman_graphroot "$CONF" "$HOME_DIR" >/dev/null
+expect "repairs a graphroot-only conf left by the previous version" \
+  "runroot = \"/run/containers/storage\"" "$(grep 'runroot' "$CONF")"
+expect "repair keeps the graphroot it already had" \
+  "graphroot = \"$EXPECTED_ROOT\"" "$(grep 'graphroot' "$CONF")"
+
 exit "$fail"
