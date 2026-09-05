@@ -934,3 +934,45 @@ func TestATeardownWithNothingRecordedStillStandsTheDeadManDown(t *testing.T) {
 		t.Fatalf("external-down left a dead-man's switch record behind (expires_at %q) — external-status will keep reporting a switch nobody armed, and the command that is supposed to tidy this up is the one that just ran", d.ExpiresAt)
 	}
 }
+
+// A TEARDOWN THAT SUCCEEDED MUST NOT REPORT FAILURE.
+//
+// `external-unroute` removes the exclusions and `external-down` runs straight
+// afterwards — and on this deployment the control plane and the tunnel's own
+// endpoint are the SAME address, so the exclusion and the endpoint pin are one
+// route. The second command therefore finds it already gone, and `ip route
+// del` cannot tell "already absent" from "could not be removed": both are exit
+// 2. Disconnect returned HTTP 502 and recorded ok:false while the host was
+// completely clean — measured live 2026-09-05 through POST /api/vpn/disconnect.
+//
+// The second half is what stops the fix from becoming "ignore every del
+// failure": a route that IS still in the table and still will not come out is
+// a real failure and has to stay one.
+func TestATeardownDoesNotFailOverARouteSomethingElseAlreadyRemoved(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	plan := planUpOn(t, upHost(), mustProfile(t))
+
+	alreadyGone := upHost()
+	// The table is EMPTY: unroute (or a flush) already took everything.
+	alreadyGone.answers["ip route show table 200"] = ""
+	alreadyGone.errs = map[string]error{
+		"ip route del": fmt.Errorf("exit status 2"),
+	}
+	if err := revertExternalUp(context.Background(), alreadyGone, *plan, nil); err != nil {
+		t.Fatalf("a teardown of a table something else had already emptied reported failure: %v", err)
+	}
+	if !alreadyGone.ran("wg-quick down") {
+		t.Fatal("the tunnel was never taken down — the walk stopped early")
+	}
+
+	stuck := upHost()
+	// The default IS still there, and still will not come out.
+	stuck.answers["ip route show table 200"] = "default dev " + plan.Iface + " scope link \n"
+	stuck.errs = map[string]error{
+		"ip route del default": fmt.Errorf("exit status 2"),
+	}
+	if err := revertExternalUp(context.Background(), stuck, *plan, nil); err == nil {
+		t.Fatal("a route that is still in the table and still will not come out was reported as a clean teardown")
+	}
+}

@@ -1185,11 +1185,39 @@ func revertExternalUp(ctx context.Context, r Runner, plan ExternalUpPlan, progre
 	// tableArgs is ordered for the apply; the revert walks it backwards, which
 	// puts the default first and the connected routes last.
 	for i := len(dels) - 1; i >= 0; i-- {
-		if _, err := r.Run(ctx, "ip", dels[i]...); err != nil && firstErr == nil {
-			// A route that is already gone is not a failure — `wg-quick down`
-			// takes the tunnel's own with it — so this is recorded and the
-			// walk continues rather than stopping at the first one.
-			firstErr = fmt.Errorf("could not remove `ip %s` from table %d: %w", strings.Join(dels[i], " "), plan.Table, err)
+		if _, err := r.Run(ctx, "ip", dels[i]...); err != nil {
+			// A ROUTE THAT IS ALREADY GONE IS NOT A FAILURE — this now checks
+			// that instead of only saying it. `ip route del` answers "already
+			// absent" and "could not be removed" with the same exit 2, so the
+			// only way to tell them apart is to ask whether the prefix is
+			// still in the table.
+			//
+			// This is not a rare race. `external-unroute` removes the
+			// exclusions and `external-down` runs straight afterwards, and on
+			// this deployment the control plane and the tunnel's own endpoint
+			// are the SAME address (65.109.66.88) — so the exclusion and the
+			// endpoint pin are one and the same route. Unroute takes it, and
+			// the teardown finds it gone. Measured live 2026-09-05: POST
+			// /api/vpn/disconnect returned 502 and recorded ok:false while the
+			// host was, in fact, completely clean. A teardown that reports
+			// failure after succeeding is the same class of lie as a status
+			// that reports connected after the dead-man has fired.
+			//
+			// The check runs AFTER the attempt, not before it — deliberately.
+			// A pre-flight `ip route show` would make this loop, the one that
+			// runs the default route out of the table, depend on being able to
+			// READ the table first; a read that fails or comes back
+			// unrecognisable would then skip a delete that was needed. Trying
+			// first and only DOWNGRADING a failure once the goal state is
+			// confirmed keeps the attempt unconditional.
+			if ok, checkErr := routeInstalled(ctx, r, ExternalRoutePlan{Table: plan.Table}, dels[i][2]); checkErr == nil && !ok {
+				continue
+			}
+			if firstErr == nil {
+				// Recorded, and the walk continues rather than stopping at the
+				// first one — the rest of the table still has to come out.
+				firstErr = fmt.Errorf("could not remove `ip %s` from table %d: %w", strings.Join(dels[i], " "), plan.Table, err)
+			}
 		}
 	}
 	if _, err := r.Run(ctx, "wg-quick", "down", plan.ConfPath); err != nil && firstErr == nil {
