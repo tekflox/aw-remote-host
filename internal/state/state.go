@@ -186,6 +186,12 @@ type ExternalRouteState struct {
 	Exclusions  []string `json:"exclusions,omitempty"`
 	// RoutedAt is RFC3339.
 	RoutedAt string `json:"routed_at,omitempty"`
+	// ExpectEgress is the public IP the caller asked this route to present,
+	// when given. Persisted so the live status query (externalstatus.go) can
+	// compare it against what the container is ACTUALLY measured leaving
+	// from — a mismatch is exactly what another mechanism silently taking
+	// this rule's traffic (a mesh exit gate, say) looks like from this side.
+	ExpectEgress string `json:"expect_egress,omitempty"`
 }
 
 // DefaultPath returns ~/.aw-remote-host/state.json.

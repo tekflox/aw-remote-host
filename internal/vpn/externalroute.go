@@ -178,6 +178,11 @@ type ExternalRoutePlan struct {
 	MainGateway string   `json:"main_gateway"`
 	MainDev     string   `json:"main_dev"`
 	Refusal     string   `json:"refusal,omitempty"`
+	// ExpectEgress is spec.ExpectEgress, carried onto the plan so it can be
+	// persisted alongside everything else this apply recorded — see
+	// ExternalStatusReport, the reader that turns a later mismatch into a
+	// warning instead of a bare, unverified address.
+	ExpectEgress string `json:"expect_egress,omitempty"`
 
 	// Guarantees is what this apply can honestly promise — whether the kill
 	// switch is really there, whether DNS is really tunnelled, and the
@@ -241,9 +246,10 @@ type ExternalRouteResult struct {
 func PlanExternalRoute(ctx context.Context, spec ExternalRouteSpec) (*ExternalRoutePlan, error) {
 	spec = spec.withDefaults()
 	plan := &ExternalRoutePlan{
-		Container: spec.Container,
-		Table:     spec.Table,
-		Priority:  spec.Priority,
+		Container:    spec.Container,
+		Table:        spec.Table,
+		Priority:     spec.Priority,
+		ExpectEgress: spec.ExpectEgress,
 		// Non-nil from the very first line, so every early return below —
 		// every refusal — still marshals `"warnings": []` rather than null.
 		ExternalGuarantees: ExternalGuarantees{Warnings: []string{}},
@@ -1199,17 +1205,18 @@ func measureNetnsEgress(ctx context.Context, r Runner, runtime, containerID stri
 func saveExternalRouteState(plan ExternalRoutePlan) error {
 	return mutateExternalRouteState(func(v *state.VPNState) {
 		v.ExternalRoute = &state.ExternalRouteState{
-			Container:   plan.Container,
-			ContainerID: plan.ContainerID,
-			SourceIP:    plan.SourceIP,
-			Table:       plan.Table,
-			Priority:    plan.Priority,
-			Runtime:     plan.Runtime,
-			TunnelDev:   plan.TunnelDev,
-			MainGateway: plan.MainGateway,
-			MainDev:     plan.MainDev,
-			Exclusions:  plan.Exclusions,
-			RoutedAt:    time.Now().UTC().Format(time.RFC3339),
+			Container:    plan.Container,
+			ContainerID:  plan.ContainerID,
+			SourceIP:     plan.SourceIP,
+			Table:        plan.Table,
+			Priority:     plan.Priority,
+			Runtime:      plan.Runtime,
+			TunnelDev:    plan.TunnelDev,
+			MainGateway:  plan.MainGateway,
+			MainDev:      plan.MainDev,
+			Exclusions:   plan.Exclusions,
+			RoutedAt:     time.Now().UTC().Format(time.RFC3339),
+			ExpectEgress: plan.ExpectEgress,
 		}
 	})
 }
@@ -1250,15 +1257,16 @@ func loadExternalRouteState() (*ExternalRoutePlan, error) {
 	}
 	e := st.VPN.ExternalRoute
 	return &ExternalRoutePlan{
-		Container:   e.Container,
-		ContainerID: e.ContainerID,
-		SourceIP:    e.SourceIP,
-		Table:       e.Table,
-		Priority:    e.Priority,
-		Runtime:     e.Runtime,
-		TunnelDev:   e.TunnelDev,
-		MainGateway: e.MainGateway,
-		MainDev:     e.MainDev,
-		Exclusions:  e.Exclusions,
+		Container:    e.Container,
+		ContainerID:  e.ContainerID,
+		SourceIP:     e.SourceIP,
+		Table:        e.Table,
+		Priority:     e.Priority,
+		Runtime:      e.Runtime,
+		TunnelDev:    e.TunnelDev,
+		MainGateway:  e.MainGateway,
+		MainDev:      e.MainDev,
+		Exclusions:   e.Exclusions,
+		ExpectEgress: e.ExpectEgress,
 	}, nil
 }

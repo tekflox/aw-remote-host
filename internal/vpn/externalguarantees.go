@@ -45,6 +45,18 @@ package vpn
 // work.
 const KillSwitchMissingWarning = "This connection has NO KILL SWITCH: the control plane's address could not be resolved when the connection was made, so it has not been held outside the tunnel. If the tunnel degrades while it is up, the Disconnect button may not be able to reach the workspace, and the VPN could not be switched off from this screen. To recover from the host itself, run `aw-remote-host vpn external-unroute` and then `aw-remote-host vpn external-down`. Disconnecting and reconnecting once name resolution is working again will pin it properly."
 
+// egressMismatchWarning is shown when the container's measured egress is not
+// the address this route was told to expect. It says what it looks like
+// rather than merely what it is, because the actual observed cause (a mesh
+// exit gate picked after this VPN connected) is what PlanUseExit's own shadow
+// refusal (usexit.go) now prevents going forward — this is the same theft,
+// reported from the VPN screen's side, for anything that shadowed the rule
+// before that refusal existed to stop it.
+func egressMismatchWarning(expected, got string) string {
+	return "Container egress is " + got + ", not the expected " + expected +
+		". Something else is routing this container's traffic — most likely a mesh exit gate (Settings -> Networking) picked after this VPN connected, which silently takes priority over this rule. Clear whichever was picked last, or run `aw-remote-host vpn external-unroute` and reconnect."
+}
+
 // DNSNotTunnelledWarning is shown whenever DNS is only partly tunnelled,
 // which on this deployment is always — see ExternalStatusReport.DNSTunneled
 // and planExternalExclusions for why, and the card for what closing it needs.

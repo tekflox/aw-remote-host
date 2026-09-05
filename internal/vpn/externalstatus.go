@@ -202,6 +202,13 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 				report.ContainerEgressIP = &ip
 			}
 		}
+		// THE MISMATCH THAT CAUGHT THE GATE. Before this, container_egress_ip
+		// rendered as a bare, unverified address with nothing to compare it
+		// against — exactly the gap that let a mesh exit gate steal this
+		// route unnoticed (see PlanUseExit's shadow refusal in usexit.go).
+		if w := expectedEgressMismatch(route, report.ContainerEgressIP); w != "" {
+			report.Warnings = appendWarning(report.Warnings, w)
+		}
 	}
 
 	// --- `since`, and it is gated on the TUNNEL being up ---
@@ -233,6 +240,20 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 	}
 
 	return report, nil
+}
+
+// expectedEgressMismatch reports the warning to append, or "" when there is
+// nothing to say: no route recorded, no expectation given for it (ExpectEgress
+// is optional — see ExternalRouteSpec), or no container measurement to compare
+// against yet (SkipEgress, or the probe failed). Kept pure and separate from
+// ExternalStatus's own body so the decision is testable without a runner, a
+// probe container, or a network round trip — the same reason ScopeRefusal and
+// externalRouteShadowRefusal (usexit.go) are pulled out the same way.
+func expectedEgressMismatch(route *state.ExternalRouteState, containerEgressIP *string) string {
+	if route == nil || route.ExpectEgress == "" || containerEgressIP == nil || *containerEgressIP == route.ExpectEgress {
+		return ""
+	}
+	return egressMismatchWarning(route.ExpectEgress, *containerEgressIP)
 }
 
 // interfacePresent asks wg which interfaces exist. A host with no `wg` at all

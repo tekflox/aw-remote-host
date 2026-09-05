@@ -58,6 +58,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -377,7 +378,24 @@ func PlanUseExit(ctx context.Context, spec UseExitSpec) (*UseExitPlan, error) {
 		plan.Refusal = fmt.Sprintf("%s. %s", plan.ProbeNetworkReason, NoAttachedContainerRefusal)
 		return plan, nil
 	}
-	for _, subnet := range ContainerSubnets(plan.Networks) {
+	subnets := ContainerSubnets(plan.Networks)
+
+	// THE SHADOW REFUSAL, 2026-09-05. A container already pinned to an
+	// external VPN tunnel (externalroute.go) sits inside one of these subnets
+	// exactly when this gate's own `from <subnet> lookup 52` rule at priority
+	// 5261 would be consulted before the dialer's `from <container>/32 lookup
+	// 200` at priority 5399 — ip rule is first-match by ascending priority,
+	// not longest prefix, so the gate wins and the container is silently
+	// taken off the VPN while both this gate and the VPN screen report
+	// success. Refusing here — not warning on either screen — is the only
+	// place that also covers the CLI and the /link verb, neither of which
+	// goes through the UI at all.
+	if refusal := externalRouteShadowRefusal(subnets); refusal != "" {
+		plan.Refusal = refusal
+		return plan, nil
+	}
+
+	for _, subnet := range subnets {
 		plan.Routes.Containers = append(plan.Routes.Containers, ContainerRoute{
 			Prefix:   subnet,
 			Networks: NetworksFor(plan.Networks, subnet),
@@ -385,6 +403,39 @@ func PlanUseExit(ctx context.Context, spec UseExitSpec) (*UseExitPlan, error) {
 	}
 	plan.Routes.Exclusions = exclusions.Exclusions
 	return plan, nil
+}
+
+// externalRouteShadowRefusal reports why this gate must not proceed, given
+// the container subnets it is about to route: an external VPN tunnel
+// (externalroute.go) already pins a container's source address inside one of
+// them.
+//
+// A missing or unreadable state.json is "nothing recorded", never a refusal
+// — loadExternalRouteState's own contract, and the reason this host is not
+// refused just because it has never dialled a VPN. Only an ACTUAL overlap
+// between the recorded source and a subnet THIS PLAN would route refuses; a
+// recorded route pinned to some other address entirely is none of this
+// plan's business.
+func externalRouteShadowRefusal(subnets []string) string {
+	route, err := loadExternalRouteState()
+	if err != nil || route == nil || route.SourceIP == "" {
+		return ""
+	}
+	src := net.ParseIP(route.SourceIP)
+	if src == nil {
+		return ""
+	}
+	for _, subnet := range subnets {
+		_, ipnet, err := net.ParseCIDR(subnet)
+		if err != nil || !ipnet.Contains(src) {
+			continue
+		}
+		return fmt.Sprintf(
+			"this gate would route %s, which already carries container %q (%s) pinned to an external VPN tunnel this host terminates (table %d, priority %d) — picking this gate would silently shadow that tunnel's ip rule (priority %d beats %d) and take %s off the VPN while this gate and the VPN screen both report success. Clear the external route first (`aw-remote-host vpn external-unroute`) if the gate is what you want, or pick a different gate that does not cover this container's network.",
+			subnet, route.Container, route.SourceIP, route.Table, route.Priority, containerRoutePriority, route.Priority, route.Container,
+		)
+	}
+	return ""
 }
 
 // UseExitResult is what a switch attempt measured, whether it worked or not.
