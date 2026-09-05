@@ -2,26 +2,44 @@
 // that this host already terminates — as opposed to a mesh exit gate, which is
 // usexit.go's job and is not touched by anything in this file.
 //
-// WHY THIS EXISTS AS A SECOND PATH AT ALL. The `aw` workspace runs inside a
-// container (`e91aacf5a3a3`, the `aw-remote-host` container on the production
-// bare metal) which has neither `ip`, `wg` nor `tailscale` in its image and no
-// container runtime of its own. It therefore cannot select a mesh gate for
-// itself: platformFor (usexit_platform.go) refuses a host with no `ip`, and
-// ScopeRefusal refuses a host with no runtime to scope. Both refusals are
-// correct and neither is worth weakening. Measured 2026-09-02 inside that
-// container: /usr/sbin/ip, /sbin/ip, /usr/bin/ip, wg, wg-quick, tailscale and
-// tailscaled are all absent and `dpkg -l` is empty.
+// WHY THIS EXISTS AS A SECOND PATH AT ALL. It routes ONE named container
+// rather than every container network the way usexit.go does, and it does so
+// over a tunnel this host terminates itself rather than a mesh gate. Those are
+// different mechanisms with different failure modes, and they can be in force
+// at the same time.
 //
-// What IS true is that the machine hosting it — the bare metal — already
-// terminates the GL.iNet tunnel as `aw-vpn-hub`, and that hub already
-// maintains a complete routing table (200: `default via 10.8.0.2 dev wg0`
-// plus direct routes for the local docker bridges so container-to-container
-// traffic never enters the tunnel — repos/aw-stack/scripts/vpn-hub-entrypoint.sh).
-// The whole engine is already up. The only thing missing was a SOURCE pointed
-// at it. So the apply runs on the host that OWNS the tunnel, and names the
-// container it is moving. This is the first place in this codebase where an
-// apply for host A executes on host B, and that is deliberate: host B is the
-// only one that can write the rule.
+// A CORRECTION, 2026-09-05. This header used to say that the `aw-remote-host`
+// container (`e91aacf5a3a3`, where the `aw` workspace's 130 sibling containers
+// live) had no `ip`, no `wg` and no container runtime of its own, and that
+// this was why the apply had to run on the bare metal hosting it. That was
+// measured on 2026-09-02 and it was true then. It is NOT true any more:
+// the image was rebuilt from this repo's own Dockerfile and the container was
+// recreated, and inside the running container today are /usr/sbin/ip
+// (iproute2-6.1.0), /usr/bin/wg and /usr/bin/wg-quick (wireguard-tools
+// 1.0.20210914), /usr/sbin/openvpn (2.6.14), /usr/bin/podman and
+// /usr/bin/tailscale.
+//
+// So the SAME-NETNS case is now the simple case and the normal one: the
+// runtime, the local bridges and the tunnel device are all in one namespace,
+// ExternalRouteSpec.Container resolves "as the local runtime knows it"
+// (below), and the apply runs where the Runner runs. Nothing about this file
+// had to be inverted for that — it was always written against a Runner rather
+// than against a location.
+//
+// The cross-host case (an apply for host A executing on host B, where B is the
+// only machine that can write the rule) still WORKS and is still supported —
+// the container id A reports for itself is the id B knows it by — but it is
+// the difficult case, not the premise. Reading it as the premise sends the
+// next person looking for a hosting relationship that no longer has to exist.
+//
+// The tunnel this points a source at can now be brought up by this tool too:
+// externalup.go's ExternalUp/ExternalDown are the dialler, and they are
+// SIBLINGS of this file rather than callers of it. Before them the tunnel had
+// to already exist — typically aw-vpn-hub's, whose table 200 carries
+// `default via 10.8.0.2 dev wg0` plus a direct route per local bridge so
+// container-to-container traffic never enters the tunnel
+// (repos/aw-stack/scripts/vpn-hub-entrypoint.sh). ExternalUp builds a table of
+// exactly that shape, for the same reason.
 //
 // THE INVARIANT IS UNCHANGED, and this path does not need an exception to it:
 //

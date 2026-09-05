@@ -4,10 +4,10 @@
 //
 // This is the WRITE side that ops_vpn_external.go (external_tunnels on
 // vpn_status) is the read side of. It is deliberately named apart from the
-// vpn_external_up/down pair that card vpn:remote-host-dials-external-vpn will
-// bring: those DIAL a tunnel, this one only points a source at a tunnel that
-// is already up. Conflating the two in one verb name would make an operator
-// reading a run log unable to tell which of the two happened.
+// vpn_external_up/down pair (ops_vpn_external_up.go): those DIAL a tunnel,
+// this one only points a source at a tunnel that is already up. Conflating the
+// two in one verb name would make an operator reading a run log unable to tell
+// which of the two happened.
 //
 // It is also distinct from vpn_use_exit (ops_vpn_exit.go), which routes ALL of
 // this host's containers onto a MESH gate. Nothing in this file touches
@@ -15,15 +15,21 @@
 // internal/vpn.ExternalRoute, which is a sibling of UseExit rather than a
 // caller of it.
 //
-// WHY A VERB HERE AND NOT ON THE HOST BEING ROUTED, which is the surprising
-// part: the container that needs this (`aw-remote-host`/`e91aacf5a3a3`, where
-// the `aw` workspace runs) has no `ip`, no `wg` and no container runtime of
-// its own — measured 2026-09-02, with an empty dpkg database — so it cannot
-// write a rule for itself and never will without a change to an image this
-// repo does not own. The machine hosting it can, and already terminates the
-// tunnel. So this is the first verb in this repo where the apply for host A
-// runs on host B, and the caller names A by the hostname A reports for itself,
-// which IS the container id B knows it by.
+// A CORRECTION, 2026-09-05. This header used to say that the container needing
+// this (`aw-remote-host`/`e91aacf5a3a3`, where the `aw` workspace's siblings
+// live) had no `ip`, no `wg` and no container runtime of its own, with an
+// empty dpkg database, and that the apply therefore had to run on the machine
+// hosting it. That was measured on 2026-09-02 and was true then. It is not
+// true now: the image was rebuilt from this repo's own Dockerfile and the
+// container recreated, and it carries /usr/sbin/ip, /usr/bin/wg,
+// /usr/bin/wg-quick, /usr/sbin/openvpn, /usr/bin/podman and /usr/bin/tailscale.
+//
+// So the SAME-NETNS case — this verb answered by the very host being routed,
+// which also owns the runtime and the tunnel — is now the simple case and the
+// normal one. The cross-host case still works and is still supported (the
+// caller names host A by the hostname A reports for itself, which IS the
+// container id B knows it by), but it is the difficult case rather than the
+// reason this verb exists here.
 //
 // Deliberately NOT in workspaceLifecycleVerbs (ops.go), for the same reason
 // vpn_status is not: this needs a container runtime and an `ip` binary, never

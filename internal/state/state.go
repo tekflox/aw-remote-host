@@ -120,6 +120,51 @@ type VPNState struct {
 	// So it is still written only after a confirmed apply — a record for an
 	// apply that never confirmed would be re-asserted forever.
 	ExternalRoute *ExternalRouteState `json:"external_route,omitempty"`
+	// ExternalTunnel is the external tunnel this host DIALLED itself —
+	// internal/vpn/externalup.go. Distinct from ExternalRoute above, which
+	// points a container at a tunnel that is already up: the two are separate
+	// records because they are separately reversible, and an operator has to
+	// be able to tell "the tunnel went away" from "the container came off it".
+	//
+	// Like ExternalRoute it is written only after a confirmed apply, so
+	// `vpn external-down` never undoes a dial that did not survive its own
+	// confirmation.
+	ExternalTunnel *ExternalTunnelState `json:"external_tunnel,omitempty"`
+}
+
+// ExternalTunnelState is one dialled external tunnel.
+//
+// NO KEY MATERIAL LIVES HERE, and none may ever be added. The private key is
+// written to exactly one place — the 0600 synthesized config at ConfPath —
+// and ProfileSHA256 is a hash whose only job is to answer "is this the same
+// profile I was asked for last time" without the file having to hold what it
+// is a hash of. PeerPublicKey is public by definition and is what identifies
+// the peer in `wg show`.
+type ExternalTunnelState struct {
+	Type          string `json:"type"`
+	Iface         string `json:"iface"`
+	Table         int    `json:"table"`
+	ConfPath      string `json:"conf_path,omitempty"`
+	Endpoint      string `json:"endpoint,omitempty"`
+	EndpointIP    string `json:"endpoint_ip,omitempty"`
+	PeerPublicKey string `json:"peer_public_key,omitempty"`
+	MainGateway   string `json:"main_gateway,omitempty"`
+	MainDev       string `json:"main_dev,omitempty"`
+	// Connected is what was DISCOVERED from the main table at dial time and
+	// written into the tunnel's table alongside the default. Recorded so the
+	// teardown removes the same routes the dial installed — re-discovering
+	// them afterwards would compute a set that was never installed.
+	Connected     []ConnectedRouteState `json:"connected_routes,omitempty"`
+	ProfileSHA256 string                `json:"profile_sha256,omitempty"`
+	// DialedAt is RFC3339.
+	DialedAt string `json:"dialed_at,omitempty"`
+}
+
+// ConnectedRouteState is one directly-attached network kept reachable inside
+// the tunnel's routing table.
+type ConnectedRouteState struct {
+	Prefix string `json:"prefix"`
+	Dev    string `json:"dev"`
 }
 
 // ExternalRouteState is one container's egress pinned to an external tunnel.

@@ -32,6 +32,18 @@ func runVPN(args []string) error {
 			return runVPNUseExit(args[1:])
 		case "clear-exit":
 			return runVPNClearExit(args[1:])
+		// The external-tunnel family (vpn_external.go). Separate subcommands
+		// rather than flags on use-exit for the reason above, one level down:
+		// a MESH gate and an EXTERNAL tunnel fail in different ways, and the
+		// two must not be a typo apart either.
+		case "external-up":
+			return runVPNExternalUp(args[1:])
+		case "external-down":
+			return runVPNExternalDown(args[1:])
+		case "external-route":
+			return runVPNExternalRoute(args[1:])
+		case "external-unroute":
+			return runVPNExternalUnroute(args[1:])
 		}
 	}
 	return runVPNEnroll(args)

@@ -91,6 +91,7 @@ Commands:
                         an exit node. Enrolling never changes this machine's
                         default route; the two subcommands below do.
 %s
+%s
   unlink                Disconnect this machine from the control plane
   version               Print the client version
 
@@ -138,5 +139,5 @@ Flags (vpn):
 
 unlink also stops and uninstalls the background service (launchd/systemd),
 if one was installed.
-`, vpnExitUsage, defaultControlPlane)
+`, vpnExitUsage, vpnExternalUsage, defaultControlPlane)
 }
