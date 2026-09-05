@@ -77,6 +77,14 @@ func isolateState(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
+	// The synthesized config lives in /etc/wireguard in production (see
+	// ExternalTunnelDir for the AppArmor measurement that forces it). A test
+	// must never write there on the machine running `go test`, so the
+	// directory is redirected — and restored, so the test that asserts the
+	// production value still sees the real one.
+	original := externalTunnelDir
+	externalTunnelDir = filepath.Join(dir, "etc-wireguard")
+	t.Cleanup(func() { externalTunnelDir = original })
 	return dir
 }
 
@@ -698,17 +706,51 @@ func TestNothingButTheConfigEverCarriesThePrivateKey(t *testing.T) {
 	}
 }
 
-// The synthesized file is 0600 and lives in a 0700 directory of this tool's
-// own, never /etc/wireguard — a generated profile must not land where
-// something else scans for tunnels to auto-start.
-func TestTheSynthesizedConfigIsPrivate(t *testing.T) {
-	home := isolateState(t)
+// THE TEST THAT WOULD HAVE CAUGHT BLOCKER A — and the one that used to assert
+// the bug.
+//
+// This test previously required the config NOT to be under /etc/, which is
+// exactly what made `external-up` fail 100% of the time on the production
+// host: Ubuntu 24.04 ships an AppArmor profile attached to /usr/bin/wg-quick
+// whose only permitted configuration location is /etc/wireguard/**, so
+// wg-quick could not read a config written anywhere else and died with
+// "Permission denied" on a file it was running as root. See ExternalTunnelDir
+// for the audit line.
+//
+// A green test asserting the wrong invariant is worse than no test, so the
+// assertion is inverted rather than deleted: the location is now pinned, with
+// the reason attached to it.
+func TestTheSynthesizedConfigLivesWhereWgQuickIsPermittedToReadIt(t *testing.T) {
+	// The PRODUCTION value, read before isolateState redirects it.
+	if externalTunnelDir != "/etc/wireguard" {
+		t.Fatalf("synthesized configs go to %q; AppArmor on Ubuntu 24.04 permits wg-quick to read configuration only under /etc/wireguard, so anywhere else cannot be dialled at all", externalTunnelDir)
+	}
+	dir, err := ExternalTunnelDir()
+	if err != nil {
+		t.Fatalf("dir: %v", err)
+	}
 	path, err := ExternalTunnelConfPath("wg0")
 	if err != nil {
 		t.Fatalf("path: %v", err)
 	}
-	if !strings.HasPrefix(path, filepath.Join(home, ".aw-remote-host")) || strings.Contains(path, "/etc/") {
-		t.Fatalf("config path is %q", path)
+	if dir != "/etc/wireguard" || path != "/etc/wireguard/wg0.conf" {
+		t.Fatalf("dir=%q path=%q", dir, path)
+	}
+	// The basename still has to be <iface>.conf: wg-quick derives the
+	// interface name from it, and `wg-quick down <iface>` by bare name — the
+	// form the AppArmor profile is written for — only resolves that way.
+	if filepath.Base(path) != "wg0.conf" {
+		t.Fatalf("basename %q would give wg-quick the wrong interface name", filepath.Base(path))
+	}
+}
+
+// Being in /etc/wireguard does not make it public: the file still holds a
+// private key, so it stays 0600 inside a 0700 directory.
+func TestTheSynthesizedConfigIsStillPrivate(t *testing.T) {
+	isolateState(t)
+	path, err := ExternalTunnelConfPath("wg0")
+	if err != nil {
+		t.Fatalf("path: %v", err)
 	}
 	conf, err := synthesizeWireGuard(mustProfile(t), "wg0")
 	if err != nil {

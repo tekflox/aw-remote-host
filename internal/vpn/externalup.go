@@ -80,7 +80,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tekflox/aw-remote-host/internal/homedir"
 	"github.com/tekflox/aw-remote-host/internal/state"
 )
 
@@ -419,16 +418,52 @@ func assertNoExecutableDirective(conf string) error {
 	return nil
 }
 
-// ExternalTunnelDir is where synthesized configs live: 0700, under this tool's
-// own state directory, never /etc/wireguard. A private directory keeps the
-// generated file away from anything that scans for profiles to auto-start.
+// ExternalTunnelDir is /etc/wireguard, and it is the ONLY directory this can
+// be — not a preference, and not where this file used to put it.
+//
+// MEASURED 2026-09-05 on the production host, after `external-up` failed 100%
+// of the time with a message that named neither the cause nor anything true:
+//
+//	$ /usr/bin/wg-quick up /home/aw-remote-host/.aw-remote-host/vpn/x.conf
+//	/usr/bin/wg-quick: line 40: <conf>: Permission denied
+//	$ /bin/bash /usr/bin/wg-quick up <same conf>     # works
+//
+// Same file, same root, same everything — and the kernel audit log says why:
+//
+//	apparmor="DENIED" operation="open" profile="wg-quick"
+//	  name="/tmp/.../x.conf" requested_mask="r" denied_mask="r" fsuid=0 ouid=0
+//
+// Ubuntu 24.04 ships a Canonical AppArmor profile attached BY PATH to
+// /usr/bin/wg-quick, and the only configuration it grants is
+// `file rw @{etc_rw}/wireguard/{,**}`. Because AppArmor attaches on the
+// executed binary's path, running it through its own shebang confines it and
+// the read of a config anywhere else is denied; running `bash
+// /usr/bin/wg-quick` execs /bin/bash instead, matches no profile, and escapes
+// the confinement entirely. A byte-identical COPY of wg-quick at another path
+// also works via its own shebang — which is what proves the discriminant is
+// the path and not the file.
+//
+// So there were two ways out and only one of them is honest. Invoking through
+// an explicit interpreter would work, but it deliberately defeats a
+// distribution security control, and it would quietly weaken the property that
+// lookupExternalBinary resolves a real absolute path. Writing the config where
+// the policy already permits it works WITH that control, needs no interpreter
+// trick, and behaves identically on hosts that have no AppArmor at all.
+//
+// The comment that used to be here said the opposite — "never /etc/wireguard"
+// — reasoning that a generated profile should not land where something might
+// scan for tunnels to auto-start. That concern is real but much smaller than
+// it sounded: wg-quick@<iface> only starts an interface a human explicitly
+// enabled, there is no start-everything unit, and the file stays 0600 in a
+// 0700 directory. It was not worth a feature that cannot dial at all.
 func ExternalTunnelDir() (string, error) {
-	home, err := homedir.Dir()
-	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
-	}
-	return filepath.Join(home, ".aw-remote-host", "vpn"), nil
+	return externalTunnelDir, nil
 }
+
+// externalTunnelDir is a var so a test can point it at a temp dir; production
+// never changes it. Nothing else may: the path is load-bearing security
+// policy, not configuration — see ExternalTunnelDir.
+var externalTunnelDir = "/etc/wireguard"
 
 // ExternalTunnelConfPath is the absolute path of one interface's synthesized
 // config. wg-quick takes a path with a '/' in it and derives the interface

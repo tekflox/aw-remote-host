@@ -593,3 +593,79 @@ func TestPriorityDoesNotCollideWithTailscaleOrTheHub(t *testing.T) {
 		t.Fatalf("priority %d is after the main table lookup", ExternalRoutePriority)
 	}
 }
+
+// hostEgressForTest is the address the fixtures report as this machine's own.
+// withStubbedHostEgress pins it so the confirmation can be exercised without a
+// live HTTPS round trip to measure a public IP.
+const hostEgressForTest = "65.109.66.88"
+
+func withStubbedHostEgress(t *testing.T) {
+	t.Helper()
+	original := hostPublicIP
+	hostPublicIP = func(context.Context) (Egress, error) {
+		return Egress{IP: hostEgressForTest, Via: "test"}, nil
+	}
+	t.Cleanup(func() { hostPublicIP = original })
+}
+
+// BLOCKER B's signature, as a test — the failure that cost hours against a
+// live tunnel because every route on this side is correct.
+//
+// MEASURED both ways on 2026-09-05 (see CryptokeyRoutingHint): with the peer's
+// AllowedIPs covering our tunnel address, a routed container's public IP
+// changed with policy routing ALONE and no SNAT of ours. With the AllowedIPs
+// narrowed so it does NOT cover us, the routing is byte-for-byte identical,
+// `ip route get` still picks the tunnel, and the container's egress simply
+// dies.
+//
+// Two things must hold, and this asserts both: the apply is NOT confirmed
+// (so it reverts rather than leaving a container black-holed), and the reason
+// names the far end instead of sending the reader back through their own
+// routes.
+func TestEgressThatDidNotMoveIsUnconfirmedAndBlamesTheFarEnd(t *testing.T) {
+	withStubbedHostEgress(t)
+	plan := planOn(t, healthyHost())
+
+	// The probe answers with the SAME address as before: routing installed,
+	// nothing moved. This is what a peer rejecting our source looks like from
+	// here when the packets are dropped after a successful handshake.
+	r := healthyHost()
+	r.answers["docker run --rm --network container:"] = "AW_EGRESS https://1.1.1.1/cdn-cgi/trace 65.109.66.88\n"
+
+	got := externalConfirmOnce(context.Background(), r, *plan, externalConfirmSpec{
+		hostBefore:      hostEgressForTest,
+		containerBefore: "65.109.66.88",
+	})
+	if got.ok {
+		t.Fatal("an apply whose container egress never changed was CONFIRMED — it would leave the rule installed with traffic black-holed")
+	}
+	if !strings.Contains(got.reason, "nothing moved") {
+		t.Fatalf("reason does not state the symptom: %s", got.reason)
+	}
+	if !strings.Contains(got.reason, "AllowedIPs") {
+		t.Fatalf("reason does not name the measured cause, so the next person re-derives it from scratch: %s", got.reason)
+	}
+}
+
+// The same hint has to reach the OTHER shape of this failure: a probe that
+// times out entirely rather than returning the old address. Against the live
+// hub that is what actually happened — the container's curl returned nothing
+// at all — so a hint attached only to the "unchanged" branch would have missed
+// the real run.
+func TestAnEgressThatCannotBeMeasuredAlsoBlamesTheFarEnd(t *testing.T) {
+	withStubbedHostEgress(t)
+	plan := planOn(t, healthyHost())
+	r := healthyHost()
+	r.errs = map[string]error{"docker run --rm --network container:": fmt.Errorf("exit status 28")}
+
+	got := externalConfirmOnce(context.Background(), r, *plan, externalConfirmSpec{
+		hostBefore:      hostEgressForTest,
+		containerBefore: "65.109.66.88",
+	})
+	if got.ok {
+		t.Fatal("an unmeasurable egress was confirmed")
+	}
+	if !strings.Contains(got.reason, "AllowedIPs") {
+		t.Fatalf("the timeout branch does not carry the cause: %s", got.reason)
+	}
+}

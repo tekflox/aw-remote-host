@@ -1050,6 +1050,28 @@ func routeInstalled(ctx context.Context, r Runner, plan ExternalRoutePlan, prefi
 	return false, nil
 }
 
+// CryptokeyRoutingHint is appended to the two confirmation failures that share
+// one measured cause, so an operator is told it instead of rediscovering it.
+//
+// MEASURED 2026-09-05 against the live hub, both directions:
+//
+//   - peer AllowedIPs 10.8.0.12/32 (matching our tunnel address): the routed
+//     container's public IP changed 65.109.66.88 -> 24.90.8.255 with policy
+//     routing ALONE. No SNAT rule of ours was needed or added — the container
+//     network's own masquerade already rewrites the source to the tunnel
+//     address on the way out, which is what makes a single-/32 peer work.
+//   - peer AllowedIPs 10.8.0.99/32 (NOT matching): identical routing,
+//     `ip route get` still picks the tunnel, and the container's egress goes
+//     dead — the tunnel carrying 92/180 bytes, handshake only.
+//
+// The second is indistinguishable from a routing fault by looking at routes,
+// which is exactly why it costs hours: everything on this side is correct and
+// the far end is silently discarding the packets. WireGuard's cryptokey
+// routing drops any inbound packet whose SOURCE is outside the AllowedIPs of
+// the peer it decrypted from, and a commercial provider (NordLynx included)
+// hands out a single /32 just as this deployment's hub does.
+const CryptokeyRoutingHint = " The routing on this side is correct, so the likeliest cause is the FAR END: WireGuard drops any packet whose source address is outside the AllowedIPs the peer has registered for this client. Check that the provider's peer entry for this profile covers the address in the profile's `address` field."
+
 // --- confirmation -----------------------------------------------------------
 
 type externalConfirmSpec struct {
@@ -1092,7 +1114,10 @@ func externalConfirmOnce(ctx context.Context, r Runner, plan ExternalRoutePlan, 
 	// The host's address is checked FIRST and a move short-circuits the rest:
 	// a container egress that looks right is meaningless if the machine came
 	// with it.
-	host, err := PublicIP(ctx)
+	// hostPublicIP rather than PublicIP directly, for the reason its own
+	// comment gives: it is a live HTTPS round trip, and the confirmation logic
+	// has to be testable without one.
+	host, err := hostPublicIP(ctx)
 	if err != nil {
 		c.reason = fmt.Sprintf("this host's own public IP could not be re-measured (%v), so it cannot be proven the machine stayed put", err)
 		return c
@@ -1108,7 +1133,7 @@ func externalConfirmOnce(ctx context.Context, r Runner, plan ExternalRoutePlan, 
 	got := measureNetnsEgress(ctx, r, plan.Runtime, plan.ContainerID)
 	c.containerAfter = got.IP
 	if got.IP == "" {
-		c.reason = fmt.Sprintf("the container's egress could not be measured through the new route (%s)", got.Error)
+		c.reason = fmt.Sprintf("the container's egress could not be measured through the new route (%s).%s", got.Error, CryptokeyRoutingHint)
 		return c
 	}
 	if spec.expected != "" {
@@ -1120,7 +1145,7 @@ func externalConfirmOnce(ctx context.Context, r Runner, plan ExternalRoutePlan, 
 		return c
 	}
 	if spec.containerBefore != "" && got.IP == spec.containerBefore {
-		c.reason = fmt.Sprintf("the container is still leaving via %s — the rule is installed but nothing moved", got.IP)
+		c.reason = fmt.Sprintf("the container is still leaving via %s — the rule is installed but nothing moved.%s", got.IP, CryptokeyRoutingHint)
 		return c
 	}
 	c.ok = true
