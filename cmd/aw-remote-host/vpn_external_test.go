@@ -125,6 +125,53 @@ func TestExternalSubcommandsAreRoutedFromVPN(t *testing.T) {
 	}
 }
 
+// THE COMMAND LINE THE WORKSPACE CORE ACTUALLY SENDS, character for
+// character, from src/vpn/dialer.py's connect():
+//
+//	aw-remote-host vpn external-route --container <name> --json
+//
+// There was a test for external-up's flags and none for this one, and that is
+// exactly where the two repos drifted: this command took the container
+// positionally, core sent it as `--container`, and every Connect from the
+// screen died on `flag provided but not defined: -container` — but only AFTER
+// external-up had already dialled the tunnel, so the failure left an interface
+// up carrying nothing. Measured live 2026-09-05 against v0.1.80.
+//
+// --plan is what makes this safe to run anywhere: it resolves and prints and
+// changes nothing. The control plane is an IP LITERAL so no DNS is needed.
+// Whatever the plan then decides about a container that does not exist is not
+// this test's business — the assertion is narrowly that ARGUMENT PARSING
+// accepted the shape core sends.
+func TestExternalRouteAcceptsTheCommandLineTheWorkspaceCoreSends(t *testing.T) {
+	const notAFlagError = "flag provided but not defined"
+	for _, args := range [][]string{
+		// core's form
+		{"--container", "aw-remote-host-workspace", "--json", "--plan",
+			"--control-plane", "198.51.100.7"},
+		// the human's form, which must keep working
+		{"aw-remote-host-workspace", "--json", "--plan",
+			"--control-plane", "198.51.100.7"},
+	} {
+		err := runVPNExternalRoute(args)
+		if err != nil && strings.Contains(err.Error(), notAFlagError) {
+			t.Fatalf("the command line %v was rejected by argument parsing: %v", args, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "usage: aw-remote-host vpn external-route") {
+			t.Fatalf("the container named in %v never reached the plan: %v", args, err)
+		}
+	}
+}
+
+// Two containers named at once is refused, not silently resolved. This command
+// moves a container's egress; quietly preferring one of two names moves a
+// workload the caller never mentioned.
+func TestExternalRouteRefusesTwoDifferentContainers(t *testing.T) {
+	err := runVPNExternalRoute([]string{"one", "--container", "two", "--plan"})
+	if err == nil || !strings.Contains(err.Error(), "refusing to guess") {
+		t.Fatalf("naming two different containers was not refused: %v", err)
+	}
+}
+
 // The usage block and the flags it describes live in the same file so they
 // cannot drift; this is the assertion that they did not.
 func TestUsageDocumentsEveryExternalSubcommand(t *testing.T) {

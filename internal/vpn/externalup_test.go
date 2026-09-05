@@ -891,3 +891,46 @@ func TestNoHandshakeWithAKeepaliveBlamesThePeerNotTheProfile(t *testing.T) {
 		t.Fatalf("the reason does not distinguish itself from the keepalive limitation: %s", c.reason)
 	}
 }
+
+// A TEARDOWN THAT LEAVES THE DEAD-MAN'S SWITCH BEHIND is a status screen that
+// keeps reporting a switch nobody armed.
+//
+// The state this covers is the COMMON one, not an edge case: a dial that never
+// confirmed leaves an armed switch and NO tunnel record — so ExternalDown
+// takes its "nothing was recorded" fallback path. That path used to return
+// before reaching Disarm, while the recorded path disarmed correctly. The net
+// effect was that `vpn external-down` — the command
+// ExternalStatusReport.Describe tells an operator to run to tidy exactly this
+// up — could not tidy it up. Found live on 2026-09-05 against v0.1.80, on a
+// leftover from a dial that had failed inside wg-quick.
+func TestATeardownWithNothingRecordedStillStandsTheDeadManDown(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+
+	// PID 0 is a record whose process is long gone — which is what an expired
+	// switch looks like. Disarm must still remove the RECORD.
+	if err := saveDeadman(&Deadman{
+		PID:       0,
+		ArmedAt:   "2026-09-05T18:10:46Z",
+		ExpiresAt: "2026-09-05T18:12:46Z",
+		ExitNode:  "external tunnel wg0 (example:51820)",
+	}); err != nil {
+		t.Fatalf("plant the leftover: %v", err)
+	}
+
+	res, err := ExternalDown(context.Background(), ExternalUpSpec{Runner: upHost()}, nil)
+	if err != nil {
+		t.Fatalf("external-down: %v", err)
+	}
+	if !strings.Contains(res.Warning, "no tunnel was recorded") {
+		t.Fatalf("this test is no longer exercising the fallback path: %q", res.Warning)
+	}
+
+	d, err := LoadDeadman()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if d != nil {
+		t.Fatalf("external-down left a dead-man's switch record behind (expires_at %q) — external-status will keep reporting a switch nobody armed, and the command that is supposed to tidy this up is the one that just ran", d.ExpiresAt)
+	}
+}

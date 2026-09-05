@@ -1398,6 +1398,18 @@ func ExternalDown(ctx context.Context, spec ExternalUpSpec, progress Progress) (
 		if _, err := runner.Run(ctx, "wg-quick", "down", fallback.ConfPath); err != nil {
 			progress.emit("info", "no interface %s was up (nothing to take down)", fallback.Iface)
 		}
+		// The dead-man is stood down HERE TOO, and not only on the recorded
+		// path below. "Nothing is recorded" is not the rare case for a leftover
+		// switch — it is the NORMAL one: a dial that never confirmed leaves an
+		// armed switch and no tunnel record at all, which is precisely the
+		// state ExternalStatus.Describe tells an operator to fix by running
+		// this command. Without this, that instruction was a dead end: the
+		// record survived every teardown and external-status kept reporting a
+		// deadman_expires_at nobody had armed. Found live 2026-09-05 on a
+		// leftover from a dial that failed at wg-quick.
+		if _, err := Disarm(); err != nil {
+			progress.emit("warning", "the teardown ran but a dead-man's switch could not be stood down (%v). It will fire harmlessly.", err)
+		}
 		res.Reverted = true
 		return res, nil
 	}

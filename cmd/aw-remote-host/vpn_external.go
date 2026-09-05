@@ -163,8 +163,23 @@ func runVPNExternalDown(args []string) error {
 // That gap is why this exists: the workspace drives this host through the exec
 // bridge, which runs commands, so an engine reachable only as a link verb was
 // unreachable from the thing that needs it.
+//
+// THE CONTAINER MAY BE GIVEN EITHER WAY, and that is not a style choice. The
+// positional form is what a human types and what `vpn use-exit` established;
+// `--container` is what the workspace core has ALWAYS sent
+// (src/vpn/dialer.py's connect()), and until now this command rejected it —
+// `flag provided but not defined: -container`, after external-up had already
+// brought the tunnel up. So every Connect from the screen dialled a tunnel and
+// then failed to route anything through it, leaving an interface up that
+// carried no traffic. Measured live 2026-09-05 against v0.1.80, the first time
+// the two halves ran end to end.
+//
+// Accepting both is the direction that cannot break the other side: the shape
+// the deployed core already sends starts working, and every existing caller of
+// the positional form is untouched.
 func runVPNExternalRoute(args []string) error {
 	fs := flag.NewFlagSet("vpn external-route", flag.ContinueOnError)
+	container := fs.String("container", "", "the container to route, as an alternative to giving it positionally — this is the form the workspace core sends")
 	controlPlane := fs.String("control-plane", defaultControlPlane, "control plane base URL — its addresses are held outside the tunnel")
 	table := fs.Int("table", 0, "routing table carrying the tunnel's default (default 200)")
 	priority := fs.Int("priority", 0, "ip rule priority (default 5399)")
@@ -187,8 +202,18 @@ func runVPNExternalRoute(args []string) error {
 	if wanted == "" && fs.NArg() == 1 {
 		wanted = fs.Arg(0)
 	}
+	// Both forms given and disagreeing is refused rather than resolved by a
+	// precedence rule nobody would remember: this command moves a container's
+	// egress, and picking the wrong one of two named containers moves a
+	// workload the caller never mentioned.
+	if wanted != "" && *container != "" && wanted != *container {
+		return fmt.Errorf("two different containers were named: %q positionally and %q via --container — refusing to guess which one you meant to move", wanted, *container)
+	}
+	if wanted == "" {
+		wanted = *container
+	}
 	if wanted == "" || fs.NArg() > 1 {
-		return fmt.Errorf("usage: aw-remote-host vpn external-route <container> [flags] — <container> is a name or id as THIS host's runtime knows it")
+		return fmt.Errorf("usage: aw-remote-host vpn external-route <container> [flags] (or --container <container>) — <container> is a name or id as THIS host's runtime knows it")
 	}
 
 	spec := vpn.ExternalRouteSpec{
