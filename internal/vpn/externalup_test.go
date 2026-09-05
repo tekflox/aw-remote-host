@@ -64,6 +64,8 @@ func withFakeBinaries(t *testing.T) {
 			return "/usr/bin/wg", nil
 		case "wg-quick":
 			return "/usr/bin/wg-quick", nil
+		case "rm":
+			return "/bin/rm", nil
 		}
 		return "", fmt.Errorf("not found")
 	}
@@ -579,7 +581,7 @@ func TestRevertRemovesTheDefaultBeforeTheConnectedRoutes(t *testing.T) {
 	plan := planUpOn(t, r, mustProfile(t))
 
 	after := &tableRunner{answers: r.answers}
-	if err := revertExternalUp(context.Background(), after, *plan, nil); err != nil {
+	if _, err := revertExternalUp(context.Background(), after, *plan, nil); err != nil {
 		t.Fatalf("revert: %v", err)
 	}
 	defaultAt := callIndex(after, "ip route del default dev wg0 table 200")
@@ -959,7 +961,7 @@ func TestATeardownDoesNotFailOverARouteSomethingElseAlreadyRemoved(t *testing.T)
 	alreadyGone.errs = map[string]error{
 		"ip route del": fmt.Errorf("exit status 2"),
 	}
-	if err := revertExternalUp(context.Background(), alreadyGone, *plan, nil); err != nil {
+	if _, err := revertExternalUp(context.Background(), alreadyGone, *plan, nil); err != nil {
 		t.Fatalf("a teardown of a table something else had already emptied reported failure: %v", err)
 	}
 	if !alreadyGone.ran("wg-quick down") {
@@ -972,7 +974,104 @@ func TestATeardownDoesNotFailOverARouteSomethingElseAlreadyRemoved(t *testing.T)
 	stuck.errs = map[string]error{
 		"ip route del default": fmt.Errorf("exit status 2"),
 	}
-	if err := revertExternalUp(context.Background(), stuck, *plan, nil); err == nil {
+	if _, err := revertExternalUp(context.Background(), stuck, *plan, nil); err == nil {
 		t.Fatal("a route that is still in the table and still will not come out was reported as a clean teardown")
+	}
+}
+
+// A TUNNEL THAT IS DOWN MUST LEAVE NO KEY ON DISK.
+//
+// The synthesized config is 0600 and holds a private key, and it is
+// regenerated from the stored profile on every dial — so there is no recovery
+// argument for keeping it, and every second it survives its own tunnel is a
+// second a key sits somewhere nobody is looking. On 2026-09-05 a redaction
+// slip on this card leaked one and a live peer had to be rotated.
+func TestATeardownLeavesNoPrivateKeyOnDisk(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	plan := planUpOn(t, upHost(), mustProfile(t))
+
+	if err := writeExternalConf(plan.ConfPath, "[Interface]\nPrivateKey = not-a-real-key\n"); err != nil {
+		t.Fatalf("stage the config: %v", err)
+	}
+	warning, err := revertExternalUp(context.Background(), upHost(), *plan, nil)
+	if err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	if warning != "" {
+		t.Fatalf("a clean removal produced a warning: %q", warning)
+	}
+	if _, statErr := os.Stat(plan.ConfPath); !os.IsNotExist(statErr) {
+		t.Fatalf("the teardown left the synthesized config at %s — it holds a private key", plan.ConfPath)
+	}
+}
+
+// Running the teardown twice is not an error: the goal is the ABSENCE of the
+// file, and a caller who already achieved it has not failed.
+func TestATeardownWithNoConfigToRemoveIsNotAFailure(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	plan := planUpOn(t, upHost(), mustProfile(t))
+
+	warning, err := revertExternalUp(context.Background(), upHost(), *plan, nil)
+	if err != nil || warning != "" {
+		t.Fatalf("an already-absent config was treated as a problem: warning=%q err=%v", warning, err)
+	}
+}
+
+// A config that could not be deleted is a WARNING, never an error.
+//
+// Both halves matter and they pull in opposite directions. It must be
+// surfaced, because a private key still on disk is exactly what someone needs
+// told. It must NOT fail the teardown, because the routing and the interface
+// are already gone — the tunnel IS down, and reporting failure over a leftover
+// file would be the same lie ("a teardown that succeeded reporting failure")
+// that HTTP 502 on a clean host already cost this card once.
+func TestAConfigThatCannotBeDeletedWarnsAndDoesNotFailTheTeardown(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	plan := planUpOn(t, upHost(), mustProfile(t))
+
+	// A non-empty DIRECTORY where the config should be: os.Remove refuses it,
+	// which is a real removal failure rather than a stubbed one.
+	if err := os.MkdirAll(filepath.Join(plan.ConfPath, "occupied"), 0o700); err != nil {
+		t.Fatalf("stage the undeletable config: %v", err)
+	}
+
+	warning, err := revertExternalUp(context.Background(), upHost(), *plan, nil)
+	if err != nil {
+		t.Fatalf("a leftover config failed the whole teardown, which is the lie this card already paid for once: %v", err)
+	}
+	if warning == "" {
+		t.Fatal("a config that could not be deleted was swallowed — nothing would tell anyone a private key is still on disk")
+	}
+	for _, want := range []string{plan.ConfPath, "PRIVATE KEY"} {
+		if !strings.Contains(warning, want) {
+			t.Fatalf("the warning does not say %q, so it cannot be acted on: %s", want, warning)
+		}
+	}
+}
+
+// THE DEAD-MAN'S PATH IS THE ONE THAT MOST NEEDS THIS, because it is the one
+// nobody watches: it fires unattended, on a dial that was never confirmed, so
+// without this line a reverted tunnel would be the case that reliably left a
+// key behind. The absolute path is asserted for the reason the whole script
+// uses absolute paths — it runs with whatever PATH it inherits.
+func TestTheDeadManAlsoRemovesTheConfigItLeavesBehind(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	plan := planUpOn(t, upHost(), mustProfile(t))
+
+	script := externalUpRevertScript(PrivilegedRunner{Inner: upHost(), Sudo: true}, *plan)
+	if !strings.Contains(script, "/bin/rm -f "+plan.ConfPath) {
+		t.Fatalf("the dead-man's revert leaves the private key on disk:\n%s", script)
+	}
+	// It has to come AFTER wg-quick, which reads the file it is deleting.
+	if strings.Index(script, "/bin/rm -f") < strings.Index(script, "wg-quick down") {
+		t.Fatalf("the config is deleted before wg-quick reads it:\n%s", script)
+	}
+	// The only reporting channel this script has is the log it already writes.
+	if !strings.Contains(script, "PRIVATE KEY") {
+		t.Fatalf("a failed removal would be silent in the dead-man's log:\n%s", script)
 	}
 }

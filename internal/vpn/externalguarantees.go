@@ -96,6 +96,21 @@ func newExternalGuarantees(inForce, killSwitch bool) ExternalGuarantees {
 	return g
 }
 
+// appendWarning adds one sentence to a warnings list, skipping the empty
+// string so callers do not each have to guard.
+//
+// It exists because the teardown's warning is produced by a function that
+// usually has nothing to say ("" is the normal return of revertExternalUp),
+// and every call site would otherwise repeat the same `if warning != ""`. One
+// of them eventually would not — the sibling defect on this card was exactly
+// one branch missing a call the others made.
+func appendWarning(warnings []string, warning string) []string {
+	if warning == "" {
+		return warnings
+	}
+	return append(OrEmptyStrings(warnings), warning)
+}
+
 // OrEmptyStrings keeps a nil slice marshalling as `[]` rather than `null`.
 //
 // Needed because a plan rebuilt from state.json (loadExternalRouteState) has

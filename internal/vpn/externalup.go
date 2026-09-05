@@ -70,6 +70,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -488,6 +489,31 @@ func writeExternalConf(path, conf string) error {
 	return nil
 }
 
+// removeExternalConf deletes the synthesized config once its tunnel is down.
+//
+// A TUNNEL THAT IS DOWN MUST LEAVE NO KEY ON DISK. This file is 0600 and it
+// holds a private key, and after `wg-quick down` there is nothing left that
+// reads it — it is synthesized from the stored profile on every dial, so
+// keeping it buys no recovery and only widens the window in which a key sits
+// somewhere nobody is looking. On 2026-09-05 a redaction slip on this very
+// card leaked one and a live peer had to be rotated; that is the cost this
+// removes.
+//
+// os.Remove, not a shellout, for symmetry with writeExternalConf: the same
+// process wrote this file, so the same process can delete it, and routing the
+// delete through a privileged runner would introduce a second permission model
+// for one path.
+//
+// Already gone is SUCCESS, not an error — same rule the route teardown
+// follows. The goal is the absence of the file, and a caller who ran teardown
+// twice has achieved it.
+func removeExternalConf(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove %s: %w", path, err)
+	}
+	return nil
+}
+
 // --- plan --------------------------------------------------------------------
 
 // ConnectedRoute is one directly-attached network, discovered from the live
@@ -592,6 +618,11 @@ type ExternalUpPlan struct {
 	wgQuickPath string
 	ipPath      string
 	wgPath      string
+	// rmPath is resolved for the same reason and under the same rule, and it
+	// is not a network tool: the dead-man's script deletes the synthesized
+	// config, which holds a private key, and a bare `rm` there would depend on
+	// the PATH of a machine whose network has just gone.
+	rmPath string
 }
 
 // pinPlan is an ExternalRoutePlan carrying exactly the three fields
@@ -697,10 +728,10 @@ func PlanExternalUp(ctx context.Context, spec ExternalUpSpec) (*ExternalUpPlan, 
 	for _, bin := range []struct {
 		name string
 		into *string
-	}{{"ip", &plan.ipPath}, {"wg", &plan.wgPath}, {"wg-quick", &plan.wgQuickPath}} {
+	}{{"ip", &plan.ipPath}, {"wg", &plan.wgPath}, {"wg-quick", &plan.wgQuickPath}, {"rm", &plan.rmPath}} {
 		path, err := lookupExternalBinary(bin.name)
 		if err != nil || path == "" {
-			plan.Refusal = fmt.Sprintf("this host has no usable `%s` command, so it cannot bring a WireGuard tunnel up (the aw-remote-host image carries iproute2 and wireguard-tools; a host missing them was never rebuilt)", bin.name)
+			plan.Refusal = fmt.Sprintf("this host has no usable `%s` command, so it cannot bring a WireGuard tunnel up (the aw-remote-host image carries iproute2, wireguard-tools and coreutils; a host missing them was never rebuilt)", bin.name)
 			return plan, nil
 		}
 		*bin.into = path
@@ -1071,7 +1102,9 @@ func ExternalUp(ctx context.Context, spec ExternalUpSpec, progress Progress) (Ex
 	progress.emit("info", "dead-man's switch ARMED (pid %d) — this tunnel tears itself down and table %d is flushed at %s unless this run confirms it", armed.PID, plan.Table, armed.ExpiresAt)
 
 	if err := applyExternalUp(ctx, runner, *plan); err != nil {
-		res.Reverted, res.DeadmanStillArmed = revertExternalUpAfterFailure(ctx, runner, *plan, progress)
+		var warning string
+		res.Reverted, res.DeadmanStillArmed, warning = revertExternalUpAfterFailure(ctx, runner, *plan, progress)
+		res.Plan.Warnings = appendWarning(res.Plan.Warnings, warning)
 		return res, err
 	}
 
@@ -1085,7 +1118,9 @@ func ExternalUp(ctx context.Context, spec ExternalUpSpec, progress Progress) (Ex
 			progress.emit("error", "REVERTING — THIS MACHINE'S OWN EGRESS MOVED. That is a failed apply regardless of what the tunnel is doing, and it is the exact failure this path was built to make impossible.")
 		}
 		progress.emit("warning", "REVERTING — a tunnel that cannot be confirmed is the failure this sequence exists to prevent, not a partial success.")
-		if err := revertExternalUp(ctx, runner, *plan, progress); err != nil {
+		warning, err := revertExternalUp(ctx, runner, *plan, progress)
+		res.Plan.Warnings = appendWarning(res.Plan.Warnings, warning)
+		if err != nil {
 			res.DeadmanStillArmed = true
 			progress.emit("error", "the revert itself FAILED (%v). The dead-man's switch is still armed and fires at %s; leaving it armed on purpose.", err, armed.ExpiresAt)
 			return res, fmt.Errorf("the tunnel could not be confirmed and the revert failed: %s", confirm.reason)
@@ -1179,7 +1214,7 @@ func tunnelDevicePresent(ctx context.Context, r Runner, plan ExternalUpPlan) boo
 // The DEFAULT comes out FIRST, and the order is the mirror of the apply's for
 // the same reason: if removing the connected routes then fails, the container
 // is already off the tunnel rather than on it with half its local fabric gone.
-func revertExternalUp(ctx context.Context, r Runner, plan ExternalUpPlan, progress Progress) error {
+func revertExternalUp(ctx context.Context, r Runner, plan ExternalUpPlan, progress Progress) (string, error) {
 	var firstErr error
 	dels := plan.tableArgs("del")
 	// tableArgs is ordered for the apply; the revert walks it backwards, which
@@ -1223,21 +1258,48 @@ func revertExternalUp(ctx context.Context, r Runner, plan ExternalUpPlan, progre
 	if _, err := r.Run(ctx, "wg-quick", "down", plan.ConfPath); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("could not take the tunnel %s down: %w", plan.Iface, err)
 	}
-	if firstErr == nil {
-		progress.emit("info", "tunnel %s is down and table %d no longer carries its default", plan.Iface, plan.Table)
+
+	// THE CONFIG GOES LAST, and it goes on EVERY path through here — this is
+	// the one seam all three teardowns share (a failed dial, a failed
+	// confirmation, and a deliberate external-down), so none of them can be the
+	// one that forgets. That mattered: the sibling defect on this card was
+	// exactly a Disarm call present on one branch and missing on another.
+	//
+	// Last, because `wg-quick down` above READS this file to know what to tear
+	// down. Deleting it first would break the teardown to tidy up after it.
+	//
+	// A failure here is a WARNING, not an error, and the distinction is the
+	// whole lesson of the defect fixed one commit ago. The routing and the
+	// interface are already gone; the tunnel IS down. Returning an error would
+	// make Disconnect report failure over a leftover file, which is the same
+	// lie — a teardown that succeeded reporting failure — in a new place. So it
+	// is surfaced as a sentence that reaches the screen instead, because a
+	// private key that could not be deleted is precisely what someone needs
+	// told.
+	warning := ""
+	if err := removeExternalConf(plan.ConfPath); err != nil {
+		warning = fmt.Sprintf(
+			"The tunnel is down but its synthesized config could NOT be deleted from %s (%v). That file is 0600 and it holds this profile's PRIVATE KEY, so it should not be left behind — remove it by hand, and treat the key as exposed if you cannot.",
+			plan.ConfPath, err)
+		progress.emit("warning", "%s", warning)
 	}
-	return firstErr
+
+	if firstErr == nil {
+		progress.emit("info", "tunnel %s is down, table %d no longer carries its default, and the synthesized config is gone", plan.Iface, plan.Table)
+	}
+	return warning, firstErr
 }
 
-func revertExternalUpAfterFailure(ctx context.Context, r Runner, plan ExternalUpPlan, progress Progress) (reverted, stillArmed bool) {
-	if err := revertExternalUp(ctx, r, plan, progress); err != nil {
+func revertExternalUpAfterFailure(ctx context.Context, r Runner, plan ExternalUpPlan, progress Progress) (bool, bool, string) {
+	warning, err := revertExternalUp(ctx, r, plan, progress)
+	if err != nil {
 		progress.emit("error", "cleanup after a failed dial did not complete (%v) — leaving the dead-man's switch armed on purpose", err)
-		return false, true
+		return false, true, warning
 	}
 	if _, err := Disarm(); err != nil {
-		return true, true
+		return true, true, warning
 	}
-	return true, false
+	return true, false, warning
 }
 
 // externalUpRevertScript is the shell the dead-man's switch runs (invariant 4).
@@ -1261,7 +1323,25 @@ func externalUpRevertScript(r Runner, plan ExternalUpPlan) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s%s down %s || true\n", prefix, plan.wgQuickPath, plan.ConfPath)
 	fmt.Fprintf(&b, "%s%s route del default dev %s table %d || true\n", prefix, plan.ipPath, plan.Iface, plan.Table)
-	fmt.Fprintf(&b, "%s%s route flush table %d || true", prefix, plan.ipPath, plan.Table)
+	fmt.Fprintf(&b, "%s%s route flush table %d || true\n", prefix, plan.ipPath, plan.Table)
+	// THE CONFIG GOES HERE TOO, and this is the path that most needs it.
+	//
+	// A dead-man fire is an UNATTENDED teardown: nobody is reading a result
+	// object, and by definition it happens when the dial was never confirmed —
+	// so a reverted tunnel would otherwise be the one case that reliably left a
+	// private key on disk, with no one watching. The whole point of arming this
+	// is that it leaves the machine as it found it, and a key on disk is not
+	// that.
+	//
+	// `rm -f` after `wg-quick down`, for the same ordering reason ExternalDown
+	// has: wg-quick reads this file. `-f` because a config already gone is the
+	// goal, not a failure — and this script must never exit non-zero on a
+	// machine whose network has just disappeared. The verification line after
+	// it is the only reporting channel available here: this script cannot call
+	// this binary and has nowhere to put a structured warning, so it says so in
+	// the log the switch already writes.
+	fmt.Fprintf(&b, "%s%s -f %s || echo \"WARNING: %s could NOT be deleted — it holds a PRIVATE KEY, remove it by hand and treat the key as exposed\" || true",
+		prefix, plan.rmPath, plan.ConfPath, plan.ConfPath)
 	return b.String()
 }
 
@@ -1426,6 +1506,18 @@ func ExternalDown(ctx context.Context, spec ExternalUpSpec, progress Progress) (
 		if _, err := runner.Run(ctx, "wg-quick", "down", fallback.ConfPath); err != nil {
 			progress.emit("info", "no interface %s was up (nothing to take down)", fallback.Iface)
 		}
+		// This path does its own teardown rather than going through
+		// revertExternalUp, so it needs the config removal spelled out again —
+		// and it is the path where a leftover is MOST likely, because it is
+		// reached exactly when a dial failed and left a config with no record
+		// to match it. Already-absent is success, so the common case is silent.
+		if err := removeExternalConf(fallback.ConfPath); err != nil {
+			w := fmt.Sprintf(
+				"The teardown ran but the synthesized config could NOT be deleted from %s (%v). That file is 0600 and it holds a PRIVATE KEY — remove it by hand, and treat the key as exposed if you cannot.",
+				fallback.ConfPath, err)
+			res.Plan.Warnings = appendWarning(res.Plan.Warnings, w)
+			progress.emit("warning", "%s", w)
+		}
 		// The dead-man is stood down HERE TOO, and not only on the recorded
 		// path below. "Nothing is recorded" is not the rare case for a leftover
 		// switch — it is the NORMAL one: a dial that never confirmed leaves an
@@ -1443,7 +1535,9 @@ func ExternalDown(ctx context.Context, spec ExternalUpSpec, progress Progress) (
 	}
 
 	res := ExternalUpResult{Plan: *plan}
-	if err := revertExternalUp(ctx, runner, *plan, progress); err != nil {
+	warning, err := revertExternalUp(ctx, runner, *plan, progress)
+	res.Plan.Warnings = appendWarning(res.Plan.Warnings, warning)
+	if err != nil {
 		return res, err
 	}
 	res.Reverted = true
@@ -1543,5 +1637,6 @@ func loadExternalTunnelPlan() (*ExternalUpPlan, error) {
 	plan.ipPath, _ = lookupExternalBinary("ip")
 	plan.wgQuickPath, _ = lookupExternalBinary("wg-quick")
 	plan.wgPath, _ = lookupExternalBinary("wg")
+	plan.rmPath, _ = lookupExternalBinary("rm")
 	return plan, nil
 }
