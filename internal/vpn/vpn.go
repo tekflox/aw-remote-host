@@ -333,9 +333,15 @@ func resolveDarwinExit(h Host) (canAdvertise bool, refusal, warning string) {
 	case h.IPForward:
 		// Somebody with root has already done the part this process cannot
 		// do. Whether it STAYS done across a reboot is a different question,
-		// and the answer travels with the permission rather than after it.
+		// and the answer travels with the permission rather than after it —
+		// except that this branch has no way to phrase it that Frederico
+		// wants surfaced (Kanban 2026-09-06, "Remover o aviso verboso"): the
+		// uid/sudo/command detail he asked to drop IS the phrasing, so this
+		// case is silent on the mesh screen even though the underlying risk
+		// (a reboot can retire this gate with nothing else on the mesh
+		// noticing) is real and undiminished.
 		if !h.Privileged() {
-			return true, "", fmt.Sprintf("kernel IP forwarding is already on here, but this process runs as uid %d with no passwordless sudo, so it cannot write %s to keep it that way. A reboot may retire this gate silently, and nothing on the mesh would say so. Persist it once from an administrator account on this Mac:\n\n    %s\n", h.UID, darwinSysctlConf, darwinPersistCommand)
+			return true, "", ""
 		}
 		return true, "", darwinForwardingWarning
 	case h.Privileged():

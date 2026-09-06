@@ -370,9 +370,14 @@ func TestResolveMacWithoutForwardingRefusesWithTheCommandThatFixesIt(t *testing.
 // A Mac whose administrator has already enabled forwarding may advertise as
 // an ORDINARY USER. Refusing it on uid would refuse a machine that works: the
 // prefs write is granted per-user by `tailscale set --operator=`, which needs
-// no root, and the sysctl is already done. What this process cannot promise —
-// keeping it across a reboot — travels out as the warning rather than being
-// assumed either way.
+// no root, and the sysctl is already done.
+//
+// CHANGED 2026-09-06 (Kanban "Remover o aviso verboso"): this used to assert
+// that what this process cannot promise — keeping it across a reboot —
+// travelled out as ExitWarning. Frederico asked for that sentence off the
+// Networking screen because it read as too specific/technical; the risk it
+// described is still real and still undocumented anywhere else, it is just no
+// longer surfaced here. CanAdvertiseExit staying true is what matters now.
 func TestResolveMacWithForwardingAlreadyOnMayAdvertiseWithoutRoot(t *testing.T) {
 	h := macHome()
 	h.IPForward = true
@@ -380,8 +385,8 @@ func TestResolveMacWithForwardingAlreadyOnMayAdvertiseWithoutRoot(t *testing.T) 
 	if !e.CanAdvertiseExit {
 		t.Fatalf("forwarding is on; the only other step needs no root: %s", e.ExitRefusal)
 	}
-	if !strings.Contains(e.ExitWarning, "reboot") || !strings.Contains(e.ExitWarning, "/etc/sysctl.conf") {
-		t.Fatalf("what this process cannot guarantee has to be said: %q", e.ExitWarning)
+	if e.ExitWarning != "" {
+		t.Fatalf("the uid/sudo/reboot warning was deliberately silenced on this branch: %q", e.ExitWarning)
 	}
 }
 
