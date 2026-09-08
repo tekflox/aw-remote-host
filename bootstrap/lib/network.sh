@@ -7,10 +7,12 @@
 # to inline the same `podman network exists || podman network create`, and all
 # three were equally broken by the problem below.
 
-# podmanMajor prints podman's major version, or nothing if it can't be read.
-podman_major() {
-  podman --version 2>/dev/null | awk '{print $3}' | cut -d. -f1
-}
+# podman_major moved to podman_version.sh when the version FLOOR needed it
+# too — one probe, one place. Resolved from this file's own directory
+# because the three install.sh that source this one do so under two
+# different variable names ($SCRIPT_DIR and $NETWORK_LIB_DIR).
+# shellcheck source=./podman_version.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/podman_version.sh"
 
 # repair_cni_config_version rewrites `"cniVersion": "1.0.0"` down to "0.4.0"
 # in every CNI conflist on this host, but ONLY on a podman older than 4.

@@ -47,4 +47,29 @@ if [ ! -S "$sock" ]; then
   exit 1
 fi
 
+# install.sh guarantees the graphroot is pinned under $HOME on a rootful
+# host; per runner.go's invariant that guarantee is unreachable unless this
+# file checks it too. It is not cosmetic: $HOME is the only path on the
+# aw-remote-host volume, so an unpinned graphroot puts every container and
+# image on the outer container's writable layer, where the next recreate
+# erases them — the 2026-09-02 postgres/redis data-loss incident. Until now
+# only the socket check above happened to stand in the way of re-arming it.
+# See bootstrap/lib/podman_storage.sh.
+if [ "$(id -u)" = "0" ]; then
+  expected_graphroot="$HOME/.local/share/containers/storage"
+  actual_graphroot="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null || true)"
+  if [ "$actual_graphroot" != "$expected_graphroot" ]; then
+    echo "podman: graphroot is '$actual_graphroot', expected '$expected_graphroot' — containers would live on an ephemeral layer and be erased by the next recreate (see bootstrap/lib/podman_storage.sh)" >&2
+    exit 1
+  fi
+fi
+
+# The version floor, LAST: everything above is about podman working at all,
+# and those messages are more useful than a version complaint when podman is
+# simply broken. Conditional by design — see bootstrap/lib/podman_version.sh
+# for why an unconditional floor bricks every Debian 12 host.
+# shellcheck source=../lib/podman_version.sh
+source "$SCRIPT_DIR/../lib/podman_version.sh"
+assert_podman_version_floor
+
 echo "podman: healthy ($(podman --version)), API socket at $sock"

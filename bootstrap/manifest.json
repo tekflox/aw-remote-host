@@ -2,7 +2,7 @@
   "modules": [
     {
       "name": "podman",
-      "version": "4.x (distro-packaged)",
+      "version": "5.x wanted, distro-packaged (falls back to whatever the host offers — see bootstrap/lib/podman_version.sh)",
       "package": "podman",
       "verify_command": "bootstrap/podman/verify.sh"
     },

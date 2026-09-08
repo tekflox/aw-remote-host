@@ -122,6 +122,16 @@ install_podman_linux() {
 }
 
 ensure_cmd podman install_podman_linux
+# ensure_cmd no-ops the moment podman is on PATH at ANY version, so on a host
+# that already has an older podman it cannot be what moves it to the floor.
+# This can: it upgrades only when the package manager actually offers
+# something at or above PODMAN_MIN_MAJOR, and is a no-op everywhere else
+# (bookworm included). Without it, verify.sh's floor would fail, run an
+# install.sh that changes nothing, and fail again — bricking the module chain
+# rather than fixing it. See bootstrap/lib/podman_version.sh.
+# shellcheck source=../lib/podman_version.sh
+source "$SCRIPT_DIR/../lib/podman_version.sh"
+upgrade_podman_to_floor
 # Only a ROOTFUL host (id -u == 0) needs this — see podman_storage.sh for
 # why, and for the incident that made it necessary. Written BEFORE anything
 # below touches podman (the socket bring-up next, and every module after
