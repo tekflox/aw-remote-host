@@ -801,7 +801,12 @@ func PlanExternalUp(ctx context.Context, spec ExternalUpSpec) (*ExternalUpPlan, 
 	// asked one step earlier so the answer reaches the user before their
 	// egress moves rather than after.
 	_, killSwitch := planExternalExclusions(ctx, spec.ControlPlane)
-	plan.ExternalGuarantees = newExternalGuarantees(true, killSwitch)
+	// dnsTunneled is false here and that is not a rounding-down either: a dial
+	// brings a tunnel UP, and the resolver is moved by `vpn external-route`,
+	// which has not run yet. Reporting anything else at dial time would
+	// promise, before a single container is routed, a guarantee that only the
+	// route verb can deliver.
+	plan.ExternalGuarantees = newExternalGuarantees(true, killSwitch, false)
 	return plan, nil
 }
 

@@ -57,9 +57,16 @@ func egressMismatchWarning(expected, got string) string {
 		". Something else is routing this container's traffic — most likely a mesh exit gate (Settings -> Networking) picked after this VPN connected, which silently takes priority over this rule. Clear whichever was picked last, or run `aw-remote-host vpn external-unroute` and reconnect."
 }
 
-// DNSNotTunnelledWarning is shown whenever DNS is only partly tunnelled,
-// which on this deployment is always — see ExternalStatusReport.DNSTunneled
-// and planExternalExclusions for why, and the card for what closing it needs.
+// DNSNotTunnelledWarning is shown whenever DNS is only partly tunnelled.
+//
+// It used to be unconditional, because on this deployment it was always true.
+// It is now the honest answer for every path where the proof in
+// planTunnelDNS/applyTunnelDNS FAILS — a profile that carries no resolver, a
+// runtime that is not podman, a `podman network update` that did not take, a
+// name that would not resolve afterwards. It is deliberately NOT deleted: a
+// warning that only ever appeared is easy to mistake for a placeholder, but
+// the state it describes is still reachable and still the one a user most
+// needs told.
 const DNSNotTunnelledWarning = "DNS IS NOT FULLY TUNNELLED. Traffic goes through the VPN, but names looked up through this machine's local container resolver are still resolved outside it, so DNS queries can still reveal which sites are being visited. Only lookups sent directly to an external resolver travel inside the tunnel."
 
 // ExternalGuarantees is the honest summary carried by every surface that
@@ -71,9 +78,13 @@ const DNSNotTunnelledWarning = "DNS IS NOT FULLY TUNNELLED. Traffic goes through
 // never null, because a caller that has to handle both is a caller that will
 // handle one of them wrong.
 type ExternalGuarantees struct {
-	// DNSTunneled is false on this deployment. It is a field rather than a
-	// constant so that the day aardvark's upstream can be moved, exactly one
-	// place changes and every surface follows.
+	// DNSTunneled is true only when the local container resolver's OWN
+	// upstream has been moved onto the profile's resolver and every step of
+	// that was proven — see §4 of the design and applyTunnelDNS, which
+	// refuses to set it rather than claim it. It was a constant `false` until
+	// podman 5 made the upstream movable; this comment used to promise that
+	// "the day aardvark's upstream can be moved, exactly one place changes
+	// and every surface follows", and that day is what this field now carries.
 	DNSTunneled bool `json:"dns_tunneled"`
 	// KillSwitch is true IFF the control plane was pinned outside the tunnel.
 	KillSwitch bool `json:"kill_switch"`
@@ -90,9 +101,14 @@ type ExternalGuarantees struct {
 // and no route there is nothing to warn ABOUT, and warning anyway would put a
 // permanent scare on an idle screen — which is how a user learns that these
 // sentences are noise, and then misses the one that matters.
-func newExternalGuarantees(inForce, killSwitch bool) ExternalGuarantees {
+// dnsTunneled is passed in rather than assumed, for the same reason
+// killSwitch is: it is a MEASUREMENT, made by whoever is in a position to make
+// it, and a default here would be this file quietly deciding an answer it
+// cannot see. Every caller that cannot prove it passes false, which is the
+// state DNSNotTunnelledWarning describes.
+func newExternalGuarantees(inForce, killSwitch, dnsTunneled bool) ExternalGuarantees {
 	g := ExternalGuarantees{
-		DNSTunneled: false,
+		DNSTunneled: dnsTunneled,
 		KillSwitch:  killSwitch,
 		Warnings:    []string{},
 	}

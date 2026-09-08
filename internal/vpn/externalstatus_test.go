@@ -282,6 +282,15 @@ func TestDeadmanArmedIsMeasuredFromTheProcessNotTheRecord(t *testing.T) {
 // screen imply otherwise. Frederico's decision put DNS through the VPN, and
 // Layer 1 delivers that only for resolvers the container addresses directly —
 // see planExternalExclusions and ExternalStatusReport.DNSTunneled.
+//
+// STILL THE CORRECT ASSERTION after --tunnel-dns shipped, which is why this
+// was made conditional rather than deleted: the route recorded here carries no
+// DNS half at all (recordATunnelAndARoute records none), which is exactly what
+// a route applied WITHOUT --tunnel-dns looks like, and what every route
+// applied WITH it looks like when any of §4's proofs failed. The counterpart —
+// a recorded DNS half that is still measurably in force reporting true — is
+// TestStatusReportsDNSTunnelledOnlyWhenBothHalvesAreStillInForce in
+// externalroute_dns_test.go.
 func TestStatusIsHonestThatDNSIsNotFullyTunnelled(t *testing.T) {
 	isolateState(t)
 	recordATunnelAndARoute(t)

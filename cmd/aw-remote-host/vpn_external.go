@@ -181,6 +181,13 @@ func runVPNExternalRoute(args []string) error {
 	fs := flag.NewFlagSet("vpn external-route", flag.ContinueOnError)
 	container := fs.String("container", "", "the container to route, as an alternative to giving it positionally — this is the form the workspace core sends")
 	controlPlane := fs.String("control-plane", defaultControlPlane, "control plane base URL — its addresses are held outside the tunnel")
+	// --profile-json rather than a --dns flag, and that is a privacy decision
+	// rather than a style one: the file's PATH is all that reaches the exec
+	// command string, so the resolver address never lands in aw-backend's job
+	// log. It is the same value external-up is already given, so the caller
+	// computes nothing new.
+	profilePath := fs.String("profile-json", "", "path to the same 0600 profile JSON that `vpn external-up` was given. Only its dns field is read here, and only when --tunnel-dns is passed; the file's path is what reaches the command line, never its contents")
+	tunnelDNS := fs.Bool("tunnel-dns", false, "ALSO move the container network's resolver upstream onto the profile's own DNS, closing the leak where lookups sent to the local container resolver are forwarded from this host instead of through the tunnel. OFF by default because the change is network-wide: every container on the routed container's podman network resolves through the VPN's resolver while the tunnel is up. Needs --profile-json. If any part of it cannot be proven, the route is applied anyway and DNS is reported as not tunnelled")
 	table := fs.Int("table", 0, "routing table carrying the tunnel's default (default 200)")
 	priority := fs.Int("priority", 0, "ip rule priority (default 5399)")
 	expectEgress := fs.String("expect-egress", "", "the public IP the tunnel should present. Given, confirmation is an exact match; omitted, confirmation is that the container's address CHANGED and this host's did not")
@@ -225,6 +232,27 @@ func runVPNExternalRoute(args []string) error {
 		Deadman:        secondsFlag(*deadmanS),
 		ConfirmTimeout: secondsFlag(*confirmS),
 		ControlPlane:   *controlPlane,
+		TunnelDNS:      *tunnelDNS,
+	}
+	// The profile is loaded only for its resolvers, and ONLY when the caller
+	// asked to tunnel DNS. Reading it unconditionally would make a file this
+	// verb has never needed into a hard dependency of every route.
+	//
+	// A --tunnel-dns with no --profile-json is a REFUSAL rather than a silent
+	// downgrade to "route without touching DNS": the caller asked for a
+	// privacy guarantee, and quietly not providing it is the exact
+	// false-reassurance failure internal/vpn/externalguarantees.go exists to
+	// prevent. Every other way this can fail is discovered on the host, where
+	// downgrading IS right; this one is a malformed request.
+	if *tunnelDNS {
+		if strings.TrimSpace(*profilePath) == "" {
+			return fmt.Errorf("--tunnel-dns needs --profile-json: the resolver to point the container network at comes from the profile's `dns` field, and there is no other flag that carries it")
+		}
+		profile, _, err := vpn.LoadExternalProfile(*profilePath)
+		if err != nil {
+			return err
+		}
+		spec.DNS = profile.DNS
 	}
 	ctx := context.Background()
 
@@ -250,6 +278,14 @@ func runVPNExternalRoute(args []string) error {
 			resolved.Container, resolved.SourceIP, resolved.TunnelDev, resolved.Table, resolved.Priority)
 		for _, ex := range resolved.Exclusions {
 			fmt.Printf("vpn:   %s stays OUTSIDE the tunnel\n", ex)
+		}
+		if len(resolved.DNSServers) > 0 {
+			fmt.Printf("vpn: would ALSO point network %s's resolver upstream at %s, reached over a %s-table route into %s\n",
+				resolved.DNSNetwork, strings.Join(resolved.DNSServers, ", "), "main", resolved.TunnelDev)
+			fmt.Printf("vpn:   this affects EVERY container on %s, not only %s — aardvark's upstream is scoped to the network and has no per-container form\n", resolved.DNSNetwork, resolved.Container)
+			fmt.Printf("vpn:   the dead-man's switch would undo it with `%s network update %s --dns-drop ...`\n", resolved.DNSPodmanPath, resolved.DNSNetwork)
+		} else if *tunnelDNS {
+			fmt.Println("vpn: --tunnel-dns was asked for but could NOT be planned on this host (no usable resolver in the profile, a runtime that is not podman, a podman that could not be resolved to an absolute path, or a container on more than one network). The route would be applied and DNS reported as NOT tunnelled.")
 		}
 		fmt.Println("vpn: this MACHINE's own public IP would NOT change. That is asserted, not hoped for: a host whose address moved is a failed apply that reverts.")
 		return nil
@@ -521,6 +557,17 @@ var vpnExternalUsage = strings.Trim(`
                         switch and a confirmation of both halves. Refuses
                         anything wider than a single host address.
       --expect-egress   the public IP the tunnel should present (exact match)
+      --profile-json    the same profile file external-up was given; only its
+                        dns field is read, and only with --tunnel-dns
+      --tunnel-dns      ALSO move the container network's resolver upstream
+                        onto the profile's DNS, so lookups the container sends
+                        to the LOCAL container resolver stop being forwarded
+                        from this host. Off by default: the change is scoped
+                        to the podman network, so every container on it
+                        resolves through the VPN while the tunnel is up. The
+                        dead-man's switch reverts it. If any step cannot be
+                        proven the route still applies and DNS is reported as
+                        not tunnelled — never claimed.
       --table/--priority/--deadman-s/--confirm-s/--json/--plan
 
   vpn external-unroute  Remove the recorded rule and its exclusions.

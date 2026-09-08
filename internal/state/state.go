@@ -192,6 +192,25 @@ type ExternalRouteState struct {
 	// from — a mismatch is exactly what another mechanism silently taking
 	// this rule's traffic (a mesh exit gate, say) looks like from this side.
 	ExpectEgress string `json:"expect_egress,omitempty"`
+
+	// DNSServers / DNSNetwork / DNSPodmanPath describe the aardvark upstream
+	// this apply moved, when it moved one.
+	//
+	// They are persisted for the same reason Exclusions is: `external-unroute`
+	// and the reassert timer undo and re-check what was RECORDED, never what a
+	// fresh plan would compute. Re-planning would be actively wrong here —
+	// podman's absolute path or the container's network can both differ from
+	// what was true at apply time, and the undo would then drop an upstream on
+	// a network nobody touched while leaving the real one in place.
+	//
+	// No key material and no resolver policy beyond the addresses themselves,
+	// which are already carried in the profile this host was handed.
+	DNSServers    []string `json:"dns_servers,omitempty"`
+	DNSNetwork    string   `json:"dns_network,omitempty"`
+	DNSPodmanPath string   `json:"dns_podman_path,omitempty"`
+	// DNSPrior is what the network's upstream was BEFORE this apply, so the
+	// undo restores rather than merely empties.
+	DNSPrior []string `json:"dns_prior,omitempty"`
 }
 
 // DefaultPath returns ~/.aw-remote-host/state.json.

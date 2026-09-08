@@ -319,7 +319,7 @@ func TestApplyIsIdempotent(t *testing.T) {
 		"ip rule show":            "5399:\tfrom 172.18.0.4 lookup 200\n",
 		"ip route show table 200": "default via 10.8.0.2 dev wg0 \n185.12.64.1/32 via 65.109.66.65 dev enp41s0 onlink \n185.12.64.2/32 via 65.109.66.65 dev enp41s0 onlink \n",
 	}}
-	if err := applyExternalRoute(context.Background(), r, *plan); err != nil {
+	if _, err := applyExternalRoute(context.Background(), r, *plan, nil); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if r.ran("ip rule add") {

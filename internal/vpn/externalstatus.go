@@ -179,7 +179,15 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 			}
 		}
 	}
-	report.ExternalGuarantees = newExternalGuarantees(report.Up || report.RuleInstalled, killSwitch)
+	// DNS, MEASURED, on exactly the same principle as the kill switch above
+	// and for the same reason: both halves of it can go away silently. The
+	// main-table /32 is flushed by the same daily systemd-networkd restart
+	// Reassert exists for, and the aardvark upstream is rewritten by anything
+	// that reloads the network — and neither failure is loud. A status that
+	// replayed "dns_tunneled: true" from the record would be claiming a
+	// privacy guarantee that had already lapsed, which is the one lie this
+	// file exists to make impossible.
+	report.ExternalGuarantees = newExternalGuarantees(report.Up || report.RuleInstalled, killSwitch, measuredDNSTunneled(ctx, runner, route))
 
 	if d, err := LoadDeadman(); err == nil && d != nil {
 		expires := d.ExpiresAt
@@ -240,6 +248,36 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 	}
 
 	return report, nil
+}
+
+// measuredDNSTunneled asks the machine whether the resolver is STILL moved,
+// rather than whether an apply once moved it.
+//
+// Both halves have to hold, because either one missing reopens the leak in a
+// different way: without the aardvark upstream the queries go back out through
+// the host, and without the main-table /32 they are aimed into a table that
+// cannot reach the resolver at all. The second is the more dangerous of the
+// two and the reason this is not a single check — a flushed /32 leaves an
+// upstream that still LOOKS right in the config file while every container on
+// the network has lost external DNS.
+//
+// Deliberately cheap: two reads, no probe container, no round trip. This verb
+// is polled by a screen, and the end-to-end resolution check belongs to the
+// apply (§4.5), not to a poll that would run it every few seconds.
+func measuredDNSTunneled(ctx context.Context, r Runner, route *state.ExternalRouteState) bool {
+	if route == nil || len(route.DNSServers) == 0 || route.DNSNetwork == "" {
+		return false
+	}
+	upstreams := aardvarkUpstreams(ctx, r, route.DNSNetwork)
+	for _, dns := range route.DNSServers {
+		if !containsAddress(upstreams, dns) {
+			return false
+		}
+		if ok, err := dnsRouteInstalled(ctx, r, dns); err != nil || !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // expectedEgressMismatch reports the warning to append, or "" when there is
@@ -308,6 +346,7 @@ func (r ExternalStatusReport) Describe() []string {
 	}
 	if r.Up || r.RuleInstalled {
 		out = append(out, "kill switch: "+killSwitchWord(r.KillSwitch))
+		out = append(out, "DNS: "+dnsWord(r.DNSTunneled))
 	}
 	// The warnings are the sentences a person is meant to read, so they are
 	// printed verbatim rather than summarised into a word.
@@ -329,6 +368,17 @@ func installedWord(in bool) string {
 		return "INSTALLED"
 	}
 	return "NOT installed"
+}
+
+// dnsWord says which of the two states this is in one line. The false case
+// deliberately does not repeat DNSNotTunnelledWarning — that sentence is
+// printed verbatim by the warnings loop just below, and saying it twice is how
+// a reader learns to skip both.
+func dnsWord(ok bool) string {
+	if ok {
+		return "the container resolver's own upstream is inside the tunnel, so name lookups do not leave through this host"
+	}
+	return "NOT fully tunnelled"
 }
 
 func killSwitchWord(ok bool) string {

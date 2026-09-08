@@ -127,6 +127,29 @@ type ExternalRouteSpec struct {
 	// tunnel. Defaults to the daemon's own control plane.
 	ControlPlane string
 
+	// TunnelDNS asks for the local container resolver's OWN upstream to be
+	// moved onto DNS below, closing the leak this file's
+	// planExternalExclusions header documents as a known gap.
+	//
+	// It is OFF by default and the caller has to ask, because the change is
+	// NETWORK-WIDE by construction: aardvark's upstream is scoped to a podman
+	// network, `--dns-add` is the only knob, and every container on that
+	// network resolves through the new upstream while the tunnel is up. See
+	// §5 of the design. Defaulting it on would move 30 containers' resolvers
+	// on behalf of a caller that asked to route one.
+	//
+	// The kill switch lives on this flag rather than in the binary: rolling
+	// back is "stop passing --tunnel-dns", a core deploy, which is far faster
+	// than rebuilding and reinstalling this binary on the host.
+	TunnelDNS bool
+	// DNS is the profile's own resolver list, already IP-validated by
+	// ExternalProfile.validate. It arrives here from --profile-json rather
+	// than a --dns flag on purpose: the address then never appears in an exec
+	// command string, so aw-backend's job log stays exactly as clean as it is
+	// today. Empty means there is nothing to move the upstream TO, which is
+	// the first of §4's refusals.
+	DNS []string
+
 	// Runner is how every shellout is made. Required and never defaulted:
 	// this package cannot build one (the base shellout lives in internal/ops,
 	// which imports this package) and PrivilegedRunner's zero value has a nil
@@ -184,6 +207,34 @@ type ExternalRoutePlan struct {
 	// warning instead of a bare, unverified address.
 	ExpectEgress string `json:"expect_egress,omitempty"`
 
+	// --- the DNS half. All four are empty unless every PLAN-time
+	// precondition in §4 held; the APPLY-time ones are proven in
+	// applyTunnelDNS, which is the only thing that may set DNSTunneled. ---
+
+	// DNSServers are the profile's resolvers, to become the network's
+	// aardvark upstream. Empty means the DNS half is not being attempted at
+	// all, and every function below treats that as "there is nothing to do"
+	// rather than as a failure.
+	DNSServers []string `json:"dns_servers,omitempty"`
+	// DNSNetwork is the podman network carrying the routed container,
+	// RESOLVED from `podman inspect` rather than assumed to be a constant.
+	// Today it is the only network on this host; §9 of the design records
+	// that writing it as a constant is a door that closes the moment a
+	// second one appears.
+	DNSNetwork string `json:"dns_network,omitempty"`
+	// DNSPodmanPath is podman's ABSOLUTE path, resolved before anything is
+	// touched — the same rule ArmSpec.TailscalePath enforces, and here it is
+	// load-bearing rather than tidy: the dead-man's revert names this path,
+	// so a podman that cannot be resolved is a DNS change that cannot be
+	// undone, and one that must therefore not be made. That un-revertability
+	// is exactly what got the previous approach to this rejected.
+	DNSPodmanPath string `json:"dns_podman_path,omitempty"`
+	// DNSPrior is the network's upstream list BEFORE this apply, so a revert
+	// restores what was there instead of assuming it was empty. Today it is
+	// empty on this host; recording it is what keeps that from being an
+	// assumption baked into the undo.
+	DNSPrior []string `json:"dns_prior,omitempty"`
+
 	// Guarantees is what this apply can honestly promise — whether the kill
 	// switch is really there, whether DNS is really tunnelled, and the
 	// sentences to show when either is false. Embedded so `dns_tunneled`,
@@ -214,6 +265,109 @@ func (p ExternalRoutePlan) excludeArgs(verb, prefix string) []string {
 		args = append(args, "onlink")
 	}
 	return append(args, "table", strconv.Itoa(p.Table))
+}
+
+// dnsRouteArgs is the MAIN-table /32 that makes the resolver reachable at all,
+// and it is the non-obvious half of this whole feature.
+//
+// aardvark forwards from the HOST netns with the host's own source address, so
+// its queries are resolved against the MAIN table — which has no route into the
+// tunnel. Pointing `--dns-add` at an address the main table cannot reach does
+// not degrade DNS for the routed container, it BLACK-HOLES IT FOR EVERY
+// CONTAINER ON THE NETWORK — 30 of them here, including postgres, redis and the
+// MCP gateway. That is a far worse outcome than the leak being closed, and it is
+// the single most likely way a naive implementation breaks this host (§10).
+//
+// The prefix is a /32 to the resolver and nothing wider, so it moves the
+// resolver's traffic and not the machine's: `ExternalRoute`'s "host egress must
+// NOT change" confirmation still runs afterwards and would revert this whole
+// apply if it ever did.
+//
+// `onlink` for the same measured reason excludeArgs carries it: a WireGuard
+// device whose address is a /32 has no connected subnet containing the tunnel
+// gateway, and without onlink the kernel answers `Error: Nexthop has invalid
+// gateway.` and the route silently never installs.
+func (p ExternalRoutePlan) dnsRouteArgs(verb, dns string) []string {
+	args := []string{"route", verb, dns + "/32", "via", p.TunnelVia, "dev", p.TunnelDev}
+	if verb == "add" {
+		args = append(args, "onlink")
+	}
+	return args
+}
+
+// dnsUpdateArgs is the `podman network update` that moves the upstream.
+//
+// verb is "--dns-add" or "--dns-drop". Measured on the host 2026-09-08: both
+// take repeated flags, both exit 0, and a `--dns-drop` of an address that is
+// not there still exits 0 — which is what makes the dead-man's line safe to
+// run unconditionally.
+func (p ExternalRoutePlan) dnsUpdateArgs(verb string) []string {
+	args := []string{"network", "update", p.DNSNetwork}
+	for _, d := range p.DNSServers {
+		args = append(args, verb, d)
+	}
+	return args
+}
+
+// aardvarkConfigDir is where netavark writes the per-network aardvark config.
+// The UPSTREAM LIST IS THE FIRST LINE, alongside the bind address, and it is
+// comma-separated when there is more than one:
+//
+//	10.89.0.1 9.9.9.9,149.112.112.112
+//
+// so an assertion has to read line 1 and split on both — a `grep` over the
+// whole file would match a container's own A record further down and report
+// success for a change that never landed (§10).
+const aardvarkConfigDir = "/run/containers/networks/aardvark-dns"
+
+// aardvarkUpstreams reads the upstreams a network's aardvark is forwarding to
+// right now, as the kernel-visible truth rather than as podman's record of it.
+//
+// Absent file, unreadable file and empty list are all "no upstreams", never an
+// error: this is called on the reassert timer and from the status verb, and a
+// host that has never dialled must not produce a log full of failures.
+func aardvarkUpstreams(ctx context.Context, r Runner, network string) []string {
+	if network == "" {
+		return nil
+	}
+	out, err := r.Run(ctx, "cat", aardvarkConfigDir+"/"+network)
+	if err != nil {
+		return nil
+	}
+	line := firstLine(out)
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) < 2 {
+		// Field 0 is the bind address; a bare line means no upstream at all,
+		// which is this host's measured state today.
+		return nil
+	}
+	var out2 []string
+	for _, f := range fields[1:] {
+		for _, part := range strings.Split(f, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out2 = append(out2, part)
+			}
+		}
+	}
+	return out2
+}
+
+// aardvarkBindAddress is field 0 of that same first line — the address the
+// routed container actually sends its queries to. Used to prove §4.5 end to
+// end without hardcoding a gateway.
+func aardvarkBindAddress(ctx context.Context, r Runner, network string) string {
+	if network == "" {
+		return ""
+	}
+	out, err := r.Run(ctx, "cat", aardvarkConfigDir+"/"+network)
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(strings.TrimSpace(firstLine(out)))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }
 
 // ExternalRouteResult is what one apply measured, whether it worked or not.
@@ -325,12 +479,104 @@ func PlanExternalRoute(ctx context.Context, spec ExternalRouteSpec) (*ExternalRo
 
 	exclusions, killSwitch := planExternalExclusions(ctx, spec.ControlPlane)
 	plan.Exclusions = exclusions
+
+	// The DNS half's PLAN-time preconditions (§4.1 and §4.2). Failing any of
+	// them leaves the four fields empty, which every function below reads as
+	// "not attempted" — the route itself is unaffected, because a route that
+	// failed because DNS could not be tunnelled would regress behaviour that
+	// has shipped.
+	planTunnelDNS(ctx, runner, rt, spec, plan)
+
 	// A route that is about to be applied IS in force for the purposes of the
 	// warning: this plan is what the apply will do, and the warning has to
 	// reach the screen with the result rather than after somebody notices.
-	plan.ExternalGuarantees = newExternalGuarantees(true, killSwitch)
+	//
+	// dnsTunneled is FALSE here even when the DNS half is fully planned, and
+	// that is not a rounding-down. §4 says the flag may only be set once the
+	// APPLY-time proofs have passed, and a plan has by definition applied
+	// nothing — `--plan` changes no state, so on a plan the resolver has
+	// genuinely not moved. applyTunnelDNS is the only place it can become true.
+	plan.ExternalGuarantees = newExternalGuarantees(true, killSwitch, false)
 	return plan, nil
 }
+
+// planTunnelDNS resolves the DNS half, or leaves it unresolved.
+//
+// It NEVER sets plan.Refusal and never returns an error. That is the whole
+// posture of §4: any failure here means "route exactly as this host does
+// today, and keep saying DNS is not tunnelled" — the honest, already-shipped
+// behaviour — rather than "refuse to connect". The DNS leak is the thing
+// being fixed; failing to fix it must not become a worse bug than having it.
+func planTunnelDNS(ctx context.Context, r Runner, rt ContainerRuntime, spec ExternalRouteSpec, plan *ExternalRoutePlan) {
+	if !spec.TunnelDNS {
+		return
+	}
+	// §4.1 — a profile with no `DNS =` line has nothing to point aardvark at.
+	var servers []string
+	for _, d := range spec.DNS {
+		d = strings.TrimSpace(d)
+		// Re-validated here even though externalup.go:236 already did it. This
+		// value ends up inside a dead-man's shell script, and "somebody else
+		// checked" is not the standard for a string that reaches a script that
+		// runs unattended on a machine whose network has just gone.
+		if ip := net.ParseIP(d); ip != nil && ip.To4() != nil {
+			servers = append(servers, d)
+		}
+	}
+	if len(servers) == 0 {
+		return
+	}
+	// `podman network update` is podman-only — docker has no equivalent verb,
+	// so on a docker host the honest outcome is the warning, not an attempt.
+	if rt.Name != "podman" {
+		return
+	}
+	// §4.2 — the ABSOLUTE path, resolved BEFORE anything is touched. If it
+	// does not resolve, the change cannot be reverted by the dead-man, so it
+	// must not be made.
+	podmanPath, err := lookupExternalBinary(rt.Name)
+	if err != nil || podmanPath == "" {
+		return
+	}
+	network, err := resolveContainerNetwork(ctx, r, rt, plan.ContainerID)
+	if err != nil || network == "" {
+		return
+	}
+	plan.DNSServers = servers
+	plan.DNSNetwork = network
+	plan.DNSPodmanPath = podmanPath
+	plan.DNSPrior = aardvarkUpstreams(ctx, r, network)
+}
+
+// resolveContainerNetwork names the podman network whose aardvark upstream
+// this apply would move.
+//
+// It asks `inspect` rather than assuming `aw-remote-host`, because §9 records
+// that as the door this feature closes if it is written as a constant: today
+// there is exactly one network on this host, and the first day there are two,
+// a constant would point the change at the wrong one silently.
+//
+// More than one attachment is refused for the same reason resolveContainerSource
+// refuses it — this path moves ONE network's resolver, and picking one of
+// several would move the DNS of containers that have nothing to do with the
+// tunnel while leaving the routed container's own other network alone.
+func resolveContainerNetwork(ctx context.Context, r Runner, rt ContainerRuntime, containerID string) (string, error) {
+	const format = "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}"
+	out, err := r.Run(ctx, rt.Name, "inspect", "-f", format, containerID)
+	if err != nil {
+		return "", fmt.Errorf("could not resolve the podman network carrying %s (%s inspect: %v)", containerID, rt.Name, err)
+	}
+	names := strings.Fields(strings.TrimSpace(out))
+	switch len(names) {
+	case 0:
+		return "", fmt.Errorf("container %s reports no podman network, so there is no aardvark upstream to move", containerID)
+	case 1:
+		return names[0], nil
+	default:
+		return "", fmt.Errorf("container %s is attached to %d networks (%s) and this path moves exactly one network's resolver — refusing rather than picking one", containerID, len(names), strings.Join(names, ", "))
+	}
+}
+
 
 // ExternalRoute moves one container's egress onto the external tunnel, and
 // reverts if it cannot prove that worked.
@@ -373,8 +619,23 @@ func ExternalRoute(ctx context.Context, spec ExternalRouteSpec, progress Progres
 	}
 	// Loudly, and in the same stream as everything else that just happened.
 	// The kill switch going missing used to be completely silent.
+	//
+	// The DNS warning is held back when the DNS half is about to be ATTEMPTED:
+	// at plan time the verdict is genuinely not known yet (§4's proofs are all
+	// apply-time), and emitting "DNS IS NOT FULLY TUNNELLED" here and then
+	// reporting dns_tunneled:true in the same object would make the narration
+	// contradict the result. It is re-emitted below, after the apply, from
+	// what was actually proven.
+	dnsPending := len(plan.DNSServers) > 0
 	for _, w := range plan.Warnings {
+		if dnsPending && w == DNSNotTunnelledWarning {
+			continue
+		}
 		progress.emit("warning", "%s", w)
+	}
+	if dnsPending {
+		progress.emit("info", "DNS: will move network %s's resolver upstream to %s — this affects EVERY container on that network, not only %s, because aardvark's upstream is scoped to the network and there is no per-container form of it",
+			plan.DNSNetwork, strings.Join(plan.DNSServers, ", "), plan.Container)
 	}
 
 	// TWO baselines, and the host's is the one that is not optional: it is
@@ -409,9 +670,25 @@ func ExternalRoute(ctx context.Context, spec ExternalRouteSpec, progress Progres
 
 	// Exclusions BEFORE the rule, so there is no window in which the container
 	// is on the tunnel with its resolvers inside it.
-	if err := applyExternalRoute(ctx, runner, *plan); err != nil {
+	dnsTunneled, err := applyExternalRoute(ctx, runner, *plan, progress)
+	if err != nil {
 		res.Reverted, res.DeadmanStillArmed = revertExternalAfterFailure(ctx, runner, *plan, progress)
 		return res, err
+	}
+
+	// Rebuilt from what the apply PROVED rather than from what it planned.
+	// This is the one place DNSTunneled can become true, and it is downstream
+	// of every §4 check — a plan that intended to tunnel DNS and an apply that
+	// managed to are different facts, and only the second one may be reported.
+	plan.ExternalGuarantees = newExternalGuarantees(true, plan.KillSwitch, dnsTunneled)
+	res.Plan = *plan
+	if dnsPending {
+		if dnsTunneled {
+			progress.emit("info", "DNS: aardvark's upstream for network %s is now %s, reached through %s — the leak documented in planExternalExclusions is closed for every container on that network while this tunnel is up",
+				plan.DNSNetwork, strings.Join(plan.DNSServers, ", "), plan.TunnelDev)
+		} else {
+			progress.emit("warning", "%s", DNSNotTunnelledWarning)
+		}
 	}
 
 	progress.emit("info", "rule installed — confirming BOTH halves (up to %s): that the container's egress moved, and that this machine's did not...", spec.ConfirmTimeout)
@@ -602,6 +879,16 @@ func reassertPlan(ctx context.Context, r Runner, plan ExternalRoutePlan) (restor
 			}
 			restored = append(restored, "removed orphaned exclusion "+prefix)
 		}
+		// The resolver moved for this container's sake, so it comes back when
+		// the container does not exist any more. Leaving 30 containers pointed
+		// at a VPN resolver on behalf of a workload that is gone is the same
+		// orphan the rule above is, with a much wider blast radius.
+		if len(plan.DNSServers) > 0 {
+			if err := revertTunnelDNS(ctx, r, plan); err != nil {
+				return restored, nil, false, fmt.Errorf("container %s no longer resolves, and the orphaned DNS upstream on %s could not be dropped: %w", plan.Container, plan.DNSNetwork, err)
+			}
+			restored = append(restored, "dropped orphaned DNS upstream on "+plan.DNSNetwork+" ("+plan.Container+" no longer exists)")
+		}
 		return restored, nil, true, nil
 	}
 
@@ -649,6 +936,44 @@ func reassertPlan(ctx context.Context, r Runner, plan ExternalRoutePlan) (restor
 			return restored, updated, false, fmt.Errorf("could not re-assert the exclusion %s: %w", prefix, err)
 		}
 		restored = append(restored, "exclusion "+prefix)
+	}
+
+	// THE DNS HALF, re-checked on the same timer and for the same measured
+	// reason the rule is. Two things take it away without telling anyone: the
+	// daily unattended-apt flush that systemd-networkd does to the main-table
+	// /32, and anything that rewrites the network's config (a podman restart,
+	// a `network reload`) to the aardvark upstream. Neither breaks loudly —
+	// the first black-holes the resolver, the second silently reopens the leak
+	// this feature exists to close — so both are checked here rather than
+	// discovered later.
+	//
+	// Asserted on LINE 1 of the aardvark config, never on a grep over the
+	// file: the upstream list shares that line with the bind address, and the
+	// records below it can contain an address that would match a naive grep
+	// and report success for a change that never landed (§10).
+	if len(plan.DNSServers) > 0 {
+		for _, dns := range plan.DNSServers {
+			if ok, err := dnsRouteInstalled(ctx, r, dns); err != nil || ok {
+				continue
+			}
+			if _, err := r.Run(ctx, "ip", plan.dnsRouteArgs("add", dns)...); err != nil {
+				return restored, updated, false, fmt.Errorf("could not re-assert the main-table route to the tunnel resolver %s, without which every container on %s loses external DNS: %w", dns, plan.DNSNetwork, err)
+			}
+			restored = append(restored, "main-table route to resolver "+dns)
+		}
+		upstreams := aardvarkUpstreams(ctx, r, plan.DNSNetwork)
+		var missing []string
+		for _, dns := range plan.DNSServers {
+			if !containsAddress(upstreams, dns) {
+				missing = append(missing, dns)
+			}
+		}
+		if len(missing) > 0 {
+			if _, err := r.Run(ctx, plan.DNSPodmanPath, plan.dnsUpdateArgs("--dns-add")...); err != nil {
+				return restored, updated, false, fmt.Errorf("could not re-assert %s's aardvark upstream (%s): %w", plan.DNSNetwork, strings.Join(missing, ", "), err)
+			}
+			restored = append(restored, "aardvark upstream on "+plan.DNSNetwork+" ("+strings.Join(missing, ", ")+")")
+		}
 	}
 	return restored, updated, false, nil
 }
@@ -936,25 +1261,227 @@ func resolveControlPlaneIPs(ctx context.Context, base string) []string {
 
 // --- apply / revert ---------------------------------------------------------
 
-func applyExternalRoute(ctx context.Context, r Runner, plan ExternalRoutePlan) error {
+// applyExternalRoute installs the exclusions, then the rule, then — only if
+// both of those worked — attempts the DNS half.
+//
+// It returns whether DNS ended up tunnelled ALONGSIDE the error rather than
+// folding one into the other, because they are different kinds of outcome: an
+// error here means the ROUTE failed and everything reverts, while a false
+// dnsTunneled means the route is fine and DNS is exactly as leaky as it was
+// before this feature existed. Conflating them would make a failed DNS proof
+// tear down a working tunnel (§4).
+func applyExternalRoute(ctx context.Context, r Runner, plan ExternalRoutePlan, progress Progress) (dnsTunneled bool, err error) {
 	for _, prefix := range plan.Exclusions {
 		if ok, err := routeInstalled(ctx, r, plan, prefix); err == nil && ok {
 			continue
 		}
 		if _, err := r.Run(ctx, "ip", plan.excludeArgs("add", prefix)...); err != nil {
-			return fmt.Errorf("could not hold %s outside the tunnel, and routing the container without that would leave it without DNS: %w", prefix, err)
+			return false, fmt.Errorf("could not hold %s outside the tunnel, and routing the container without that would leave it without DNS: %w", prefix, err)
 		}
 	}
 	// Idempotent on purpose: `ip rule add` happily installs a duplicate, and a
 	// second identical rule is invisible in every symptom but impossible to
 	// remove with one `del`.
-	if ok, err := ruleInstalled(ctx, r, plan); err == nil && ok {
+	if ok, rerr := ruleInstalled(ctx, r, plan); rerr != nil || !ok {
+		if _, err := r.Run(ctx, "ip", plan.ruleArgs("add")...); err != nil {
+			return false, fmt.Errorf("could not install the routing policy rule for %s: %w", plan.SourceIP, err)
+		}
+	}
+	// ROUTE IN BEFORE RESOLVER (§10). The container has to be on the tunnel
+	// before its resolver is pointed down it, or there is a window where
+	// queries are aimed at an address the container's own route cannot reach.
+	return applyTunnelDNS(ctx, r, plan, progress), nil
+}
+
+// applyTunnelDNS proves §4.3, §4.4 and §4.5 in that order and moves the
+// network's aardvark upstream, or undoes its own half and reports false.
+//
+// Every failure path calls revertTunnelDNS and KEEPS THE ROUTE. That asymmetry
+// is the design's, and it is deliberate: the route was independently confirmed
+// and is the feature the user asked for, while tunnelled DNS is the gap being
+// closed. Killing a working tunnel because the gap could not be closed would
+// regress shipped behaviour to fix a leak.
+func applyTunnelDNS(ctx context.Context, r Runner, plan ExternalRoutePlan, progress Progress) bool {
+	if len(plan.DNSServers) == 0 {
+		return false
+	}
+	abandon := func(format string, args ...any) bool {
+		progress.emit("warning", "DNS was NOT tunnelled and has been left exactly as it was: "+format, args...)
+		if err := revertTunnelDNS(ctx, r, plan); err != nil {
+			// Loud, because this is the one DNS failure that can outlive the
+			// run: a half-applied upstream is what black-holes 30 containers.
+			// The dead-man is still armed at this point and its script carries
+			// the same drop, so the recovery exists — it just is not silent.
+			progress.emit("error", "backing the DNS change out did not fully complete (%v). The dead-man's switch still carries the same `--dns-drop`, and `%s network update %s --dns-drop %s` undoes it by hand.",
+				err, plan.DNSPodmanPath, plan.DNSNetwork, strings.Join(plan.DNSServers, " --dns-drop "))
+		}
+		return false
+	}
+
+	// §4.3 — the MAIN-table /32 first, and PROVEN, not assumed. Without it
+	// aardvark forwards from the host netns into a table with no route to the
+	// resolver and every container on the network loses external DNS.
+	for _, dns := range plan.DNSServers {
+		if ok, err := dnsRouteInstalled(ctx, r, dns); err != nil || !ok {
+			if _, err := r.Run(ctx, "ip", plan.dnsRouteArgs("add", dns)...); err != nil {
+				return abandon("the main-table route %s/32 via %s dev %s could not be installed (%v), and pointing the resolver at an address this host cannot reach would black-hole DNS for every container on network %s", dns, plan.TunnelVia, plan.TunnelDev, err, plan.DNSNetwork)
+			}
+		}
+		// `ip route get` is what proves the /32 actually won, rather than that
+		// the add command exited 0. A profile whose resolver is a PUBLIC one
+		// reachable over the main default is the case this catches: without
+		// the /32 taking effect its queries still resolve — so §4.5's
+		// end-to-end check would pass — while leaving the machine in the
+		// clear. That is the false reassurance externalguarantees.go exists to
+		// prevent, so the route is proven separately from the path.
+		dev, err := routeGetDevice(ctx, r, dns)
+		if err != nil {
+			return abandon("it could not be proven which device queries to %s would leave by (%v)", dns, err)
+		}
+		if dev != plan.TunnelDev {
+			return abandon("queries to %s would leave by %s, not the tunnel %s — sending them to a resolver in the clear is not tunnelled DNS, and reporting it as such would be worse than reporting the leak", dns, dev, plan.TunnelDev)
+		}
+	}
+
+	// §4.4 — move the upstream, and read back the file rather than trusting
+	// the exit code.
+	if _, err := r.Run(ctx, plan.DNSPodmanPath, plan.dnsUpdateArgs("--dns-add")...); err != nil {
+		return abandon("`podman network update %s --dns-add` failed (%v)", plan.DNSNetwork, err)
+	}
+	got := aardvarkUpstreams(ctx, r, plan.DNSNetwork)
+	for _, want := range plan.DNSServers {
+		if !containsAddress(got, want) {
+			return abandon("`podman network update` exited 0 but %s's aardvark upstream is %q, which does not carry %s", plan.DNSNetwork, strings.Join(got, ","), want)
+		}
+	}
+
+	// §4.5 — and finally the only check that proves the PATH rather than the
+	// configuration. CryptokeyRoutingHint's measured lesson is why this is not
+	// redundant with the route check above: a peer whose AllowedIPs does not
+	// cover our address gives a route that looks perfect and traffic that
+	// silently dies, and DNS would fail exactly that way.
+	if err := resolvesThroughTunnel(ctx, r, plan); err != nil {
+		return abandon("a name could not be resolved from inside %s after the change (%v).%s", plan.Container, err, CryptokeyRoutingHint)
+	}
+	return true
+}
+
+// revertTunnelDNS undoes the DNS half, RESOLVER OUT BEFORE ROUTE (§10).
+//
+// The drop goes first so there is never a moment where aardvark is still
+// pointed at an address whose route has already been withdrawn — that ordering
+// is the difference between a clean undo and the black hole this feature's
+// main risk is. Both halves are idempotent (a `--dns-drop` of an address that
+// is not configured exits 0; a missing route is checked before deleting), so
+// this is safe to call on a partial apply, on a full one, and twice.
+func revertTunnelDNS(ctx context.Context, r Runner, plan ExternalRoutePlan) error {
+	if len(plan.DNSServers) == 0 {
 		return nil
 	}
-	if _, err := r.Run(ctx, "ip", plan.ruleArgs("add")...); err != nil {
-		return fmt.Errorf("could not install the routing policy rule for %s: %w", plan.SourceIP, err)
+	var firstErr error
+	if plan.DNSPodmanPath != "" && plan.DNSNetwork != "" {
+		if _, err := r.Run(ctx, plan.DNSPodmanPath, plan.dnsUpdateArgs("--dns-drop")...); err != nil {
+			firstErr = fmt.Errorf("could not drop %s's aardvark upstream: %w", plan.DNSNetwork, err)
+		}
+		// Anything that was there BEFORE this apply goes back. Today this is
+		// empty on the production host, and recording it is precisely what
+		// keeps "it was empty" from being an assumption compiled into the undo.
+		for _, prior := range plan.DNSPrior {
+			if containsAddress(plan.DNSServers, prior) {
+				continue
+			}
+			if _, err := r.Run(ctx, plan.DNSPodmanPath, "network", "update", plan.DNSNetwork, "--dns-add", prior); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("could not restore %s's prior upstream %s: %w", plan.DNSNetwork, prior, err)
+			}
+		}
+	}
+	for _, dns := range plan.DNSServers {
+		if ok, err := dnsRouteInstalled(ctx, r, dns); err == nil && !ok {
+			continue
+		}
+		if _, err := r.Run(ctx, "ip", plan.dnsRouteArgs("del", dns)...); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("could not remove the main-table route for %s: %w", dns, err)
+		}
+	}
+	return firstErr
+}
+
+// dnsRouteInstalled asks whether the main-table /32 is there. `ip route show
+// <prefix>` prints the matching route or nothing at all, so emptiness is the
+// answer rather than an error.
+func dnsRouteInstalled(ctx context.Context, r Runner, dns string) (bool, error) {
+	out, err := r.Run(ctx, "ip", "route", "show", dns+"/32")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// routeGetDevice is the kernel's own answer to "which device would this
+// packet leave by", which is a different question from "is there a route" and
+// the only one worth asking here.
+func routeGetDevice(ctx context.Context, r Runner, dst string) (string, error) {
+	out, err := r.Run(ctx, "ip", "route", "get", dst)
+	if err != nil {
+		return "", err
+	}
+	f := strings.Fields(firstLine(out))
+	for i := 0; i < len(f)-1; i++ {
+		if f[i] == "dev" {
+			return f[i+1], nil
+		}
+	}
+	return "", fmt.Errorf("`ip route get %s` named no device: %q", dst, strings.TrimSpace(firstLine(out)))
+}
+
+// resolvesThroughTunnel proves a name actually resolves for the routed
+// container, by running a probe INSIDE that container's network namespace.
+//
+// `--network container:<id>` is the same mechanism measureNetnsEgress uses and
+// it works here for one measured reason: podman gives the probe the TARGET's
+// resolv.conf, so it asks the same aardvark on the same address the routed
+// container does. Verified on the host 2026-09-08 — the probe's
+// /etc/resolv.conf came back as the target's `nameserver 10.89.1.1`.
+//
+// The routed container itself is never required to contain a resolver tool,
+// which matters: on this deployment it is the workspace, and a check that
+// depended on what happens to be installed there would silently stop working
+// the day that image changes.
+func resolvesThroughTunnel(ctx context.Context, r Runner, plan ExternalRoutePlan) error {
+	args := []string{"run", "--rm", "--network", "container:" + plan.ContainerID,
+		"--entrypoint", "sh", ContainerProbeImage, "-c", dnsProbeScript()}
+	out, err := r.Run(ctx, plan.DNSPodmanPath, args...)
+	if err != nil {
+		return fmt.Errorf("the probe in %s's namespace failed: %v: %s", plan.Container, err, strings.TrimSpace(lastLine(out)))
+	}
+	if !strings.Contains(out, dnsProbeMarker) {
+		return fmt.Errorf("the probe ran but resolved nothing: %q", strings.TrimSpace(lastLine(out)))
 	}
 	return nil
+}
+
+// dnsProbeMarker is looked for instead of an exit code for the same reason
+// containerEgressScript emits its own: a probe that printed a resolver's
+// error page, or a busybox whose exit status disagrees with its output, would
+// otherwise be read as success.
+const dnsProbeMarker = "AW_DNS_OK"
+
+// dnsProbeScript tries two names rather than one so a single domain being
+// briefly unresolvable is not read as "the tunnel's resolver is broken".
+func dnsProbeScript() string {
+	return "for n in example.com cloudflare.com; do\n" +
+		"  if nslookup \"$n\" >/dev/null 2>&1; then echo \"" + dnsProbeMarker + " $n\"; exit 0; fi\n" +
+		"done\n" +
+		"echo AW_DNS_FAIL; exit 1\n"
+}
+
+func containsAddress(haystack []string, needle string) bool {
+	for _, h := range haystack {
+		if h == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // revertExternalRoute removes the rule FIRST. Order matters for the same
@@ -963,6 +1490,14 @@ func applyExternalRoute(ctx context.Context, r Runner, plan ExternalRoutePlan) e
 // gone.
 func revertExternalRoute(ctx context.Context, r Runner, plan ExternalRoutePlan, progress Progress) error {
 	var firstErr error
+	// RESOLVER OUT BEFORE ROUTE (§10), which is why this is above the rule
+	// removal and not below it. Taking the tunnel away from under an aardvark
+	// still forwarding into it is the black hole; taking the resolver back
+	// first leaves the network resolving exactly as it did before the apply,
+	// whatever happens to the rest of this function.
+	if err := revertTunnelDNS(ctx, r, plan); err != nil {
+		firstErr = err
+	}
 	// Loop rather than a single del: a flush-and-reassert race can leave two
 	// identical rules, and one `del` would remove only one of them.
 	for i := 0; i < 8; i++ {
@@ -1011,6 +1546,28 @@ func externalRevertScript(r Runner, plan ExternalRoutePlan) string {
 		prefix = strings.TrimSuffix(p.CommandPrefix("ip"), "ip")
 	}
 	var b strings.Builder
+	// THE DNS LINES GO FIRST, and this ordering is the whole reason the DNS
+	// change was allowed to be made at all.
+	//
+	// An un-revertable DNS change is precisely what got the aardvark-config
+	// approach rejected on the predecessor card; what podman 5 changed is that
+	// the undo is now a CLI verb a POSIX-sh script can call by absolute path,
+	// exactly the shape as deadman.go's own `tailscale set --exit-node=` line.
+	// So the fire path leaves 30 containers resolving the way they did before
+	// this run, and it does that before it touches the route — resolver out
+	// before route, the same order revertTunnelDNS uses, for the same reason.
+	//
+	// `--dns-drop` of an address that is not configured exits 0 (measured
+	// 2026-09-08), so this line is safe on a run that never got as far as
+	// adding it. The absolute path is plan.DNSPodmanPath, resolved at plan
+	// time — a bare `podman` here would depend on the PATH of a machine whose
+	// network has just gone.
+	if len(plan.DNSServers) > 0 && plan.DNSPodmanPath != "" && plan.DNSNetwork != "" {
+		fmt.Fprintf(&b, "%s%s %s || true\n", prefix, plan.DNSPodmanPath, strings.Join(plan.dnsUpdateArgs("--dns-drop"), " "))
+		for _, dns := range plan.DNSServers {
+			fmt.Fprintf(&b, "%sip %s || true\n", prefix, strings.Join(plan.dnsRouteArgs("del", dns), " "))
+		}
+	}
 	fmt.Fprintf(&b, "%sip %s || true\n", prefix, strings.Join(plan.ruleArgs("del"), " "))
 	for _, ex := range plan.Exclusions {
 		fmt.Fprintf(&b, "%sip %s || true\n", prefix, strings.Join(plan.excludeArgs("del", ex), " "))
@@ -1217,6 +1774,11 @@ func saveExternalRouteState(plan ExternalRoutePlan) error {
 			Exclusions:   plan.Exclusions,
 			RoutedAt:     time.Now().UTC().Format(time.RFC3339),
 			ExpectEgress: plan.ExpectEgress,
+
+			DNSServers:    plan.DNSServers,
+			DNSNetwork:    plan.DNSNetwork,
+			DNSPodmanPath: plan.DNSPodmanPath,
+			DNSPrior:      plan.DNSPrior,
 		}
 	})
 }
@@ -1268,5 +1830,10 @@ func loadExternalRouteState() (*ExternalRoutePlan, error) {
 		MainDev:      e.MainDev,
 		Exclusions:   e.Exclusions,
 		ExpectEgress: e.ExpectEgress,
+
+		DNSServers:    e.DNSServers,
+		DNSNetwork:    e.DNSNetwork,
+		DNSPodmanPath: e.DNSPodmanPath,
+		DNSPrior:      e.DNSPrior,
 	}, nil
 }
