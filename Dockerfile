@@ -31,10 +31,23 @@ RUN CGO_ENABLED=0 go build \
 # etc.) are bash scripts that shell out to `sudo apt-get install podman` on
 # Linux — they expect a real distro with apt + sudo + bash, not a minimal
 # Alpine/busybox image. Debian slim gives them what they need.
-FROM debian:bookworm-slim
+#
+# WHY trixie AND NOT bookworm: podman is NOT baked into this image —
+# bootstrap/podman/install.sh runs `apt-get install -y podman` against
+# whatever suite this base offers, so the podman version this host runs is a
+# property of THIS LINE. bookworm offers only 4.3.1; trixie offers 5.4.2,
+# which is where `podman network update` arrives — the verb the external-VPN
+# dialer needs to redirect a RUNNING container's resolver instead of having
+# to recreate it. Measured 2026-09-08: bookworm-backports ships no podman
+# package at all, Kubic's Debian_12 suite ships an OLDER 3.4.2, and pinning
+# trixie's .deb into bookworm needs libc6 >= 2.38 against bookworm's 2.36 —
+# a glibc bump plus the whole 64-bit-time_t transition, i.e. a distro upgrade
+# in place. The base image is the only lever. See
+# docs/runbooks/podman-5-upgrade-aw-remote-host.md.
+FROM debian:trixie-slim
 
 # procps/psmisc/file are not needed to boot — they are needed to *diagnose*
-# this host, and their absence has cost real time. bookworm-slim ships no ps,
+# this host, and their absence has cost real time. Debian slim ships no ps,
 # pkill or pgrep at all, so on 2026-08-20 a zombie-process investigation here
 # had to find the aw-remote-host pid by walking /proc/*/exe by hand, and an
 # earlier `ps -eo stat,comm | grep -c defunct` printed a reassuring "0" that
@@ -78,9 +91,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # `tailscale` brings a systemd unit along with the binaries. Nothing starts it
 # and nothing can; it is inert, and removing it would be a change to an
 # upstream package for no gain.
-RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg \
+RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
       > /usr/share/keyrings/tailscale-archive-keyring.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian bookworm main" \
+    echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian trixie main" \
       > /etc/apt/sources.list.d/tailscale.list && \
     apt-get update && apt-get install -y --no-install-recommends tailscale && \
     rm -rf /var/lib/apt/lists/*
