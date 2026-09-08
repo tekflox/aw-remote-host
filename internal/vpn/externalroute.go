@@ -538,6 +538,31 @@ func planTunnelDNS(ctx context.Context, r Runner, rt ContainerRuntime, spec Exte
 	if err != nil || podmanPath == "" {
 		return
 	}
+	// A resolver that is ALSO how this host measures its own public IP cannot
+	// be tunnelled by this mechanism, and the collision is not hypothetical:
+	// the only profile configured on this deployment today has DNS = 1.1.1.1,
+	// and egressEndpoints[0] is `https://1.1.1.1/cdn-cgi/trace` — the FIRST
+	// endpoint PublicIP tries, an IP literal on purpose so a broken resolver
+	// cannot be mistaken for no internet.
+	//
+	// Installing the main-table /32 for such an address routes THIS HOST's own
+	// egress probe into the tunnel. confirmExternal then reads the tunnel's
+	// address as the machine's, reports "THIS MACHINE'S OWN EGRESS MOVED", and
+	// reverts the whole route — so the tunnel would fail to connect every
+	// single time, which is far worse than the DNS leak being closed.
+	//
+	// The two requirements are genuinely contradictory for such an address:
+	// the confirmation must reach that endpoint OUTSIDE the tunnel to prove
+	// the host stayed put, and tunnelled DNS requires the same address to be
+	// INSIDE it. Refusing the DNS half is the only outcome that keeps both the
+	// route and the honesty of dns_tunneled; picking either side silently
+	// would break one of them. Resolving it properly is a design decision
+	// about what host-egress confirmation means, not one to take here.
+	for _, d := range servers {
+		if isHostEgressProbeAddress(d) {
+			return
+		}
+	}
 	network, err := resolveContainerNetwork(ctx, r, rt, plan.ContainerID)
 	if err != nil || network == "" {
 		return
@@ -576,7 +601,6 @@ func resolveContainerNetwork(ctx context.Context, r Runner, rt ContainerRuntime,
 		return "", fmt.Errorf("container %s is attached to %d networks (%s) and this path moves exactly one network's resolver — refusing rather than picking one", containerID, len(names), strings.Join(names, ", "))
 	}
 }
-
 
 // ExternalRoute moves one container's egress onto the external tunnel, and
 // reverts if it cannot prove that worked.

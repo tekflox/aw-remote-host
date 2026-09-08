@@ -240,6 +240,50 @@ func TestEachPlanTimePreconditionLeavesTheDNSHalfUnattempted(t *testing.T) {
 	}
 }
 
+// THE CASE THE ONLY REAL PROFILE ON THIS DEPLOYMENT HITS.
+//
+// gl-inet, the one configured profile, carries DNS = 1.1.1.1 — which is also
+// egressEndpoints[0], the IP literal PublicIP tries FIRST to measure this
+// host's own address. Installing the main-table /32 for it would route the
+// confirmation probe into the tunnel, confirmExternal would read the tunnel's
+// address as the machine's, and the whole route would revert with "THIS
+// MACHINE'S OWN EGRESS MOVED" — on every single connect.
+//
+// The design assumed a private resolver here and said to verify that rather
+// than assume it. It does not hold, so the DNS half refuses and the route is
+// untouched. If this test ever fails, connecting the VPN is broken outright,
+// which is a much worse bug than the leak this feature closes.
+func TestAResolverThatIsAlsoTheHostEgressProbeIsRefused(t *testing.T) {
+	withFakePodmanPath(t, testPodmanPath, nil)
+	plan, err := PlanExternalRoute(context.Background(), ExternalRouteSpec{
+		Container: "aw-remote-host-workspace",
+		Runner:    podmanHost(),
+		Runtime:   ContainerRuntime{Name: "podman"},
+		TunnelDNS: true,
+		DNS:       []string{"1.1.1.1"},
+	})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if plan.Refusal != "" {
+		t.Fatalf("the ROUTE must still work — only the DNS half backs off: %s", plan.Refusal)
+	}
+	if len(plan.DNSServers) != 0 {
+		t.Fatalf("a /32 for %v would route this host's OWN egress probe into the tunnel and make every connect revert itself", plan.DNSServers)
+	}
+	if !containsString(plan.Warnings, DNSNotTunnelledWarning) {
+		t.Fatalf("warnings: %v", plan.Warnings)
+	}
+	if !isHostEgressProbeAddress("1.1.1.1") {
+		t.Fatal("1.1.1.1 is egressEndpoints[0] and must be recognised as such")
+	}
+	// A resolver that is NOT a probe endpoint is unaffected — the guard has to
+	// be this collision and not "public resolvers are refused".
+	if isHostEgressProbeAddress("9.9.9.9") {
+		t.Fatal("the guard is too wide: it must catch the probe collision, not every public resolver")
+	}
+}
+
 // A runtime that is not podman gets the warning rather than an attempt: docker
 // has no `network update`, so there is no verb to move an upstream with.
 func TestDockerHostCannotTunnelDNSAndSaysSo(t *testing.T) {
@@ -341,12 +385,17 @@ func TestApplyTunnelDNSInstallsTheMainTableRouteBeforeMovingTheUpstream(t *testi
 // externalguarantees.go exists to prevent.
 func TestPublicResolverStillReachableOffTunnelDoesNotFlipTheFlag(t *testing.T) {
 	withFakePodmanPath(t, testPodmanPath, nil)
-	plan := planDNSOn(t, podmanHost(), []string{"1.1.1.1"})
-	r := readyHost("1.1.1.1")
+	// 9.9.9.9 rather than 1.1.1.1: a PUBLIC resolver, but not one of this
+	// host's own egress probe endpoints, so the collision guard does not fire
+	// and this test stays about the thing it is named for — the route proof.
+	// The 1.1.1.1 case is TestAResolverThatIsAlsoTheHostEgressProbeIsRefused.
+	const publicDNS = "9.9.9.9"
+	plan := planDNSOn(t, podmanHost(), []string{publicDNS})
+	r := readyHost(publicDNS)
 	// The /32 was added and did NOT win: the kernel still sends this out the
 	// host's own uplink. Meanwhile the probe resolves perfectly — which is
 	// precisely why the route has to be proven separately from the path.
-	r.answers["ip route get 1.1.1.1"] = "1.1.1.1 via 65.109.66.65 dev enp41s0 src 65.109.66.88 uid 0 \n"
+	r.answers["ip route get "+publicDNS] = publicDNS + " via 65.109.66.65 dev enp41s0 src 65.109.66.88 uid 0 \n"
 
 	if applyTunnelDNS(context.Background(), r, *plan, nil) {
 		t.Fatal("dns_tunneled=true for a resolver the host reaches over its OWN default — the queries leave in the clear, and reporting that as tunnelled is worse than reporting the leak")
@@ -355,7 +404,7 @@ func TestPublicResolverStillReachableOffTunnelDoesNotFlipTheFlag(t *testing.T) {
 		t.Fatalf("the upstream was moved despite the route proof failing: %v", r.calls)
 	}
 	// And it cleaned up after itself: no orphan /32 pointing into a tunnel.
-	if !r.ran("ip route del 1.1.1.1/32") {
+	if !r.ran("ip route del " + publicDNS + "/32") {
 		t.Fatalf("the main-table /32 was left behind: %v", r.calls)
 	}
 }

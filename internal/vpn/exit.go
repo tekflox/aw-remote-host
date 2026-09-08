@@ -120,6 +120,30 @@ var egressEndpoints = []egressEndpoint{
 	{URL: "https://icanhazip.com"},
 }
 
+// isHostEgressProbeAddress reports whether an address is one this host reaches
+// BY IP LITERAL to measure its own public address.
+//
+// It exists for planTunnelDNS, which must refuse to install a main-table /32
+// for such an address: doing so routes the confirmation probe itself into the
+// tunnel, and the apply then reports the machine's own egress as having moved.
+// Only the ByIP entries are checkable — the others are names whose addresses
+// are resolved at probe time and are not a static property of this list.
+func isHostEgressProbeAddress(ip string) bool {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return false
+	}
+	for _, e := range egressEndpoints {
+		if !e.ByIP {
+			continue
+		}
+		if strings.Contains(e.URL, "//"+ip+"/") || strings.HasSuffix(e.URL, "//"+ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // egressEndpoint is one such service and how to read it.
 type egressEndpoint struct {
 	URL string
