@@ -16,6 +16,15 @@ on:
       - "go.sum"
       - "install.sh"
       - "install.ps1"
+      # The container form of this host is built and published from this same
+      # workflow (see the `image` job), so its packaging is release-relevant
+      # too. Before 2026-09-08 these three were absent, which is how the one
+      # consumer of the image ended up running a build from an unnamed commit
+      # on a stale checkout while the other three host forms had had
+      # push→build→publish since day one.
+      - "Dockerfile"
+      - "entrypoint.sh"
+      - "healthcheck.sh"
       - ".github/workflows/release.yml"
 
 permissions:
@@ -24,6 +33,12 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Exported so the `image` job builds the SAME version this job releases,
+    # rather than resolving its own. There is exactly one version authority in
+    # this repo and it is the step below — a second workflow on its own push
+    # trigger would race it and hard-error on "version already exists".
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -119,13 +134,115 @@ jobs:
             dist/*.zip
             dist/checksums.txt
 
+  # ── container image ──────────────────────────────────────────────────────
+  # Three of the four host forms (darwin, windows, the bare-metal binary) have
+  # had push→build→publish since day one; the container form is the only one
+  # that skipped it, and built instead from whatever happened to be on one
+  # machine's disk. This job closes that gap: one workflow, one version
+  # authority, image and binaries carrying the same vX.Y.Z from one commit.
+  #
+  # A job here rather than a separate build-image.yml on its own push trigger:
+  # that would create a second version-resolution path racing `build`'s.
+  image:
+    needs: build
+    # Deliberately NOT ubuntu-latest like its sibling `build` job. That one
+    # produces artifacts for four OSes and has no reason to be here; this one
+    # produces an image whose only consumer is a container on this very
+    # machine, so it builds where it is used and the layers never cross the
+    # network except to reach GHCR. Same runner + buildx combination proven by
+    # agentic-workspace's build-aw-sandbox.yml.
+    runs-on: [self-hosted, aw-baremetal]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ghcr.io rejects mixed-case namespaces, and github.repository preserves
+      # the owner's casing.
+      - name: Lowercase image ref
+        id: ref
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "image=ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # amd64 only. The sole consumer is amd64, and Mac.Home/surface run the
+      # released binary rather than this image — two of them cannot consume a
+      # Linux image at all. Adding arm64 is one `platforms:` entry away when a
+      # containerised arm64 host actually exists; until then it is QEMU time
+      # for nobody.
+      #
+      # :latest and :vX.Y.Z are published as pointers FOR HUMANS. No host ever
+      # resolves either one — compose consumes the digest below through
+      # AW_REMOTE_HOST_IMAGE, with no :latest fallback, so an unrelated
+      # recreate can never silently ship whatever landed on main since.
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            AW_REMOTE_HOST_VERSION=${{ needs.build.outputs.version }}
+          tags: |
+            ${{ steps.ref.outputs.image }}:${{ needs.build.outputs.version }}
+            ${{ steps.ref.outputs.image }}:latest
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+          VERSION: ${{ needs.build.outputs.version }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "## Image published"
+            echo ""
+            echo "Pin compose to this, not to a tag:"
+            echo ""
+            echo '```'
+            echo "AW_REMOTE_HOST_IMAGE=${IMAGE}@${DIGEST}"
+            echo '```'
+            echo ""
+            echo "Tags also moved: \`${VERSION}\`, \`latest\` (pointers for humans only)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── announce ─────────────────────────────────────────────────────────────
+  # Last, and needing both jobs, so the payload describes a COMPLETE release —
+  # binaries and image from one commit. Carrying the image ref + digest is what
+  # lets the console show drift between a host's pinned digest and the newest
+  # release; that visibility is the mitigation for a pin nobody advances, which
+  # is the same failure as a stale build wearing a different hat.
+  notify:
+    needs: [build, image]
+    runs-on: ubuntu-latest
+    steps:
       - name: Notify aw-backend release registry
         env:
           RELEASE_TOKEN: ${{ secrets.AW_RELEASE_WEBHOOK_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.build.outputs.version }}
           SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
-          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.version }}
+          IMAGE: ${{ needs.image.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
           if [ -z "${RELEASE_TOKEN}" ]; then
@@ -137,6 +254,8 @@ jobs:
           import json
           import os
 
+          image = os.environ.get("IMAGE", "")
+          digest = os.environ.get("DIGEST", "")
           payload = {
               "component": "aw-remote-host",
               "version": os.environ["VERSION"],
@@ -145,6 +264,8 @@ jobs:
               "metadata": {
                   "workflow": "release",
                   "run_id": os.environ["RUN_ID"],
+                  "image": f"{image}@{digest}" if image and digest else "",
+                  "image_digest": digest,
               },
           }
           print(json.dumps(payload))

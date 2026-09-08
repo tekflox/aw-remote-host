@@ -13,7 +13,19 @@ FROM golang:1.23-alpine AS build
 
 WORKDIR /src
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/aw-remote-host ./cmd/aw-remote-host
+
+# Stamp the version, exactly as release.yml's binary builds already do
+# (-X main.version=...). Without this every image-born binary reports "dev",
+# and "dev" is not cosmetic: internal/state/state.go short-circuits both
+# RecordBootstrapVersion and CheckDowngrade on it, so an unstamped image can
+# never record what it bootstrapped and the downgrade guard can never fire.
+# It also makes the container the only one of the four host forms whose
+# reported version is a lie. Defaults to "dev" so a local `docker build` with
+# no --build-arg still works; release.yml passes the real vX.Y.Z.
+ARG AW_REMOTE_HOST_VERSION=dev
+RUN CGO_ENABLED=0 go build \
+      -ldflags "-X main.version=${AW_REMOTE_HOST_VERSION}" \
+      -o /out/aw-remote-host ./cmd/aw-remote-host
 
 # bootstrap-workspace's own install scripts (bootstrap/podman/install.sh
 # etc.) are bash scripts that shell out to `sudo apt-get install podman` on
