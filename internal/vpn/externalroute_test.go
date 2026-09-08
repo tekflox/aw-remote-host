@@ -19,18 +19,35 @@ type tableRunner struct {
 	calls   []string
 }
 
+// The LONGEST matching prefix wins, in both tables. Map iteration order in Go
+// is randomised, so a first-match-wins lookup is nondeterministic the moment
+// one key is a prefix of another — and that is not hypothetical here:
+// `ip route get 1.1.1.1` is a prefix of `ip route get 1.1.1.1 ipproto udp
+// dport 53`, and those two commands are REQUIRED to answer differently. That
+// pair is the whole point of the DNS rule proofs, so the fixture has to be
+// able to express it without flaking one run in two.
 func (s *tableRunner) Run(_ context.Context, name string, args ...string) (string, error) {
 	full := strings.TrimSpace(name + " " + strings.Join(args, " "))
 	s.calls = append(s.calls, full)
+	bestErrLen := -1
+	var bestErr error
 	for prefix, err := range s.errs {
-		if strings.HasPrefix(full, prefix) {
-			return "", err
+		if strings.HasPrefix(full, prefix) && len(prefix) > bestErrLen {
+			bestErrLen, bestErr = len(prefix), err
 		}
 	}
+	if bestErrLen >= 0 {
+		return "", bestErr
+	}
+	bestLen := -1
+	best := ""
 	for prefix, out := range s.answers {
-		if strings.HasPrefix(full, prefix) {
-			return out, nil
+		if strings.HasPrefix(full, prefix) && len(prefix) > bestLen {
+			bestLen, best = len(prefix), out
 		}
+	}
+	if bestLen >= 0 {
+		return best, nil
 	}
 	return "", nil
 }

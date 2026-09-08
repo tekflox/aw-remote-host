@@ -123,9 +123,19 @@ var egressEndpoints = []egressEndpoint{
 // isHostEgressProbeAddress reports whether an address is one this host reaches
 // BY IP LITERAL to measure its own public address.
 //
-// It exists for planTunnelDNS, which must refuse to install a main-table /32
-// for such an address: doing so routes the confirmation probe itself into the
-// tunnel, and the apply then reports the machine's own egress as having moved.
+// It used to be a REFUSAL: tunnelling DNS to such an address once meant
+// installing a main-table `<dns>/32`, which routed the confirmation probe
+// itself into the tunnel and made the apply report the machine's own egress as
+// having moved. That mechanism is withdrawn — the DNS half is now a policy
+// rule scoped to `dport 53`, and a probe on 443 cannot match it — so the
+// collision is handled rather than refused.
+//
+// The function stays, and applyTunnelDNS still calls it, for one job: NAMING
+// the case in the narration. A resolver that is also an egress probe address
+// is the one configuration where an operator most needs to be told that the
+// host's own measurement is deliberately still leaving in the clear, and
+// silence there reads as an oversight rather than a decision.
+//
 // Only the ByIP entries are checkable — the others are names whose addresses
 // are resolved at probe time and are not a static property of this list.
 func isHostEgressProbeAddress(ip string) bool {

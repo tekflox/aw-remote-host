@@ -181,7 +181,7 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 	}
 	// DNS, MEASURED, on exactly the same principle as the kill switch above
 	// and for the same reason: both halves of it can go away silently. The
-	// main-table /32 is flushed by the same daily systemd-networkd restart
+	// DNS rules are flushed by the same daily systemd-networkd restart
 	// Reassert exists for, and the aardvark upstream is rewritten by anything
 	// that reloads the network — and neither failure is loud. A status that
 	// replayed "dns_tunneled: true" from the record would be claiming a
@@ -255,11 +255,15 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 //
 // Both halves have to hold, because either one missing reopens the leak in a
 // different way: without the aardvark upstream the queries go back out through
-// the host, and without the main-table /32 they are aimed into a table that
-// cannot reach the resolver at all. The second is the more dangerous of the
-// two and the reason this is not a single check — a flushed /32 leaves an
-// upstream that still LOOKS right in the config file while every container on
-// the network has lost external DNS.
+// the host, and without the policy rules they take the main table's own path
+// to the resolver — in the clear. The second is the quieter of the two and the
+// reason this is not a single check: a flushed rule leaves an upstream that
+// still LOOKS right in the config file while every query on the network goes
+// out unprotected.
+//
+// EVERY rule has to be there, tcp included. A host where only the udp rule
+// survived is leaking exactly the responses that were too big for udp, which
+// is a partial leak reported as a full guarantee.
 //
 // Deliberately cheap: two reads, no probe container, no round trip. This verb
 // is polled by a screen, and the end-to-end resolution check belongs to the
@@ -273,7 +277,18 @@ func measuredDNSTunneled(ctx context.Context, r Runner, route *state.ExternalRou
 		if !containsAddress(upstreams, dns) {
 			return false
 		}
-		if ok, err := dnsRouteInstalled(ctx, r, dns); err != nil || !ok {
+	}
+	// Spelled through a plan so the rule vocabulary — the selector, the table
+	// and the priority band — lives in exactly one place (dnsRulesFor) and a
+	// poll cannot drift from what the apply installed.
+	plan := ExternalRoutePlan{
+		Table:       route.Table,
+		DNSServers:  route.DNSServers,
+		DNSNetwork:  route.DNSNetwork,
+		DNSPriority: route.DNSPriority,
+	}
+	for _, ru := range plan.dnsRules() {
+		if ok, err := dnsRuleInstalled(ctx, r, plan, ru); err != nil || !ok {
 			return false
 		}
 	}

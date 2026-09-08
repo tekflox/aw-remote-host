@@ -211,6 +211,12 @@ type ExternalRouteState struct {
 	// DNSPrior is what the network's upstream was BEFORE this apply, so the
 	// undo restores rather than merely empties.
 	DNSPrior []string `json:"dns_prior,omitempty"`
+	// DNSPriority is the base of the `ip rule` band that apply installed for
+	// the DNS flows. Persisted for the same reason Priority is: `ip rule del`
+	// matches on the whole selector, priority included, so an undo that
+	// recomputed it from the current default would silently delete nothing on
+	// a host whose apply used a different base.
+	DNSPriority int `json:"dns_priority,omitempty"`
 }
 
 // DefaultPath returns ~/.aw-remote-host/state.json.

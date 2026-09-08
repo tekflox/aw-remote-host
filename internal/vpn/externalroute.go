@@ -103,6 +103,24 @@ const ExternalRouteTable = 200
 // own uplink.
 const ExternalRoutePriority = 5399
 
+// ExternalRouteDNSPriority is the BASE of the small contiguous band the DNS
+// rules occupy — two per resolver, udp then tcp, so resolver i owns
+// base+2i and base+2i+1.
+//
+// It sits immediately above ExternalRoutePriority on purpose. These rules are
+// the same shape as the container rule (`lookup <plan.Table>`) and they belong
+// in the same neighbourhood, so their ordering against everything else —
+// after tailscale's 5210-5270 fwmark rules have had their say, before the
+// 32766 main lookup — is the ordering that has already shipped rather than a
+// new question. It is a separate constant rather than `Priority+1` because a
+// caller that overrides `--priority` must not silently move this band on top
+// of something else.
+//
+// The numbering is derived from the plan and nothing else, which is what lets
+// the dead-man's script, reassertPlan and the status poll all spell the same
+// number without passing it to each other.
+const ExternalRouteDNSPriority = 5400
+
 // ExternalRouteSpec is one request to move a single container's egress onto an
 // external tunnel this host terminates.
 type ExternalRouteSpec struct {
@@ -234,6 +252,12 @@ type ExternalRoutePlan struct {
 	// empty on this host; recording it is what keeps that from being an
 	// assumption baked into the undo.
 	DNSPrior []string `json:"dns_prior,omitempty"`
+	// DNSPriority is the base of this plan's DNS rule band — see
+	// ExternalRouteDNSPriority. Carried on the plan, and persisted, because
+	// `ip rule del` matches on the WHOLE selector including the priority: a
+	// revert that recomputed this number from a fresh default would delete
+	// nothing on a host where the apply used a different one.
+	DNSPriority int `json:"dns_priority,omitempty"`
 
 	// Guarantees is what this apply can honestly promise — whether the kill
 	// switch is really there, whether DNS is really tunnelled, and the
@@ -267,32 +291,75 @@ func (p ExternalRoutePlan) excludeArgs(verb, prefix string) []string {
 	return append(args, "table", strconv.Itoa(p.Table))
 }
 
-// dnsRouteArgs is the MAIN-table /32 that makes the resolver reachable at all,
-// and it is the non-obvious half of this whole feature.
+// dnsRule is one policy rule this plan owns: one resolver, one transport, one
+// priority. Enumerated in exactly one place (dnsRulesFor) so the apply, the
+// revert, the reassert timer, the status poll and the dead-man's script all
+// spell the same rule without being handed the numbering.
+type dnsRule struct {
+	DNS      string
+	Proto    string
+	Priority int
+}
+
+// dnsRulesFor is that one place. Two rules per resolver, udp then tcp, from
+// base upwards.
+//
+// TCP IS NOT OPTIONAL AND IT IS NOT SYMMETRY. A DNS response over 512 bytes
+// without EDNS is truncated and the resolver retries over TCP — so a udp-only
+// rule leaves exactly those queries going out in the clear. That is a PARTIAL
+// leak that looks like success from every surface, which is the specific kind
+// of false reassurance externalguarantees.go exists to prevent.
+func dnsRulesFor(servers []string, base int) []dnsRule {
+	if base <= 0 {
+		base = ExternalRouteDNSPriority
+	}
+	rules := make([]dnsRule, 0, len(servers)*2)
+	for i, dns := range servers {
+		rules = append(rules,
+			dnsRule{DNS: dns, Proto: "udp", Priority: base + 2*i},
+			dnsRule{DNS: dns, Proto: "tcp", Priority: base + 2*i + 1},
+		)
+	}
+	return rules
+}
+
+func (p ExternalRoutePlan) dnsRules() []dnsRule {
+	return dnsRulesFor(p.DNSServers, p.DNSPriority)
+}
+
+// dnsRuleArgs is the `ip rule` that puts aardvark's forwarded QUERIES on the
+// tunnel while leaving everything else about that address alone. It is the
+// non-obvious half of this whole feature, and it is deliberately a RULE and
+// not a route.
 //
 // aardvark forwards from the HOST netns with the host's own source address, so
-// its queries are resolved against the MAIN table — which has no route into the
-// tunnel. Pointing `--dns-add` at an address the main table cannot reach does
-// not degrade DNS for the routed container, it BLACK-HOLES IT FOR EVERY
-// CONTAINER ON THE NETWORK — 30 of them here, including postgres, redis and the
-// MCP gateway. That is a far worse outcome than the leak being closed, and it is
-// the single most likely way a naive implementation breaks this host (§10).
+// its queries resolve against the main table, which has no route into the
+// tunnel. The first version of this installed a main-table `<dns>/32 via
+// <tunnel>` to fix that — and that is withdrawn, because it keyed on the
+// ADDRESS when the collision is between FLOWS. The only profile configured on
+// this deployment carries DNS = 1.1.1.1, which is also egressEndpoints[0], the
+// IP literal `hostPublicIP` (:1707) tries FIRST to measure this machine's own
+// public address. A /32 routed that host's own confirmation probe into the
+// tunnel, confirmExternal read the tunnel's address as the machine's, and the
+// whole route reverted on every connect.
 //
-// The prefix is a /32 to the resolver and nothing wider, so it moves the
-// resolver's traffic and not the machine's: `ExternalRoute`'s "host egress must
-// NOT change" confirmation still runs afterwards and would revert this whole
-// apply if it ever did.
+// The two flows are trivially distinguishable and they were never in conflict:
 //
-// `onlink` for the same measured reason excludeArgs carries it: a WireGuard
-// device whose address is a /32 has no connected subnet containing the tunnel
-// gateway, and without onlink the kernel answers `Error: Nexthop has invalid
-// gateway.` and the route silently never installs.
-func (p ExternalRoutePlan) dnsRouteArgs(verb, dns string) []string {
-	args := []string{"route", verb, dns + "/32", "via", p.TunnelVia, "dev", p.TunnelDev}
-	if verb == "add" {
-		args = append(args, "onlink")
-	}
-	return args
+//	aardvark's query      to <dns>/32 ipproto {udp,tcp} dport 53  -> tunnel
+//	hostPublicIP's probe  <dns>:443, HTTPS                        -> main, untouched
+//
+// A rule scoped to dport 53 cannot capture a 443 round trip, so the host's
+// egress confirmation is immune BY CONSTRUCTION rather than by hoping nobody
+// picks a popular resolver.
+//
+// Nothing is written to the main table, and nothing needs `onlink`: the rule
+// reaches the resolver through plan.Table's OWN default, which tableDefault
+// (:1124) already refuses to leave empty. This is a strictly smaller footprint
+// than the route it replaces.
+func (p ExternalRoutePlan) dnsRuleArgs(verb string, ru dnsRule) []string {
+	return []string{"rule", verb, "to", ru.DNS + "/32",
+		"ipproto", ru.Proto, "dport", "53",
+		"lookup", strconv.Itoa(p.Table), "priority", strconv.Itoa(ru.Priority)}
 }
 
 // dnsUpdateArgs is the `podman network update` that moves the upstream.
@@ -538,31 +605,17 @@ func planTunnelDNS(ctx context.Context, r Runner, rt ContainerRuntime, spec Exte
 	if err != nil || podmanPath == "" {
 		return
 	}
-	// A resolver that is ALSO how this host measures its own public IP cannot
-	// be tunnelled by this mechanism, and the collision is not hypothetical:
-	// the only profile configured on this deployment today has DNS = 1.1.1.1,
-	// and egressEndpoints[0] is `https://1.1.1.1/cdn-cgi/trace` — the FIRST
-	// endpoint PublicIP tries, an IP literal on purpose so a broken resolver
-	// cannot be mistaken for no internet.
-	//
-	// Installing the main-table /32 for such an address routes THIS HOST's own
-	// egress probe into the tunnel. confirmExternal then reads the tunnel's
-	// address as the machine's, reports "THIS MACHINE'S OWN EGRESS MOVED", and
-	// reverts the whole route — so the tunnel would fail to connect every
-	// single time, which is far worse than the DNS leak being closed.
-	//
-	// The two requirements are genuinely contradictory for such an address:
-	// the confirmation must reach that endpoint OUTSIDE the tunnel to prove
-	// the host stayed put, and tunnelled DNS requires the same address to be
-	// INSIDE it. Refusing the DNS half is the only outcome that keeps both the
-	// route and the honesty of dns_tunneled; picking either side silently
-	// would break one of them. Resolving it properly is a design decision
-	// about what host-egress confirmation means, not one to take here.
-	for _, d := range servers {
-		if isHostEgressProbeAddress(d) {
-			return
-		}
-	}
+	// A resolver that is ALSO how this host measures its own public address is
+	// NOT refused here, and that is the whole of revision 1. The collision is
+	// real — the only profile configured on this deployment carries
+	// DNS = 1.1.1.1, and egressEndpoints[0] is `https://1.1.1.1/cdn-cgi/trace`,
+	// the FIRST endpoint PublicIP tries, an IP literal on purpose so a broken
+	// resolver cannot be mistaken for no internet — but it is a collision
+	// between FLOWS, not addresses. dnsRuleArgs moves dport-53 traffic and
+	// nothing else; the probe's HTTPS round trip on 443 to the same address is
+	// untouched by construction, and applyTunnelDNS proves both halves of that
+	// before it claims anything. isHostEgressProbeAddress is still consulted,
+	// there, to name the case in the narration.
 	network, err := resolveContainerNetwork(ctx, r, rt, plan.ContainerID)
 	if err != nil || network == "" {
 		return
@@ -571,6 +624,7 @@ func planTunnelDNS(ctx context.Context, r Runner, rt ContainerRuntime, spec Exte
 	plan.DNSNetwork = network
 	plan.DNSPodmanPath = podmanPath
 	plan.DNSPrior = aardvarkUpstreams(ctx, r, network)
+	plan.DNSPriority = ExternalRouteDNSPriority
 }
 
 // resolveContainerNetwork names the podman network whose aardvark upstream
@@ -964,26 +1018,25 @@ func reassertPlan(ctx context.Context, r Runner, plan ExternalRoutePlan) (restor
 
 	// THE DNS HALF, re-checked on the same timer and for the same measured
 	// reason the rule is. Two things take it away without telling anyone: the
-	// daily unattended-apt flush that systemd-networkd does to the main-table
-	// /32, and anything that rewrites the network's config (a podman restart,
-	// a `network reload`) to the aardvark upstream. Neither breaks loudly —
-	// the first black-holes the resolver, the second silently reopens the leak
-	// this feature exists to close — so both are checked here rather than
-	// discovered later.
+	// daily unattended-apt flush of the host's policy rules, and anything that
+	// rewrites the network's config (a podman restart, a `network reload`) to
+	// the aardvark upstream. Neither breaks loudly — the first black-holes the
+	// resolver, the second silently reopens the leak this feature exists to
+	// close — so both are checked here rather than discovered later.
 	//
 	// Asserted on LINE 1 of the aardvark config, never on a grep over the
 	// file: the upstream list shares that line with the bind address, and the
 	// records below it can contain an address that would match a naive grep
 	// and report success for a change that never landed (§10).
 	if len(plan.DNSServers) > 0 {
-		for _, dns := range plan.DNSServers {
-			if ok, err := dnsRouteInstalled(ctx, r, dns); err != nil || ok {
+		for _, ru := range plan.dnsRules() {
+			if ok, err := dnsRuleInstalled(ctx, r, plan, ru); err != nil || ok {
 				continue
 			}
-			if _, err := r.Run(ctx, "ip", plan.dnsRouteArgs("add", dns)...); err != nil {
-				return restored, updated, false, fmt.Errorf("could not re-assert the main-table route to the tunnel resolver %s, without which every container on %s loses external DNS: %w", dns, plan.DNSNetwork, err)
+			if _, err := r.Run(ctx, "ip", plan.dnsRuleArgs("add", ru)...); err != nil {
+				return restored, updated, false, fmt.Errorf("could not re-assert the %s DNS rule to the tunnel resolver %s, without which every container on %s loses external DNS: %w", ru.Proto, ru.DNS, plan.DNSNetwork, err)
 			}
-			restored = append(restored, "main-table route to resolver "+dns)
+			restored = append(restored, ru.Proto+" DNS rule to resolver "+ru.DNS)
 		}
 		upstreams := aardvarkUpstreams(ctx, r, plan.DNSNetwork)
 		var missing []string
@@ -1317,8 +1370,9 @@ func applyExternalRoute(ctx context.Context, r Runner, plan ExternalRoutePlan, p
 	return applyTunnelDNS(ctx, r, plan, progress), nil
 }
 
-// applyTunnelDNS proves §4.3, §4.4 and §4.5 in that order and moves the
-// network's aardvark upstream, or undoes its own half and reports false.
+// applyTunnelDNS proves §11.4's two rule proofs, then §4.4 and §4.5, in that
+// order, and moves the network's aardvark upstream — or undoes its own half
+// and reports false.
 //
 // Every failure path calls revertTunnelDNS and KEEPS THE ROUTE. That asymmetry
 // is the design's, and it is deliberate: the route was independently confirmed
@@ -1342,28 +1396,56 @@ func applyTunnelDNS(ctx context.Context, r Runner, plan ExternalRoutePlan, progr
 		return false
 	}
 
-	// §4.3 — the MAIN-table /32 first, and PROVEN, not assumed. Without it
-	// aardvark forwards from the host netns into a table with no route to the
-	// resolver and every container on the network loses external DNS.
+	// A resolver that is ALSO how this host measures its own public address is
+	// no longer a refusal — it is the case the port-scoped rule was written
+	// for, and it is the only case that exists on this deployment today
+	// (gl-inet carries DNS = 1.1.1.1, which is egressEndpoints[0]). It is
+	// still called out by name, so an operator reading the narration knows why
+	// proof 2 below is not ceremony.
 	for _, dns := range plan.DNSServers {
-		if ok, err := dnsRouteInstalled(ctx, r, dns); err != nil || !ok {
-			if _, err := r.Run(ctx, "ip", plan.dnsRouteArgs("add", dns)...); err != nil {
-				return abandon("the main-table route %s/32 via %s dev %s could not be installed (%v), and pointing the resolver at an address this host cannot reach would black-hole DNS for every container on network %s", dns, plan.TunnelVia, plan.TunnelDev, err, plan.DNSNetwork)
+		if isHostEgressProbeAddress(dns) {
+			progress.emit("info", "%s %s is also this host's own egress-probe address. Only its dport-53 flows move onto the tunnel; the HTTPS probe on 443 stays on the main path, and the check below proves it.", dnsProbeCollisionNotice, dns)
+		}
+	}
+
+	// §11.4 proof 1 — THE DNS FLOW MOVED. The rules go in first, then the
+	// kernel is asked, per resolver and per transport, which device that flow
+	// would actually leave by. `ip rule add` exiting 0 is not the assertion:
+	// a rule whose table lost its default, or which something at a lower
+	// priority already claimed, exits 0 and changes nothing.
+	for _, ru := range plan.dnsRules() {
+		if ok, err := dnsRuleInstalled(ctx, r, plan, ru); err != nil || !ok {
+			if _, err := r.Run(ctx, "ip", plan.dnsRuleArgs("add", ru)...); err != nil {
+				return abandon("the policy rule sending %s dport-53 traffic to %s down the tunnel could not be installed (%v)", ru.Proto, ru.DNS, err)
 			}
 		}
-		// `ip route get` is what proves the /32 actually won, rather than that
-		// the add command exited 0. A profile whose resolver is a PUBLIC one
-		// reachable over the main default is the case this catches: without
-		// the /32 taking effect its queries still resolve — so §4.5's
-		// end-to-end check would pass — while leaving the machine in the
-		// clear. That is the false reassurance externalguarantees.go exists to
-		// prevent, so the route is proven separately from the path.
-		dev, err := routeGetDevice(ctx, r, dns)
+		dev, err := routeGetDevice(ctx, r, ru.DNS, "ipproto", ru.Proto, "dport", "53")
 		if err != nil {
-			return abandon("it could not be proven which device queries to %s would leave by (%v)", dns, err)
+			return abandon("it could not be proven which device %s queries to %s would leave by (%v)", ru.Proto, ru.DNS, err)
 		}
 		if dev != plan.TunnelDev {
-			return abandon("queries to %s would leave by %s, not the tunnel %s — sending them to a resolver in the clear is not tunnelled DNS, and reporting it as such would be worse than reporting the leak", dns, dev, plan.TunnelDev)
+			return abandon("%s queries to %s would leave by %s, not the tunnel %s — sending them to a resolver in the clear is not tunnelled DNS, and reporting it as such would be worse than reporting the leak", ru.Proto, ru.DNS, dev, plan.TunnelDev)
+		}
+	}
+
+	// §11.4 proof 2 — THE PROBE FLOW DID NOT. This is the positive assertion
+	// of the thing §4 assumed and got wrong, and it is the reason this design
+	// may claim what the withdrawn one could not: with NO selector — which is
+	// the lookup the host's own HTTPS egress probe performs — the resolver
+	// must still be reached over the main path.
+	//
+	// If this ever fails, something has put the whole address into the tunnel
+	// (a reinstated main-table /32 being the obvious way), and confirmExternal
+	// would then read the tunnel's address as this machine's and revert the
+	// entire route. Backing the DNS half out here is what keeps that from
+	// happening at all.
+	for _, dns := range plan.DNSServers {
+		dev, err := routeGetDevice(ctx, r, dns)
+		if err != nil {
+			return abandon("it could not be proven that non-DNS traffic to %s still leaves by the main path (%v)", dns, err)
+		}
+		if dev == plan.TunnelDev {
+			return abandon("everything to %s now leaves by the tunnel %s, not just its DNS — that puts this host's own egress-confirmation probe inside the tunnel, which makes confirmExternal read the tunnel's address as the machine's and revert the whole route", dns, plan.TunnelDev)
 		}
 	}
 
@@ -1390,14 +1472,15 @@ func applyTunnelDNS(ctx context.Context, r Runner, plan ExternalRoutePlan, progr
 	return true
 }
 
-// revertTunnelDNS undoes the DNS half, RESOLVER OUT BEFORE ROUTE (§10).
+// revertTunnelDNS undoes the DNS half, RESOLVER OUT BEFORE RULES (§10).
 //
 // The drop goes first so there is never a moment where aardvark is still
-// pointed at an address whose route has already been withdrawn — that ordering
-// is the difference between a clean undo and the black hole this feature's
-// main risk is. Both halves are idempotent (a `--dns-drop` of an address that
-// is not configured exits 0; a missing route is checked before deleting), so
-// this is safe to call on a partial apply, on a full one, and twice.
+// pointed at an address whose path into the tunnel has already been withdrawn
+// — that ordering is the difference between a clean undo and the black hole
+// this feature's main risk is. Both halves are idempotent (a `--dns-drop` of
+// an address that is not configured exits 0; a missing rule is checked before
+// deleting), so this is safe to call on a partial apply, on a full one, and
+// twice.
 func revertTunnelDNS(ctx context.Context, r Runner, plan ExternalRoutePlan) error {
 	if len(plan.DNSServers) == 0 {
 		return nil
@@ -1419,33 +1502,62 @@ func revertTunnelDNS(ctx context.Context, r Runner, plan ExternalRoutePlan) erro
 			}
 		}
 	}
-	for _, dns := range plan.DNSServers {
-		if ok, err := dnsRouteInstalled(ctx, r, dns); err == nil && !ok {
+	for _, ru := range plan.dnsRules() {
+		if ok, err := dnsRuleInstalled(ctx, r, plan, ru); err == nil && !ok {
 			continue
 		}
-		if _, err := r.Run(ctx, "ip", plan.dnsRouteArgs("del", dns)...); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("could not remove the main-table route for %s: %w", dns, err)
+		if _, err := r.Run(ctx, "ip", plan.dnsRuleArgs("del", ru)...); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("could not remove the %s DNS rule for %s: %w", ru.Proto, ru.DNS, err)
 		}
 	}
 	return firstErr
 }
 
-// dnsRouteInstalled asks whether the main-table /32 is there. `ip route show
-// <prefix>` prints the matching route or nothing at all, so emptiness is the
-// answer rather than an error.
-func dnsRouteInstalled(ctx context.Context, r Runner, dns string) (bool, error) {
-	out, err := r.Run(ctx, "ip", "route", "show", dns+"/32")
+// dnsRuleInstalled asks whether one DNS rule is in force, by reading
+// `ip rule show` and matching on the priority — the same way ruleInstalled
+// (:1616) does for the container rule, and NOT with `ip route show`, which
+// knows nothing about policy rules.
+//
+// Measured shape, on the host 2026-09-08:
+//
+//	5400:	from all to 1.1.1.1 ipproto udp dport 53 lookup 200
+//
+// Note the `/32` is dropped from a single-host prefix, exactly as it is from
+// the container rule's `from`, so the bare address is what gets matched.
+func dnsRuleInstalled(ctx context.Context, r Runner, plan ExternalRoutePlan, ru dnsRule) (bool, error) {
+	out, err := r.Run(ctx, "ip", "rule", "show")
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("could not read this host's routing policy rules: %w", err)
 	}
-	return strings.TrimSpace(out) != "", nil
+	table := strconv.Itoa(plan.Table)
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || strings.TrimSuffix(f[0], ":") != strconv.Itoa(ru.Priority) {
+			continue
+		}
+		if f[len(f)-1] != table {
+			continue
+		}
+		joined := " " + strings.Join(f[1:], " ") + " "
+		if strings.Contains(joined, " to "+strings.TrimSuffix(ru.DNS, "/32")+" ") &&
+			strings.Contains(joined, " ipproto "+ru.Proto+" ") &&
+			strings.Contains(joined, " dport 53 ") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // routeGetDevice is the kernel's own answer to "which device would this
 // packet leave by", which is a different question from "is there a route" and
 // the only one worth asking here.
-func routeGetDevice(ctx context.Context, r Runner, dst string) (string, error) {
-	out, err := r.Run(ctx, "ip", "route", "get", dst)
+//
+// selector carries the flow keys — `ipproto udp dport 53` — because the whole
+// point of this revision is that the answer DIFFERS by flow for the same
+// destination. Called with no selector it asks the question §11.4's proof 2
+// asks: where would everything else to this address go.
+func routeGetDevice(ctx context.Context, r Runner, dst string, selector ...string) (string, error) {
+	out, err := r.Run(ctx, "ip", append([]string{"route", "get", dst}, selector...)...)
 	if err != nil {
 		return "", err
 	}
@@ -1483,6 +1595,18 @@ func resolvesThroughTunnel(ctx context.Context, r Runner, plan ExternalRoutePlan
 	}
 	return nil
 }
+
+// dnsProbeCollisionNotice names the progress line applyTunnelDNS emits when a
+// profile's resolver is also one of this host's own egress-probe addresses.
+//
+// It is a named constant rather than prose so a test can assert the case is
+// still called out. The case used to be a refusal (commit 7210497); it is now
+// the case the port-scoped rule exists for, and the one that describes 100% of
+// the profiles configured on this deployment. An operator reading a narration
+// that just said "DNS tunnelled" for 1.1.1.1 would have no way to know that
+// the host's own egress measurement is deliberately still going to the same
+// address in the clear — so it is said out loud.
+const dnsProbeCollisionNotice = "[dns-resolver-is-also-egress-probe]"
 
 // dnsProbeMarker is looked for instead of an exit code for the same reason
 // containerEgressScript emits its own: a probe that printed a resolver's
@@ -1586,10 +1710,15 @@ func externalRevertScript(r Runner, plan ExternalRoutePlan) string {
 	// adding it. The absolute path is plan.DNSPodmanPath, resolved at plan
 	// time — a bare `podman` here would depend on the PATH of a machine whose
 	// network has just gone.
+	//
+	// The rule lines are spelled by dnsRuleArgs, the same function that spelled
+	// the adds, priority included: `ip rule del` matches on the WHOLE selector,
+	// so a line that differs in one field deletes nothing — or, worse, deletes
+	// a rule that is not this one.
 	if len(plan.DNSServers) > 0 && plan.DNSPodmanPath != "" && plan.DNSNetwork != "" {
 		fmt.Fprintf(&b, "%s%s %s || true\n", prefix, plan.DNSPodmanPath, strings.Join(plan.dnsUpdateArgs("--dns-drop"), " "))
-		for _, dns := range plan.DNSServers {
-			fmt.Fprintf(&b, "%sip %s || true\n", prefix, strings.Join(plan.dnsRouteArgs("del", dns), " "))
+		for _, ru := range plan.dnsRules() {
+			fmt.Fprintf(&b, "%sip %s || true\n", prefix, strings.Join(plan.dnsRuleArgs("del", ru), " "))
 		}
 	}
 	fmt.Fprintf(&b, "%sip %s || true\n", prefix, strings.Join(plan.ruleArgs("del"), " "))
@@ -1803,6 +1932,7 @@ func saveExternalRouteState(plan ExternalRoutePlan) error {
 			DNSNetwork:    plan.DNSNetwork,
 			DNSPodmanPath: plan.DNSPodmanPath,
 			DNSPrior:      plan.DNSPrior,
+			DNSPriority:   plan.DNSPriority,
 		}
 	})
 }
@@ -1842,6 +1972,13 @@ func loadExternalRouteState() (*ExternalRoutePlan, error) {
 		return nil, nil
 	}
 	e := st.VPN.ExternalRoute
+	// A record written before this field existed carries 0, which would spell
+	// `priority 0` into an `ip rule del` and delete nothing. Falling back to
+	// the shipped default is what that record's apply would have used.
+	dnsPriority := e.DNSPriority
+	if dnsPriority <= 0 {
+		dnsPriority = ExternalRouteDNSPriority
+	}
 	return &ExternalRoutePlan{
 		Container:    e.Container,
 		ContainerID:  e.ContainerID,
@@ -1859,5 +1996,6 @@ func loadExternalRouteState() (*ExternalRoutePlan, error) {
 		DNSNetwork:    e.DNSNetwork,
 		DNSPodmanPath: e.DNSPodmanPath,
 		DNSPrior:      e.DNSPrior,
+		DNSPriority:   dnsPriority,
 	}, nil
 }
