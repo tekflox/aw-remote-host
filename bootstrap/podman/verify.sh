@@ -62,6 +62,19 @@ if [ "$(id -u)" = "0" ]; then
     echo "podman: graphroot is '$actual_graphroot', expected '$expected_graphroot' — containers would live on an ephemeral layer and be erased by the next recreate (see bootstrap/lib/podman_storage.sh)" >&2
     exit 1
   fi
+
+  # Same rootful-only gate as the graphroot check above, checked against the
+  # file directly rather than `podman info`: the incident this guards against
+  # is `podman system service` (the daemon, started next in install.sh) never
+  # rereading containers.conf after it starts, so a `podman info` value could
+  # read correct while the running daemon is still on the old driver — the
+  # file is the only thing this check can meaningfully assert about a fresh
+  # boot. See bootstrap/lib/podman_firewall.sh.
+  firewall_conf=/etc/containers/containers.conf
+  if [ ! -f "$firewall_conf" ] || ! grep -q 'firewall_driver = "iptables"' "$firewall_conf" 2>/dev/null; then
+    echo "podman: $firewall_conf does not pin firewall_driver to iptables — netavark's nftables backend hits a known kernel bug on this host and container networking would fail on the next recreate (see bootstrap/lib/podman_firewall.sh)" >&2
+    exit 1
+  fi
 fi
 
 # The version floor, LAST: everything above is about podman working at all,

@@ -7,6 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/deps.sh"
 # shellcheck source=../lib/podman_storage.sh
 source "$SCRIPT_DIR/../lib/podman_storage.sh"
+# shellcheck source=../lib/podman_firewall.sh
+source "$SCRIPT_DIR/../lib/podman_firewall.sh"
 
 # Pinned, validated on a real brew-less Mac (see bootstrap/podman/README.md).
 PODMAN_VENDORED_VERSION="6.0.2"
@@ -139,6 +141,12 @@ upgrade_podman_to_floor
 # graphroot first.
 if [ "$(id -u)" = "0" ]; then
   configure_podman_graphroot /etc/containers/storage.conf "$HOME"
+  # Same rootful-only gate, same reason to write it here: the socket
+  # bring-up next starts `podman system service`, which reads
+  # containers.conf once at startup and never again — see
+  # podman_firewall.sh for the incident (netavark's nftables backend vs.
+  # this host's kernel) this prevents from repeating on the next recreate.
+  configure_podman_firewall_driver /etc/containers/containers.conf
 fi
 echo "podman installed: $(podman --version)"
 
