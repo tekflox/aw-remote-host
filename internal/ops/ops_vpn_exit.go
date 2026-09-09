@@ -408,9 +408,14 @@ func secondsArg(args map[string]any, key string, def time.Duration) time.Duratio
 //	                                            which is exactly why both are
 //	                                            reported
 //
-// The container half shares vpn.MeasureContainerEgress with the exit-gate
-// sequence rather than measuring its own way. Two implementations would drift,
-// and a divergence produced by two different methods would prove nothing.
+// The container half shares its measurement with the sequence that installed
+// the thing being measured rather than measuring its own way — the routed
+// container's netns when there is one (vpn.MeasureNetnsEgress, the external
+// route's own confirmation), the probe network when there is not
+// (vpn.MeasureContainerEgress, the exit gate's). Two implementations would
+// drift, and a divergence produced by two different methods would prove
+// nothing. Which one ran is in `container_egress.network`, so a number that
+// surprises somebody can be attributed rather than argued about.
 //
 // The honesty contract is the monolith's `public_ip()` and it applies to both
 // halves: a failed measurement returns an empty address WITH the reason and
@@ -429,13 +434,38 @@ func (h *Handler) VPNPublicIP(ctx context.Context) (map[string]any, error) {
 	return out, nil
 }
 
-// measureContainerEgress is the whole container half in one call: detect the
-// runtime, find its networks, pick the probe network, measure. Each step's
+// measureContainerEgress is the whole container half in one call. Each step's
 // failure is the answer rather than an error, because "no container runtime"
 // is a legitimate, permanent state for two of this account's hosts (Mac.Home
 // and the native Windows link) and their rows must render an honest unknown —
 // not a blank, and above all not a duplicate of the host's address.
+//
+// WHICH NAMESPACE IS MEASURED IS THE WHOLE CORRECTNESS OF THIS FUNCTION, and
+// it depends on whether this host has a container routed onto an external
+// tunnel:
+//
+//	routed  -> probe INSIDE that container's netns. The dialer's rule is a /32
+//	           on that one container's source address (vpn.ExternalRoutePlan's
+//	           SourceIP), and a probe on a NETWORK gets a fresh address that
+//	           rule can never match — so it would faithfully report the HOST's
+//	           egress however well the route worked, which is the untunneled
+//	           address this widget was showing. `--network container:<id>`
+//	           shares the target's source address and is therefore matched by
+//	           the very rule being measured. Same measurement external-status
+//	           already reports (vpn.ExternalStatus), deliberately not a second
+//	           one.
+//	not      -> detect the runtime, find its networks, pick the probe network,
+//	           measure. There is no per-container rule to match, so the
+//	           network probe is the honest general answer.
+//
+// There is NO fallback from the first to the second. A route record pointing
+// at a container that is gone answers with the reason and an empty address:
+// falling through would quietly report this host's own egress as the
+// container's, fabricating exactly the evidence somebody is about to trust.
 func measureContainerEgress(ctx context.Context, r vpn.Runner) vpn.ContainerEgressResult {
+	if route := vpn.LoadExternalRouteRecord(); route != nil && route.Runtime != "" && route.ContainerID != "" {
+		return vpn.MeasureNetnsEgress(ctx, r, route.Runtime, route.ContainerID)
+	}
 	runtime, err := vpn.DetectContainerRuntime(ctx, r)
 	if err != nil {
 		return vpn.ContainerEgressResult{Error: err.Error()}

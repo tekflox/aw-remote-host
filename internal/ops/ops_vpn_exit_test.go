@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tekflox/aw-remote-host/internal/state"
 	"github.com/tekflox/aw-remote-host/internal/vpn"
 )
 
@@ -425,6 +426,132 @@ func TestClearExitSurfacesAnEgressItCouldNotMeasure(t *testing.T) {
 	out := data.(map[string]any)
 	if out["egress"] != "" || out["egress_error"] != "no endpoint answered" {
 		t.Fatalf("out = %v", out)
+	}
+}
+
+// --- which namespace the container half is measured in -----------------------
+//
+// Every test below asserts on the ARGUMENTS the runner was handed, not on the
+// address that came back. That is not pedantry: both probes return the same
+// vpn.ContainerEgressResult, so a result alone cannot tell a netns probe from
+// a network probe — and reporting the network probe's answer while a route was
+// installed is the entire bug these cover.
+
+// routedHost writes the record an external route leaves behind, into a HOME
+// this test owns. Nothing here may read or write the state.json of the machine
+// running `go test`.
+func routedHost(t *testing.T, route *state.ExternalRouteState) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	path, err := state.DefaultPath()
+	if err != nil {
+		t.Fatalf("state path: %v", err)
+	}
+	if err := state.Save(path, &state.State{VPN: &state.VPNState{ExternalRoute: route}}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+}
+
+// unroutedHostRunner is a host with a container runtime and one populated
+// network, and nothing routed. Its probe answers with hostEgress — the address
+// the network probe really would report, which is what makes it usable both as
+// the expected answer below and as the address that must NEVER appear once a
+// route record exists.
+func unroutedHostRunner(hostEgress string) *fakeRunner {
+	r := newFakeRunner()
+	r.fail(errors.New("docker: command not found"), "docker", "network", "ls", "--format", "{{.Name}}")
+	r.on("aw-remote-host\n", "podman", "network", "ls", "--format", "{{.Name}}")
+	r.on("podman version 4.9.3\n", "podman", "--version")
+	r.on(`[{"subnets":[{"subnet":"10.89.0.0/24"}]}]`, "podman", "network", "inspect", "aw-remote-host")
+	r.on("39d1f0aa\n", "podman", "ps", "--filter", "network=aw-remote-host", "--format", "{{.ID}}")
+	r.onPrefix("AW_EGRESS https://api.ipify.org "+hostEgress+"\n", nil, "podman", "run", "--rm", "--network", "aw-remote-host")
+	return r
+}
+
+// THE BUG, in one assertion. A host with a container routed onto an external
+// tunnel must be measured inside THAT container's namespace: the dialer's rule
+// is a /32 on its source address, and a probe on the network gets a fresh
+// address the rule cannot match — so the network probe reports the untunneled
+// host address no matter how well the route worked, which is what the
+// Networking → Public IP widget was showing.
+func TestContainerEgressProbesTheRoutedContainersNetns(t *testing.T) {
+	routedHost(t, &state.ExternalRouteState{
+		Container:   "aw-console",
+		ContainerID: "e91aacf5a3a39a17",
+		SourceIP:    "10.89.0.39",
+		Runtime:     "podman",
+		Table:       200,
+		Priority:    5399,
+	})
+
+	r := unroutedHostRunner("188.250.165.236")
+	r.onPrefix("AW_EGRESS https://api.ipify.org 45.83.220.14\n", nil,
+		"podman", "run", "--rm", "--network", "container:e91aacf5a3a39a17")
+
+	got := measureContainerEgress(context.Background(), r)
+
+	if !r.ran("container:e91aacf5a3a39a17") {
+		t.Fatalf("the probe did not run in the routed container's netns; calls = %v", r.calls)
+	}
+	if r.ran("aw-remote-host") {
+		t.Fatalf("a network probe ran as well as (or instead of) the netns one; calls = %v", r.calls)
+	}
+	if got.IP != "45.83.220.14" || got.Error != "" {
+		t.Fatalf("got %+v, want the tunnel's address and no error", got)
+	}
+	if got.Network != "container:e91aacf5a3a39a17" {
+		t.Fatalf("network = %q — the reply has to say which namespace produced the number", got.Network)
+	}
+}
+
+// The other half of the branch, unchanged and still required: a host with
+// nothing routed has no per-container rule to match, so the picked network is
+// the honest general answer.
+func TestContainerEgressProbesThePickedNetworkWhenNothingIsRouted(t *testing.T) {
+	routedHost(t, nil)
+
+	r := unroutedHostRunner("188.250.165.236")
+	got := measureContainerEgress(context.Background(), r)
+
+	if !r.ran("aw-remote-host") {
+		t.Fatalf("the probe did not run on the picked network; calls = %v", r.calls)
+	}
+	if got.IP != "188.250.165.236" || got.Network != "aw-remote-host" {
+		t.Fatalf("got %+v, want the network probe's answer", got)
+	}
+}
+
+// A record whose container is GONE — the shape a stale route leaves behind —
+// must answer with the reason and no address. The runner here is fully able to
+// serve the network probe, and its answer (the host's own egress) is exactly
+// what a fallback would report as the container's: the honesty contract this
+// verb shares with public_ip() forbids that, because it fabricates the
+// evidence somebody is about to trust.
+func TestContainerEgressNeverFallsBackToTheHostWhenTheRoutedContainerIsGone(t *testing.T) {
+	routedHost(t, &state.ExternalRouteState{
+		Container:   "aw-console",
+		ContainerID: "deadbeefdeadbeef",
+		Runtime:     "podman",
+	})
+
+	const hostEgress = "188.250.165.236"
+	r := unroutedHostRunner(hostEgress)
+	r.onPrefix("Error: no container with ID deadbeefdeadbeef\n", errors.New("exit status 125"),
+		"podman", "run", "--rm", "--network", "container:deadbeefdeadbeef")
+
+	got := measureContainerEgress(context.Background(), r)
+
+	if got.IP != "" {
+		t.Fatalf("ip = %q — a probe that could not run has no address to report", got.IP)
+	}
+	if got.Error == "" {
+		t.Fatal("an empty address must carry the reason it is empty")
+	}
+	if r.ran("aw-remote-host") {
+		t.Fatalf("it fell back to the network probe; calls = %v", r.calls)
+	}
+	if strings.Contains(got.IP+" "+got.Via+" "+got.Network+" "+got.Error, hostEgress) {
+		t.Fatalf("the host's own address appears in %+v", got)
 	}
 }
 

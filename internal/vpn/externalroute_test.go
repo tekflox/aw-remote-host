@@ -548,14 +548,14 @@ func TestEgressProbeSharesTheTargetsNamespace(t *testing.T) {
 	r := &tableRunner{answers: map[string]string{
 		"docker run": "AW_EGRESS https://1.1.1.1/cdn-cgi/trace 24.90.8.255\n",
 	}}
-	got := measureNetnsEgress(context.Background(), r, "docker", "e91aacf5a3a39a17")
+	got := MeasureNetnsEgress(context.Background(), r, "docker", "e91aacf5a3a39a17")
 	if got.IP != "24.90.8.255" {
 		t.Fatalf("ip = %q (%s)", got.IP, got.Error)
 	}
 
 	// And a probe that printed something else must NOT be read as an address.
 	noisy := &tableRunner{answers: map[string]string{"docker run": "curl: (28) timeout\n1.2.3.4\n"}}
-	if got := measureNetnsEgress(context.Background(), noisy, "docker", "x"); got.IP != "" {
+	if got := MeasureNetnsEgress(context.Background(), noisy, "docker", "x"); got.IP != "" {
 		t.Fatalf("an unmarked line was accepted as the answer: %q", got.IP)
 	}
 	if !r.ran("docker run --rm --network container:e91aacf5a3a39a17") {

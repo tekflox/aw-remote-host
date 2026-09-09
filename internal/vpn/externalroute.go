@@ -726,7 +726,7 @@ func ExternalRoute(ctx context.Context, spec ExternalRouteSpec, progress Progres
 	res.HostBefore = host.IP
 	progress.emit("info", "host egress before (must NOT change): %s", host.IP)
 
-	before := measureNetnsEgress(ctx, runner, plan.Runtime, plan.ContainerID)
+	before := MeasureNetnsEgress(ctx, runner, plan.Runtime, plan.ContainerID)
 	res.ContainerBefore = before.IP
 	if before.IP == "" && spec.ExpectEgress == "" {
 		return res, fmt.Errorf("could not measure the container's egress before the change (%s), and no expected egress was given, so the result could not be confirmed either way", before.Error)
@@ -855,7 +855,7 @@ func ExternalUnroute(ctx context.Context, spec ExternalRouteSpec, progress Progr
 		return res, err
 	}
 
-	after := measureNetnsEgress(ctx, runner, plan.Runtime, plan.ContainerID)
+	after := MeasureNetnsEgress(ctx, runner, plan.Runtime, plan.ContainerID)
 	res.ContainerAfter = after.IP
 	if host, err := PublicIP(ctx); err == nil {
 		res.HostAfter = host.IP
@@ -1573,7 +1573,7 @@ func routeGetDevice(ctx context.Context, r Runner, dst string, selector ...strin
 // resolvesThroughTunnel proves a name actually resolves for the routed
 // container, by running a probe INSIDE that container's network namespace.
 //
-// `--network container:<id>` is the same mechanism measureNetnsEgress uses and
+// `--network container:<id>` is the same mechanism MeasureNetnsEgress uses and
 // it works here for one measured reason: podman gives the probe the TARGET's
 // resolv.conf, so it asks the same aardvark on the same address the routed
 // container does. Verified on the host 2026-09-08 — the probe's
@@ -1846,7 +1846,7 @@ func externalConfirmOnce(ctx context.Context, r Runner, plan ExternalRoutePlan, 
 		return c
 	}
 
-	got := measureNetnsEgress(ctx, r, plan.Runtime, plan.ContainerID)
+	got := MeasureNetnsEgress(ctx, r, plan.Runtime, plan.ContainerID)
 	c.containerAfter = got.IP
 	if got.IP == "" {
 		c.reason = fmt.Sprintf("the container's egress could not be measured through the new route (%s).%s", got.Error, CryptokeyRoutingHint)
@@ -1868,8 +1868,12 @@ func externalConfirmOnce(ctx context.Context, r Runner, plan ExternalRoutePlan, 
 	return c
 }
 
-// measureNetnsEgress asks what the routed container's own egress is, by
+// MeasureNetnsEgress asks what the routed container's own egress is, by
 // running the probe INSIDE that container's network namespace.
+//
+// Exported because it is not only the confirmation's measurement: vpn_public_ip
+// (internal/ops) has to report the same number for the same reason, and a
+// second way of measuring it there would answer a different question.
 //
 // This is the part that makes the confirmation exact rather than
 // approximate. MeasureContainerEgress (containers.go) probes a NETWORK, so its
@@ -1882,7 +1886,7 @@ func externalConfirmOnce(ctx context.Context, r Runner, plan ExternalRoutePlan, 
 // The container itself is never required to contain curl, wget or anything
 // else, which matters here: the container this exists for has no `ip` and an
 // empty dpkg database.
-func measureNetnsEgress(ctx context.Context, r Runner, runtime, containerID string) ContainerEgressResult {
+func MeasureNetnsEgress(ctx context.Context, r Runner, runtime, containerID string) ContainerEgressResult {
 	res := ContainerEgressResult{Runtime: runtime, Network: "container:" + containerID}
 	if runtime == "" || containerID == "" {
 		res.Error = NoContainerRuntimeRefusal

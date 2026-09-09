@@ -54,6 +54,22 @@ func loadVPNRecords() (*state.ExternalTunnelState, *state.ExternalRouteState) {
 	return st.VPN.ExternalTunnel, st.VPN.ExternalRoute
 }
 
+// LoadExternalRouteRecord is loadVPNRecords' route half for callers outside
+// this package — today vpn_public_ip (internal/ops), which has to know whether
+// a container on this host is routed, and which one, before it can measure
+// egress in the namespace where the answer is meaningful.
+//
+// A thin accessor rather than a second reader of state.json: the record's
+// shape and the "a missing file is nothing recorded, not a fault" rule above
+// are this package's, and a caller that re-derived them would be a caller that
+// eventually disagrees with the status this file reports.
+//
+// nil means nothing is recorded, which is the normal case on most hosts.
+func LoadExternalRouteRecord() *state.ExternalRouteState {
+	_, route := loadVPNRecords()
+	return route
+}
+
 // ExternalStatusReport is the shape the workspace core parses. It is fixed by
 // that contract — core is already built against it and currently degrades to
 // state "unknown" because this verb did not exist — so the JSON tags here are
@@ -205,7 +221,7 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 			report.HostEgressIP = &ip
 		}
 		if route != nil && route.Runtime != "" && route.ContainerID != "" {
-			if got := measureNetnsEgress(ctx, runner, route.Runtime, route.ContainerID); got.IP != "" {
+			if got := MeasureNetnsEgress(ctx, runner, route.Runtime, route.ContainerID); got.IP != "" {
 				ip := got.IP
 				report.ContainerEgressIP = &ip
 			}

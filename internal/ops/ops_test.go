@@ -23,6 +23,21 @@ type fakeRunner struct {
 	calls   [][]string
 	outputs map[string]string // "name arg1 arg2" -> output
 	errs    map[string]error  // "name arg1 arg2" -> error
+	// prefixes answer commands a test cannot spell out in full — the egress
+	// probe carries a shell script built inside internal/vpn, which this
+	// package neither owns nor should be pinning a copy of.
+	prefixes []prefixAnswer
+}
+
+// prefixAnswer is one scripted reply matched on the LEADING arguments. The
+// exact-key tables win when both could match, and a prefix only matches at an
+// argument boundary — `--network container:abc` must not answer for
+// `container:abcdef`, which is precisely the kind of near-miss these tests
+// exist to tell apart.
+type prefixAnswer struct {
+	key string
+	out string
+	err error
 }
 
 func newFakeRunner() *fakeRunner {
@@ -41,6 +56,26 @@ func (f *fakeRunner) fail(err error, name string, args ...string) {
 	f.errs[f.key(name, args...)] = err
 }
 
+func (f *fakeRunner) onPrefix(output string, err error, name string, prefix ...string) {
+	f.prefixes = append(f.prefixes, prefixAnswer{key: f.key(name, prefix...), out: output, err: err})
+}
+
+// ran reports whether any recorded call contains this argument verbatim. WHICH
+// command ran is the assertion for anything where two code paths return the
+// same shape and only the arguments say which one produced it.
+func (f *fakeRunner) ran(arg string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, call := range f.calls {
+		for _, a := range call {
+			if a == arg {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -49,6 +84,14 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 	k := f.key(name, args...)
 	if err, ok := f.errs[k]; ok {
 		return f.outputs[k], err
+	}
+	if out, ok := f.outputs[k]; ok {
+		return out, nil
+	}
+	for _, p := range f.prefixes {
+		if k == p.key || strings.HasPrefix(k, p.key+" ") {
+			return p.out, p.err
+		}
 	}
 	return f.outputs[k], nil
 }
