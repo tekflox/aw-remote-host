@@ -18,6 +18,7 @@ import (
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
 	"github.com/tekflox/aw-remote-host/internal/firewall"
+	"github.com/tekflox/aw-remote-host/internal/hostfacts"
 	"github.com/tekflox/aw-remote-host/internal/hostpower"
 	"github.com/tekflox/aw-remote-host/internal/lanfastpath"
 	"github.com/tekflox/aw-remote-host/internal/link"
@@ -419,6 +420,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	}
 
 	hostname, _ := os.Hostname()
+	usernsContained, usernsMeasured := hostfacts.UsernsContained()
 	c := link.New(*controlPlane, *token)
 	c.Info = link.RegisterInfo{
 		Hostname:           hostname,
@@ -428,6 +430,12 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		HostPower:          hostPowerEnv,
 		HostPowerRequested: hostpower.Format(st.HostPower),
 		Elevated:           processIsElevated(),
+		// Elevated on its own cannot tell a userns-remapped container-root
+		// apart from an uncontained host root — both report true. See
+		// hostfacts.UsernsContained.
+		UsernsContained: usernsContained,
+		UsernsMeasured:  usernsMeasured,
+		UIDMap:          hostfacts.UIDMap(),
 	}
 
 	type registration struct {

@@ -75,6 +75,18 @@ type RegisterInfo struct {
 	// question already answered by internal/vpn's Privileged(). This is what
 	// lets the console show a "running as root" badge.
 	Elevated bool
+	// UsernsContained reports whether this daemon runs inside a REMAPPED
+	// user namespace, and UsernsMeasured whether that could be determined
+	// at all (it cannot on non-Linux hosts, which have no
+	// /proc/self/uid_map). UIDMap carries the raw evidence.
+	//
+	// Sent alongside Elevated because Elevated alone cannot distinguish the
+	// two shapes it gets used to judge: a userns-remapped container-root and
+	// an uncontained host root both report Elevated=true. See
+	// internal/hostfacts.UsernsContained for the full reasoning.
+	UsernsContained bool
+	UsernsMeasured  bool
+	UIDMap          string
 }
 
 // RegisteredReply is the server's response to a register frame.
@@ -170,6 +182,15 @@ func (c *Client) registerFrame() map[string]any {
 	// Sent unconditionally, including false: a host that stopped running as
 	// root has to be able to say so, same reasoning as host_power above.
 	frame["elevated"] = c.Info.Elevated
+	// Only sent when it could actually be measured. Omitted (rather than
+	// sent as false) on a host with no /proc/self/uid_map, so the backend's
+	// "only overwrite on a key that is present" reconnect path leaves the
+	// column NULL — "not measured" must not land in the DB as "measured,
+	// not contained".
+	if c.Info.UsernsMeasured {
+		frame["userns_contained"] = c.Info.UsernsContained
+		frame["uid_map"] = c.Info.UIDMap
+	}
 	return frame
 }
 
