@@ -57,6 +57,21 @@ func egressMismatchWarning(expected, got string) string {
 		". Something else is routing this container's traffic — most likely a mesh exit gate (Settings -> Networking) picked after this VPN connected, which silently takes priority over this rule. Clear whichever was picked last, or run `aw-remote-host vpn external-unroute` and reconnect."
 }
 
+// containerEgressUnroutedWarning is shown when the container's measured
+// egress is the SAME as this host's own — the general shape of "the route
+// silently failed", independent of whether anything predicted the exact
+// expected IP in advance (that is expectedEgressMismatch's narrower job).
+// The tunnel and its policy rule can both report healthy while this is true:
+// the packet leaves the container correctly, but whatever should have NAT'd
+// or forwarded it on the far end (a hub-side policy rule that was never
+// installed for this peer, an exit peer with no NAT of its own, a rule a
+// daily flush took away) did not, so it falls back to this host's own
+// address. Named for what it looks like, not for the one cause already seen
+// in production — the same design as egressMismatchWarning above.
+func containerEgressUnroutedWarning(ip string) string {
+	return "Container egress is " + ip + ", the SAME as this host's own public IP. The tunnel may report up and the policy rule installed, but nothing is actually forwarding this container's traffic through it — most likely a routing rule the far end (a peer or hub) needs for this connection was never installed or was flushed. Disconnect and reconnect; if it recurs, check the routing on the far end of the tunnel."
+}
+
 // DNSNotTunnelledWarning is shown whenever DNS is only partly tunnelled.
 //
 // It used to be unconditional, because on this deployment it was always true.

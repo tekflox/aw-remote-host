@@ -210,10 +210,22 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 				report.ContainerEgressIP = &ip
 			}
 		}
-		// THE MISMATCH THAT CAUGHT THE GATE. Before this, container_egress_ip
-		// rendered as a bare, unverified address with nothing to compare it
-		// against — exactly the gap that let a mesh exit gate steal this
-		// route unnoticed (see PlanUseExit's shadow refusal in usexit.go).
+		// THE GENERAL "IT DIDN'T ACTUALLY ROUTE" SIGNAL. dialer.py's own
+		// comment ("NEVER host_egress_ip... a host whose address moved is
+		// a failed apply that reverts") and this file's Describe() text
+		// both already say this is the failure state; nothing compared
+		// the two fields until now. Independent of ExpectEgress, so it
+		// catches every route that silently fell through to the main
+		// table -- a peer added to the tunnel but never to the far end's
+		// forwarding rules -- same failure shape as the mismatch check
+		// below but without needing an expectation to have been given.
+		if w := hostEgressMatchesContainer(report.HostEgressIP, report.ContainerEgressIP); w != "" {
+			report.Warnings = appendWarning(report.Warnings, w)
+		}
+		// THE MISMATCH THAT CAUGHT THE GATE, complementary to the general
+		// check above, not a replacement for it: this one only fires when
+		// an expectation WAS given (the mesh exit-gate flow), and is a
+		// stronger, exact-match check for that narrower case.
 		if w := expectedEgressMismatch(route, report.ContainerEgressIP); w != "" {
 			report.Warnings = appendWarning(report.Warnings, w)
 		}
@@ -307,6 +319,20 @@ func expectedEgressMismatch(route *state.ExternalRouteState, containerEgressIP *
 		return ""
 	}
 	return egressMismatchWarning(route.ExpectEgress, *containerEgressIP)
+}
+
+// hostEgressMatchesContainer reports the warning to append when the
+// container's measured egress is IDENTICAL to this host's own — the general
+// "route silently failed" signal, independent of whether an ExpectEgress was
+// ever given. "" when either side is unmeasured (SkipEgress, or a probe that
+// failed), so a poll with a hole in it stays silent rather than manufacturing
+// a false positive out of nothing to compare. Kept pure and separate from
+// ExternalStatus's own body for the same reason expectedEgressMismatch is.
+func hostEgressMatchesContainer(hostEgressIP, containerEgressIP *string) string {
+	if hostEgressIP == nil || containerEgressIP == nil || *hostEgressIP != *containerEgressIP {
+		return ""
+	}
+	return containerEgressUnroutedWarning(*hostEgressIP)
 }
 
 // interfacePresent asks wg which interfaces exist. A host with no `wg` at all

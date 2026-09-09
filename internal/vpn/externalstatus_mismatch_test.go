@@ -69,4 +69,46 @@ func TestExpectedEgressMismatch_WarnsOnRealMismatch(t *testing.T) {
 	}
 }
 
+// THE GENERAL CHECK, added alongside expectedEgressMismatch above: it fires
+// off HostEgressIP vs ContainerEgressIP directly, with no ExpectEgress
+// required — the shape every dialer-flow connection can hit, since the
+// dialer never sets ExpectEgress at all (only the mesh exit-gate flow does).
+
+// Either measurement missing: nothing to compare, must stay silent rather
+// than manufacturing a mismatch out of a hole.
+func TestHostEgressMatchesContainer_NoHostMeasurementIsSilent(t *testing.T) {
+	if got := hostEgressMatchesContainer(nil, strPtr("203.0.113.9")); got != "" {
+		t.Fatalf("no host measurement must produce no warning, got %q", got)
+	}
+}
+
+func TestHostEgressMatchesContainer_NoContainerMeasurementIsSilent(t *testing.T) {
+	if got := hostEgressMatchesContainer(strPtr("203.0.113.9"), nil); got != "" {
+		t.Fatalf("no container measurement must produce no warning, got %q", got)
+	}
+}
+
+// The healthy case: host and container addresses genuinely differ.
+func TestHostEgressMatchesContainer_DifferentAddressesIsSilent(t *testing.T) {
+	if got := hostEgressMatchesContainer(strPtr("65.109.66.88"), strPtr("203.0.113.9")); got != "" {
+		t.Fatalf("distinct host/container egress must produce no warning, got %q", got)
+	}
+}
+
+// THE SHAPE OF THIS CARD'S ACTUAL BUG: the hub never installed the policy
+// rule for this peer, so its traffic fell through to the main table and got
+// NAT'd to the hub's own address — container_egress_ip measured identical to
+// host_egress_ip, with no ExpectEgress ever in the picture (the dialer flow
+// never sets it). Must warn even with route == nil / ExpectEgress == "",
+// which expectedEgressMismatch alone never catches.
+func TestHostEgressMatchesContainer_WarnsOnIdenticalAddresses(t *testing.T) {
+	got := hostEgressMatchesContainer(strPtr("65.109.66.88"), strPtr("65.109.66.88"))
+	if got == "" {
+		t.Fatal("host egress identical to container egress must warn, even with no ExpectEgress recorded")
+	}
+	if !strings.Contains(got, "65.109.66.88") {
+		t.Fatalf("warning must mention the shared address, got %q", got)
+	}
+}
+
 func strPtr(s string) *string { return &s }
