@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -265,5 +266,113 @@ func TestUpdateScopesPostSyncChownToSyncedEntriesOnly(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("chown call should target the synced entry %q, call=%v", wantTarget, chownCall)
+	}
+}
+
+// TestUpdateRefusesWhenHostHeadIsAheadOfImage is the regression test for
+// aw-workspace:host-tree-reverted-by-stale-image-sync: Update() used to sync
+// the freshly-pulled image's baked source over the host tree with no check
+// at all, silently reverting committed host work when the host had moved
+// ahead of whatever commit the image was built from. The image's own commit
+// is provably an ancestor of the host's HEAD here (a real "host is ahead"
+// case), so Update() must refuse rather than sync.
+func TestUpdateRefusesWhenHostHeadIsAheadOfImage(t *testing.T) {
+	stubRunModule(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.on("hostsha123", "git", "-C", hostDir, "rev-parse", "HEAD")
+	r.on("AW_WORKSPACE_VERSION=imagesha456", "podman", "image", "inspect",
+		WorkspaceImage, "--format", "{{range .Config.Env}}{{println .}}{{end}}")
+	r.on("", "git", "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, lines := collectEmits()
+
+	_, err := h.Update(context.Background(), h.Opts, nil, emit)
+	if err == nil {
+		t.Fatal("expected Update to refuse when host HEAD is ahead of the image")
+	}
+	if !strings.Contains(err.Error(), "hostsha123") || !strings.Contains(err.Error(), "imagesha456") {
+		t.Fatalf("error should name both commits, got: %v", err)
+	}
+	for _, call := range r.calls {
+		if len(call) >= 2 && call[0] == "podman" && call[1] == "cp" {
+			t.Fatalf("must not have staged the image source once the guard refused, calls=%v", r.calls)
+		}
+	}
+	found := false
+	for _, l := range *lines {
+		if strings.Contains(l, "error/update") && strings.Contains(l, "refusing to sync") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a loud error/update emit, got lines=%v", *lines)
+	}
+}
+
+// force=true must bypass the ahead-of-image guard for an intentional
+// rollback, mirroring the bootstrap downgrade guard's own force arg.
+func TestUpdateForceArgBypassesTheAheadOfImageGuard(t *testing.T) {
+	stubRunModule(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.on("hostsha123", "git", "-C", hostDir, "rev-parse", "HEAD")
+	r.on("AW_WORKSPACE_VERSION=imagesha456", "podman", "image", "inspect",
+		WorkspaceImage, "--format", "{{range .Config.Env}}{{println .}}{{end}}")
+	r.on("", "git", "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, _ := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, map[string]any{"force": true}, emit); err != nil {
+		t.Fatalf("Update with force=true: %v", err)
+	}
+	staged := false
+	for _, call := range r.calls {
+		if len(call) >= 2 && call[0] == "podman" && call[1] == "cp" {
+			staged = true
+		}
+	}
+	if !staged {
+		t.Fatal("force=true should have let the sync proceed")
+	}
+}
+
+// When the image's commit can't be placed in the host's own git history at
+// all (shallow clone, unrelated history — merge-base errors rather than
+// answering "no"), the guard cannot prove the host is ahead. It must not
+// block a legitimate update on that uncertainty — it can only refuse a
+// PROVEN case.
+func TestUpdateProceedsWhenAncestryCannotBeDetermined(t *testing.T) {
+	stubRunModule(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.on("hostsha123", "git", "-C", hostDir, "rev-parse", "HEAD")
+	r.on("AW_WORKSPACE_VERSION=imagesha456", "podman", "image", "inspect",
+		WorkspaceImage, "--format", "{{range .Config.Env}}{{println .}}{{end}}")
+	r.fail(fmt.Errorf("fatal: not a valid object name"),
+		"git", "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, lines := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, nil, emit); err != nil {
+		t.Fatalf("Update should proceed when ancestry is undeterminable: %v", err)
+	}
+	found := false
+	for _, l := range *lines {
+		if strings.Contains(l, "warning/update") && strings.Contains(l, "could not confirm") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a loud warning/update emit, got lines=%v", *lines)
 	}
 }

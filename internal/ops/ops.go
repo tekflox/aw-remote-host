@@ -398,6 +398,70 @@ func (h *Handler) Reinstall(ctx context.Context, opts BootstrapOpts, emit Emit) 
 	return h.runModules(ctx, opts, false, emit)
 }
 
+// guardHostNotAheadOfImage compares the host tree's own committed git HEAD
+// against the AW_WORKSPACE_VERSION baked into the freshly-pulled image (set
+// from the build's own git SHA — see the Dockerfile's ARG/ENV and the image
+// build workflow). syncWorkspaceSource below unconditionally overwrites the
+// host tree with whatever the image shipped: if the host has commits the
+// image was built without, that overwrite silently reverts them with no
+// signal anywhere but a `git status` someone has to think to run — this is
+// exactly what happened live 2026-09-10 (Kanban
+// aw-workspace:host-tree-reverted-by-stale-image-sync), losing ~35 committed
+// files including the very CLI verb (`restart core`) needed to recover.
+//
+// Both sides of the comparison are best-effort: hostDir may not be a git
+// checkout at all (fresh provision) and the image may predate this build arg
+// being wired up. Either missing value means "can't tell" — proceed rather
+// than block a legitimate update on an unrelated host. When both are known
+// but the merge-base check can't place the image commit in the host's own
+// history either (shallow clone, force-pushed history, unrelated branch),
+// that is ALSO "can't tell" — logged loudly rather than silently, but not
+// blocking, since a false refusal here would strand every future update.
+// Only a PROVEN case — the image's own commit is a strict ancestor of the
+// host's HEAD — refuses outright; args["force"]=true overrides it for an
+// intentional rollback.
+func (h *Handler) guardHostNotAheadOfImage(ctx context.Context, hostDir, image string, force bool, emit Emit) error {
+	hostHead := ""
+	if out, err := h.runner().Run(ctx, "git", "-C", hostDir, "rev-parse", "HEAD"); err == nil {
+		hostHead = strings.TrimSpace(out)
+	}
+	if hostHead == "" {
+		return nil // not a git checkout (or git unavailable) — nothing to guard
+	}
+
+	imageHead := ""
+	if out, err := h.runner().Run(ctx, "podman", "image", "inspect", image,
+		"--format", "{{range .Config.Env}}{{println .}}{{end}}"); err == nil {
+		for _, line := range strings.Split(out, "\n") {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(line), "AW_WORKSPACE_VERSION="); ok && v != "" && v != "dev" {
+				imageHead = v
+			}
+		}
+	}
+	if imageHead == "" || imageHead == hostHead {
+		return nil // unknown image version, or already in sync — nothing to guard
+	}
+
+	if _, err := h.runner().Run(ctx, "git", "-C", hostDir, "merge-base", "--is-ancestor", imageHead, hostHead); err != nil {
+		emit("warning", "update", fmt.Sprintf(
+			"could not confirm host HEAD %s is not ahead of image %s (%v) — the image commit is not in this host's git history, so the ordering can't be proven either way; proceeding with sync",
+			hostHead, imageHead, err))
+		return nil
+	}
+
+	if force {
+		emit("warning", "update", fmt.Sprintf(
+			"host HEAD %s is ahead of image %s but force=true — syncing anyway, this WILL revert the host tree to the image's commit",
+			hostHead, imageHead))
+		return nil
+	}
+
+	emit("error", "update", fmt.Sprintf(
+		"refusing to sync: host HEAD %s is ahead of image HEAD %s — syncing would silently revert committed host work. Re-run with force=true to override.",
+		hostHead, imageHead))
+	return fmt.Errorf("host git HEAD %s is ahead of image HEAD %s: refusing sync without force", hostHead, imageHead)
+}
+
 // Update pulls the latest aw-workspace image, syncs the baked source tree into
 // the host bind-mount, and recreates the workspace container. Mutable runtime
 // state under .aw-workspace is preserved; source files are replaced so deletes
@@ -452,6 +516,11 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 				return nil, pullErr
 			}
 		}
+	}
+
+	force, _ := args["force"].(bool)
+	if err := h.guardHostNotAheadOfImage(ctx, hostDir, image, force, emit); err != nil {
+		return nil, err
 	}
 
 	staging := filepath.Join(hostDir, fmt.Sprintf(".aw-workspace-update-%d", time.Now().UnixNano()))
