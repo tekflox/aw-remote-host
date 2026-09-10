@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -176,5 +177,93 @@ func TestBootstrapRecordsItsOwnVersionOnSuccess(t *testing.T) {
 	}
 	if !st.Provisioned {
 		t.Fatal("Provisioned should also be set true, as before this change")
+	}
+}
+
+// copyingRunner wraps fakeRunner and makes the "podman cp" call that seeds
+// Update()'s staging dir actually write files — a real redeploy's `podman
+// cp` populates that dir for real, and Update's post-sync chown scoping
+// (core:workspace-redeploy-chowns-app-data-dirs) is only exercised if
+// syncWorkspaceSource has real entries to read there.
+type copyingRunner struct {
+	*fakeRunner
+}
+
+func (c *copyingRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	if name == "podman" && len(args) == 3 && args[0] == "cp" {
+		dst := args[2]
+		if err := os.MkdirAll(filepath.Join(dst, "src"), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(filepath.Join(dst, "src", "app.py"), []byte("new"), 0o644); err != nil {
+			return "", err
+		}
+	}
+	return c.fakeRunner.Run(ctx, name, args...)
+}
+
+// TestUpdateScopesPostSyncChownToSyncedEntriesOnly is the regression test for
+// core:workspace-redeploy-chowns-app-data-dirs: Update() used to chown -R the
+// entire host bind-mount after syncing the freshly-pulled source in, sweeping
+// .aw-workspace/data/<app> (each Tier-2 app's own bind-mounted /config,
+// living outside syncWorkspaceSource's own writes) right along with it on
+// every redeploy. The chown must now be scoped to exactly the entries
+// syncWorkspaceSource wrote.
+func TestUpdateScopesPostSyncChownToSyncedEntriesOnly(t *testing.T) {
+	stubRunModule(t)
+
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	appData := filepath.Join(hostDir, ".aw-workspace", "data", "blender")
+	if err := os.MkdirAll(appData, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(appData, "marker")
+	if err := os.WriteFile(marker, []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, _ := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, nil, emit); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected app data dir to survive untouched: %v", err)
+	}
+
+	var chownCall []string
+	for _, call := range r.calls {
+		for _, a := range call {
+			if a == "chown" {
+				chownCall = call
+				break
+			}
+		}
+	}
+	if chownCall == nil {
+		t.Fatalf("expected a chown call, calls=%v", r.calls)
+	}
+	for _, a := range chownCall {
+		if a == hostDir {
+			t.Fatalf("chown call must not target the whole hostDir directly, call=%v", chownCall)
+		}
+		if strings.Contains(a, ".aw-workspace") {
+			t.Fatalf("chown call must never reference .aw-workspace, call=%v", chownCall)
+		}
+	}
+	wantTarget := filepath.Join(hostDir, "src")
+	found := false
+	for _, a := range chownCall {
+		if a == wantTarget {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("chown call should target the synced entry %q, call=%v", wantTarget, chownCall)
 	}
 }

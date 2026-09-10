@@ -335,7 +335,8 @@ func TestSyncWorkspaceSourceOverwritesShippedEntriesAndNeverDeletesAnythingElse(
 		t.Fatal(err)
 	}
 
-	if err := syncWorkspaceSource(src, dst); err != nil {
+	written, err := syncWorkspaceSource(src, dst)
+	if err != nil {
 		t.Fatalf("syncWorkspaceSource failed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dst, ".aw-workspace", "apps", "keep.txt")); err != nil {
@@ -353,6 +354,58 @@ func TestSyncWorkspaceSourceOverwritesShippedEntriesAndNeverDeletesAnythingElse(
 	}
 	if string(got) != "new" {
 		t.Fatalf("expected the shipped file to be overwritten with fresh content, got %q", got)
+	}
+	// written must name exactly the entries the image shipped (here, only
+	// "src") — it is what Update scopes its post-sync chown to, so it must
+	// never include anything syncWorkspaceSource itself skipped.
+	wantWritten := []string{filepath.Join(dst, "src")}
+	if len(written) != len(wantWritten) || written[0] != wantWritten[0] {
+		t.Fatalf("syncWorkspaceSource written = %v, want %v", written, wantWritten)
+	}
+}
+
+// TestSyncWorkspaceSourceNeverReportsExcludedEntriesAsWritten guards the
+// exclusion list itself: every name syncWorkspaceSource skips must be absent
+// from its `written` return value, since Update() chowns exactly that list.
+// A future name added to the switch without staying out of `written` would
+// silently reopen core:workspace-redeploy-chowns-app-data-dirs.
+func TestSyncWorkspaceSourceNeverReportsExcludedEntriesAsWritten(t *testing.T) {
+	dst := t.TempDir()
+	src := t.TempDir()
+
+	excluded := []string{".aw-workspace", "apps", ".claude", ".claude.json", ".codex", ".copilot", ".cursor"}
+	for _, name := range excluded {
+		if err := os.WriteFile(filepath.Join(src, name), []byte("shipped"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(src, "src.py"), []byte("shipped too"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// .aw-workspace/data/<app> already exists on dstDir, as it would on a
+	// real host — it must not be removed or reported as written even though
+	// the image also ships a top-level ".aw-workspace" entry.
+	if err := os.MkdirAll(filepath.Join(dst, ".aw-workspace", "data", "blender"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	written, err := syncWorkspaceSource(src, dst)
+	if err != nil {
+		t.Fatalf("syncWorkspaceSource failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, ".aw-workspace", "data", "blender")); err != nil {
+		t.Fatalf("expected .aw-workspace/data/<app> to survive untouched: %v", err)
+	}
+	for _, w := range written {
+		for _, name := range excluded {
+			if w == filepath.Join(dst, name) || strings.HasPrefix(w, filepath.Join(dst, name)+string(filepath.Separator)) {
+				t.Fatalf("written = %v must not include excluded entry %q", written, name)
+			}
+		}
+	}
+	wantWritten := []string{filepath.Join(dst, "src.py")}
+	if len(written) != len(wantWritten) || written[0] != wantWritten[0] {
+		t.Fatalf("syncWorkspaceSource written = %v, want %v", written, wantWritten)
 	}
 }
 

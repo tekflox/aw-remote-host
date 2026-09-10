@@ -474,7 +474,8 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	if _, err := h.runner().Run(ctx, "podman", "cp", seedContainer+":"+ContainerWorkdir+"/.", staging); err != nil {
 		return nil, fmt.Errorf("podman cp workspace source: %w", err)
 	}
-	if err := syncWorkspaceSource(staging, hostDir); err != nil {
+	written, err := syncWorkspaceSource(staging, hostDir)
+	if err != nil {
 		return nil, err
 	}
 	// copyPath (inside syncWorkspaceSource) writes as this process's own
@@ -497,16 +498,26 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	// silently swallowed as a best-effort warning, leaving every synced
 	// entry root-owned and unwritable by the workspace's own `ubuntu`
 	// process (surfaced as "Permission denied" installing any app).
-	chownArgs := []string{"unshare", "chown", "-R", WorkspaceUID + ":" + WorkspaceGID, hostDir}
-	chownLabel := "podman unshare chown"
-	if os.Geteuid() == 0 {
-		chownArgs = []string{"-R", WorkspaceUID + ":" + WorkspaceGID, hostDir}
-		chownLabel = "chown"
-		if out, err := h.runner().Run(ctx, "chown", chownArgs...); err != nil {
+	//
+	// Scoped to `written` — the exact entries syncWorkspaceSource just
+	// copied — rather than the whole hostDir. hostDir also holds
+	// .aw-workspace/data/<app> (each Tier-2 app's own bind-mounted /config,
+	// owned by that app's own container user) and .aw-workspace/secrets;
+	// syncWorkspaceSource never touches those, but a separate `chown -R
+	// hostDir` used to sweep them anyway on every update, stomping their
+	// ownership every single redeploy (core:workspace-redeploy-chowns-app-data-dirs).
+	if len(written) > 0 {
+		chownArgs := append([]string{"unshare", "chown", "-R", WorkspaceUID + ":" + WorkspaceGID}, written...)
+		chownLabel := "podman unshare chown"
+		if os.Geteuid() == 0 {
+			chownArgs = append([]string{"-R", WorkspaceUID + ":" + WorkspaceGID}, written...)
+			chownLabel = "chown"
+			if out, err := h.runner().Run(ctx, "chown", chownArgs...); err != nil {
+				emit("warning", "update", "could not normalize workspace ownership: "+commandError(chownLabel, err, out).Error())
+			}
+		} else if out, err := h.runner().Run(ctx, "podman", chownArgs...); err != nil {
 			emit("warning", "update", "could not normalize workspace ownership: "+commandError(chownLabel, err, out).Error())
 		}
-	} else if out, err := h.runner().Run(ctx, "podman", chownArgs...); err != nil {
-		emit("warning", "update", "could not normalize workspace ownership: "+commandError(chownLabel, err, out).Error())
 	}
 
 	emit("info", "update", "recreating workspace container")
@@ -728,11 +739,18 @@ func workspaceHostDir() (string, error) {
 // unsuccessful manual attempts to fix it another way). Skipping these
 // names outright removes the collision at the root, independent of
 // whether any given image build happens to ship them.
-func syncWorkspaceSource(srcDir, dstDir string) error {
+//
+// Returns the destination paths it actually wrote, so a caller that needs to
+// fix up ownership on the fresh copy (see Update) can scope that to exactly
+// these entries instead of the whole of dstDir — which also holds mutable,
+// non-image-owned state (.aw-workspace/data/<app>, .aw-workspace/secrets)
+// that must never be touched here.
+func syncWorkspaceSource(srcDir, dstDir string) ([]string, error) {
 	srcEntries, err := os.ReadDir(srcDir)
 	if err != nil {
-		return fmt.Errorf("read staged workspace source: %w", err)
+		return nil, fmt.Errorf("read staged workspace source: %w", err)
 	}
+	var written []string
 	for _, entry := range srcEntries {
 		name := entry.Name()
 		// .aw-workspace holds mutable runtime state (see the function
@@ -751,13 +769,14 @@ func syncWorkspaceSource(srcDir, dstDir string) error {
 		// becoming a directory between versions) then copy the fresh one
 		// in — this only ever touches names the image itself brought.
 		if err := os.RemoveAll(dst); err != nil {
-			return fmt.Errorf("remove old workspace entry %s: %w", name, err)
+			return nil, fmt.Errorf("remove old workspace entry %s: %w", name, err)
 		}
 		if err := copyPath(filepath.Join(srcDir, name), dst); err != nil {
-			return err
+			return nil, err
 		}
+		written = append(written, dst)
 	}
-	return nil
+	return written, nil
 }
 
 func copyPath(src, dst string) error {
