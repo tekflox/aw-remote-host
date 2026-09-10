@@ -57,6 +57,21 @@ type State struct {
 	// safe for it). This field only makes whatever value IS configured
 	// survive a container recreation; it does not change today's default.
 	Workers int `json:"workers,omitempty"`
+	// WorkspaceImage is the aw-workspace image reference the last SUCCESSFUL
+	// update installed on this host, written only after that image's digest was
+	// checked against the registry (internal/ops.verifyImageDigest) and the
+	// container came back up on it. Normally a "<repo>@sha256:…" reference.
+	//
+	// It takes precedence over the AW_WORKSPACE_IMAGE environment variable —
+	// same "the operator's proven request survives a recreate" pattern as
+	// HostPower/Workers above, but here the value being outranked is an env pin
+	// set once by whoever created the aw-remote-host container. On this
+	// project's own deployment that pin is a DIGEST (repos/aw-stack's
+	// docker-compose.yml, deliberately, for rollback/reproducibility), and on
+	// 2026-09-10 it silently pulled the host back onto a 5-day-old image on
+	// every update — a self-perpetuating no-op that also reverted the host's
+	// source tree. Empty on every host that has never completed an update.
+	WorkspaceImage string `json:"workspace_image,omitempty"`
 	// VPN records this host's enrolment in the tenant mesh. Nil on every host
 	// that never ran the vpn module, which is the default.
 	VPN *VPNState `json:"vpn,omitempty"`

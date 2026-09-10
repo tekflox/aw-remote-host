@@ -212,6 +212,7 @@ func (c *copyingRunner) Run(ctx context.Context, name string, args ...string) (s
 // syncWorkspaceSource wrote.
 func TestUpdateScopesPostSyncChownToSyncedEntriesOnly(t *testing.T) {
 	stubRunModule(t)
+	useTempState(t)
 
 	hostDir := t.TempDir()
 	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
@@ -278,6 +279,7 @@ func TestUpdateScopesPostSyncChownToSyncedEntriesOnly(t *testing.T) {
 // case), so Update() must refuse rather than sync.
 func TestUpdateRefusesWhenHostHeadIsAheadOfImage(t *testing.T) {
 	stubRunModule(t)
+	useTempState(t)
 	hostDir := t.TempDir()
 	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
 
@@ -317,6 +319,7 @@ func TestUpdateRefusesWhenHostHeadIsAheadOfImage(t *testing.T) {
 // rollback, mirroring the bootstrap downgrade guard's own force arg.
 func TestUpdateForceArgBypassesTheAheadOfImageGuard(t *testing.T) {
 	stubRunModule(t)
+	useTempState(t)
 	hostDir := t.TempDir()
 	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
 
@@ -350,6 +353,7 @@ func TestUpdateForceArgBypassesTheAheadOfImageGuard(t *testing.T) {
 // PROVEN case.
 func TestUpdateProceedsWhenAncestryCannotBeDetermined(t *testing.T) {
 	stubRunModule(t)
+	useTempState(t)
 	hostDir := t.TempDir()
 	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
 
@@ -374,5 +378,263 @@ func TestUpdateProceedsWhenAncestryCannotBeDetermined(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a loud warning/update emit, got lines=%v", *lines)
+	}
+}
+
+// localDigestFormat mirrors the --format string localImageDigests uses, so the
+// fake runner answers the same call production makes rather than a lookalike.
+const localDigestFormat = "{{.Digest}}{{range .RepoDigests}} {{.}}{{end}}"
+
+// stubVerifiedImage makes local storage and the registry agree about image —
+// a pull that really did refresh.
+func stubVerifiedImage(r *fakeRunner, image, digest string) {
+	r.on(digest+" "+imageRepository(image)+"@"+digest,
+		"podman", "image", "inspect", image, "--format", localDigestFormat)
+	r.on(`{"manifests":[{"digest":"`+digest+`"}]}`, "podman", "manifest", "inspect", image)
+}
+
+// TestUpdateResolvesTheRequestedVersionByTagOnADigestPinnedHost is the
+// regression test for the 2026-09-10 17:04 UTC incident's root cause:
+// AW_WORKSPACE_IMAGE was digest-pinned on the affected host (aw-stack pins it
+// there deliberately), workspaceImageForVersion returned that pin unchanged,
+// and so `update to v0.1.82` pulled a five-day-old digest straight out of the
+// local cache, reported success, and reverted the host tree to that image's
+// baked copy. A requested version must reach the registry as <repo>:<version>,
+// and the pinned digest must not appear anywhere in the run.
+func TestUpdateResolvesTheRequestedVersionByTagOnADigestPinnedHost(t *testing.T) {
+	stubRunModule(t)
+	statePath := useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	const stalePin = "ghcr.io/fredericowu/aw-workspace@sha256:083f53b6"
+	t.Setenv("AW_WORKSPACE_IMAGE", stalePin)
+
+	wantTarget := "ghcr.io/fredericowu/aw-workspace:v0.1.82"
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	stubVerifiedImage(r.fakeRunner, wantTarget, "sha256:7f26f751")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, _ := collectEmits()
+
+	data, err := h.Update(context.Background(), h.Opts, map[string]any{"version": "v0.1.82"}, emit)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if !r.ran(wantTarget) {
+		t.Fatalf("update should have pulled %q, calls=%v", wantTarget, r.calls)
+	}
+	for _, call := range r.calls {
+		for _, a := range call {
+			if strings.Contains(a, "083f53b6") {
+				t.Fatalf("the stale digest pin must not be reachable from an update with a version, call=%v", call)
+			}
+		}
+	}
+	if data["digest"] != "sha256:7f26f751" {
+		t.Fatalf("update should report the digest it installed, got %v", data)
+	}
+
+	// ...and the installed digest becomes this host's steady-state image, so
+	// the next container recreate cannot fall back to the env pin.
+	st, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRecorded := "ghcr.io/fredericowu/aw-workspace@sha256:7f26f751"
+	if st.WorkspaceImage != wantRecorded {
+		t.Fatalf("state.WorkspaceImage = %q, want %q", st.WorkspaceImage, wantRecorded)
+	}
+	if got := lastEnvValue(runModuleEnv(BootstrapOpts{WorkspaceSlug: "demo"}, nil), "AW_WORKSPACE_IMAGE"); got != wantRecorded {
+		t.Fatalf("a later recreate would use AW_WORKSPACE_IMAGE=%q, want %q", got, wantRecorded)
+	}
+}
+
+// An update exists to install NEW code, so it cannot succeed offline. The
+// branch that used to warn "image pull failed; using existing local image" and
+// carry on installed the cached — i.e. stale — image, and made every recovery
+// step (ghcr logout+retry, the :latest fallback) dead code on any host that
+// already had the image, which is every installed host.
+func TestUpdateFailsWhenEveryPullAttemptFails(t *testing.T) {
+	stubRunModule(t)
+	useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace:latest")
+
+	target := "ghcr.io/fredericowu/aw-workspace:v0.1.82"
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.fail(fmt.Errorf("dial tcp: lookup ghcr.io: no such host"), "podman", "pull", target)
+	r.fail(fmt.Errorf("dial tcp: lookup ghcr.io: no such host"),
+		"podman", "pull", "ghcr.io/fredericowu/aw-workspace:latest")
+	// The image IS in local storage — the exact condition the old fall-through
+	// treated as good enough.
+	r.on("", "podman", "image", "exists", target)
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, lines := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, map[string]any{"version": "v0.1.82"}, emit); err == nil {
+		t.Fatal("expected Update to fail when the image cannot be pulled")
+	}
+	for _, call := range r.calls {
+		if len(call) >= 2 && call[0] == "podman" && call[1] == "cp" {
+			t.Fatalf("must not have staged anything after a failed pull, calls=%v", r.calls)
+		}
+	}
+	// Recovery must still have been ATTEMPTED — that is what the restructure
+	// bought, and what was unreachable before it.
+	if !r.ran("logout") {
+		t.Fatalf("expected the ghcr.io logout+retry recovery to run, calls=%v", r.calls)
+	}
+	if !r.ran("ghcr.io/fredericowu/aw-workspace:latest") {
+		t.Fatalf("expected the :latest fallback to be attempted, calls=%v", r.calls)
+	}
+	found := false
+	for _, l := range *lines {
+		if strings.Contains(l, "error/update") && strings.Contains(l, "image pull failed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a loud error/update emit, got lines=%v", *lines)
+	}
+}
+
+// The digest cross-check is what makes installing a stale image structurally
+// impossible rather than merely unlikely: whatever the reference resolution
+// does, the image about to be synced has to be what the registry serves for
+// that tag right now. A proven mismatch fails hard, naming both digests.
+func TestUpdateRefusesAnImageTheRegistryHasMovedPast(t *testing.T) {
+	stubRunModule(t)
+	useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace:latest")
+
+	target := "ghcr.io/fredericowu/aw-workspace:v0.1.82"
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.on("sha256:staledigest ghcr.io/fredericowu/aw-workspace@sha256:staledigest",
+		"podman", "image", "inspect", target, "--format", localDigestFormat)
+	r.on(`{"manifests":[{"digest":"sha256:freshdigest"}]}`, "podman", "manifest", "inspect", target)
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, lines := collectEmits()
+
+	_, err := h.Update(context.Background(), h.Opts, map[string]any{"version": "v0.1.82"}, emit)
+	if err == nil {
+		t.Fatal("expected Update to refuse an image the registry no longer serves for that tag")
+	}
+	if !strings.Contains(err.Error(), "sha256:staledigest") || !strings.Contains(err.Error(), "sha256:freshdigest") {
+		t.Fatalf("error should name both digests, got: %v", err)
+	}
+	for _, call := range r.calls {
+		if len(call) >= 2 && call[0] == "podman" && call[1] == "cp" {
+			t.Fatalf("must not have staged the image source once the digest check refused, calls=%v", r.calls)
+		}
+	}
+	found := false
+	for _, l := range *lines {
+		if strings.Contains(l, "error/update") && strings.Contains(l, "refusing to install") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a loud error/update emit, got lines=%v", *lines)
+	}
+}
+
+// "Can't tell" is not "mismatch". A single-manifest image, or a registry whose
+// manifest cannot be read, must not strand the update — the check can only
+// refuse a case it has actually proven, the same rule guardHostNotAheadOfImage
+// follows.
+func TestUpdateProceedsWhenTheRegistryManifestCannotBeRead(t *testing.T) {
+	stubRunModule(t)
+	useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace:latest")
+
+	target := "ghcr.io/fredericowu/aw-workspace:v0.1.82"
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.on("sha256:onlylocal ghcr.io/fredericowu/aw-workspace@sha256:onlylocal",
+		"podman", "image", "inspect", target, "--format", localDigestFormat)
+	r.fail(fmt.Errorf("manifest unknown"), "podman", "manifest", "inspect", target)
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, lines := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, map[string]any{"version": "v0.1.82"}, emit); err != nil {
+		t.Fatalf("Update should proceed when the registry manifest is unreadable: %v", err)
+	}
+	found := false
+	for _, l := range *lines {
+		if strings.Contains(l, "warning/update") && strings.Contains(l, "could not read the registry manifest") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a loud warning/update emit, got lines=%v", *lines)
+	}
+}
+
+// guardHostNotAheadOfImage was CONFIRMED INERT on the affected host: `git` is
+// absent from the aw-remote-host container image, so `git rev-parse HEAD`
+// failed and the guard returned "nothing to guard" — silently, through both
+// the incident it was written for and the repeat two hours later. It still
+// must not fail closed (that would strand updates on every git-less host), but
+// a guard that CANNOT RUN can never again look like a guard that passed.
+func TestUpdateWarnsWhenTheAheadOfImageGuardCannotRun(t *testing.T) {
+	stubRunModule(t)
+	useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+	if err := os.MkdirAll(filepath.Join(hostDir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.fail(fmt.Errorf(`exec: "git": executable file not found in $PATH`),
+		"git", "-C", hostDir, "rev-parse", "HEAD")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, lines := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, nil, emit); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	found := false
+	for _, l := range *lines {
+		if strings.Contains(l, "warning/update") && strings.Contains(l, "INERT") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a loud INERT-guard warning, got lines=%v", *lines)
+	}
+}
+
+// A host with no git checkout at all is the ordinary case (a fresh provision),
+// and must stay quiet — otherwise the warning above becomes noise nobody reads.
+func TestUpdateStaysQuietWhenTheHostIsNotAGitCheckout(t *testing.T) {
+	stubRunModule(t)
+	useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.fail(fmt.Errorf(`exec: "git": executable file not found in $PATH`),
+		"git", "-C", hostDir, "rev-parse", "HEAD")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, lines := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, nil, emit); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	for _, l := range *lines {
+		if strings.Contains(l, "INERT") {
+			t.Fatalf("a non-checkout host has nothing to guard and must not warn, got %q", l)
+		}
 	}
 }

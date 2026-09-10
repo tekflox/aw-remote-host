@@ -156,7 +156,21 @@ func TestRestartOK(t *testing.T) {
 	}
 }
 
+// useTempState points the state-backed image resolution (workspaceImage) and
+// the update's own persistence (recordInstalledImage) at a temp file, so a test
+// never reads — or writes — the machine's real ~/.aw-remote-host/state.json.
+// Same indirection vpnStatePath uses for the same reason.
+func useTempState(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "state.json")
+	prev := workspaceStatePath
+	workspaceStatePath = func() (string, error) { return path, nil }
+	t.Cleanup(func() { workspaceStatePath = prev })
+	return path
+}
+
 func TestWorkspaceImageUsesEnvironmentOverride(t *testing.T) {
+	useTempState(t)
 	t.Setenv("AW_WORKSPACE_IMAGE", "localhost:5000/aw-workspace:e2e")
 
 	if got := workspaceImage(); got != "localhost:5000/aw-workspace:e2e" {
@@ -165,6 +179,7 @@ func TestWorkspaceImageUsesEnvironmentOverride(t *testing.T) {
 }
 
 func TestWorkspaceImageFallsBackToDefault(t *testing.T) {
+	useTempState(t)
 	t.Setenv("AW_WORKSPACE_IMAGE", " ")
 
 	if got := workspaceImage(); got != WorkspaceImage {
@@ -172,23 +187,74 @@ func TestWorkspaceImageFallsBackToDefault(t *testing.T) {
 	}
 }
 
-func TestWorkspaceImageForVersionPinsTag(t *testing.T) {
-	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace:latest")
+// The env pin is what repos/aw-stack's docker-compose.yml sets on this
+// project's own aw-remote-host container, and on 2026-09-10 it was a five-day-
+// old DIGEST that every update silently reinstalled. Once an update has proven
+// a newer image good and recorded it, that record outranks the env — otherwise
+// the very next container recreate drags the host back to the stale digest.
+func TestWorkspaceImagePrefersARecordedInstallOverTheEnvironmentPin(t *testing.T) {
+	path := useTempState(t)
+	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace@sha256:stale")
+	if err := state.Save(path, &state.State{
+		WorkspaceImage: "ghcr.io/fredericowu/aw-workspace@sha256:fresh",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	if got := workspaceImageForVersion("abc1234"); got != "ghcr.io/fredericowu/aw-workspace:abc1234" {
-		t.Fatalf("workspaceImageForVersion() = %q, want pinned tag", got)
+	if got := workspaceImage(); got != "ghcr.io/fredericowu/aw-workspace@sha256:fresh" {
+		t.Fatalf("workspaceImage() = %q, want the recorded install", got)
 	}
 }
 
-func TestWorkspaceImageForVersionPreservesDigest(t *testing.T) {
+// ...and a host that has never completed an update still honours the env pin,
+// which is what keeps bootstrap/reinstall reproducible on a pinned host.
+func TestWorkspaceImageKeepsTheEnvironmentPinUntilAnUpdateRecordsOne(t *testing.T) {
+	useTempState(t)
+	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace@sha256:stale")
+
+	if got := workspaceImage(); got != "ghcr.io/fredericowu/aw-workspace@sha256:stale" {
+		t.Fatalf("workspaceImage() = %q, want the environment pin", got)
+	}
+}
+
+// An explicit "install version X" must resolve to <repo>:X for every shape the
+// configured reference can take. The digest case is the 2026-09-10 root cause:
+// it used to return the pinned reference unchanged, discarding the requested
+// version entirely. The registry-port case is why the tag stripping cannot be
+// a plain LastIndex(":") — "localhost:5000/aw-workspace" has no tag at all.
+func TestWorkspaceImageForVersionResolvesEveryReferenceShapeToTheRequestedTag(t *testing.T) {
+	useTempState(t)
+	for _, tc := range []struct{ name, configured, want string }{
+		{"bare repository", "ghcr.io/fredericowu/aw-workspace", "ghcr.io/fredericowu/aw-workspace:v0.1.82"},
+		{"tagged", "ghcr.io/fredericowu/aw-workspace:latest", "ghcr.io/fredericowu/aw-workspace:v0.1.82"},
+		{"digest-pinned", "ghcr.io/fredericowu/aw-workspace@sha256:deadbeef", "ghcr.io/fredericowu/aw-workspace:v0.1.82"},
+		{"tagged and digest-pinned", "ghcr.io/fredericowu/aw-workspace:latest@sha256:deadbeef", "ghcr.io/fredericowu/aw-workspace:v0.1.82"},
+		{"registry port, no tag", "localhost:5000/aw-workspace", "localhost:5000/aw-workspace:v0.1.82"},
+		{"registry port and tag", "localhost:5000/aw-workspace:e2e", "localhost:5000/aw-workspace:v0.1.82"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AW_WORKSPACE_IMAGE", tc.configured)
+			if got := workspaceImageForVersion("v0.1.82"); got != tc.want {
+				t.Fatalf("workspaceImageForVersion(%q) = %q, want %q", tc.configured, got, tc.want)
+			}
+		})
+	}
+}
+
+// With no version to resolve, the configured reference is honoured verbatim —
+// that is what keeps bootstrap/restart/reinstall on a deliberately pinned host
+// reproducible. Only an explicit version overrides the pin.
+func TestWorkspaceImageForVersionKeepsTheConfiguredReferenceWhenNoVersionIsAsked(t *testing.T) {
+	useTempState(t)
 	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace@sha256:deadbeef")
 
-	if got := workspaceImageForVersion("abc1234"); got != "ghcr.io/fredericowu/aw-workspace@sha256:deadbeef" {
-		t.Fatalf("workspaceImageForVersion() = %q, want digest image unchanged", got)
+	if got := workspaceImageForVersion(""); got != "ghcr.io/fredericowu/aw-workspace@sha256:deadbeef" {
+		t.Fatalf("workspaceImageForVersion(\"\") = %q, want the configured reference", got)
 	}
 }
 
 func TestRunModuleEnvLetsPinnedUpdateImageOverrideInheritedLatest(t *testing.T) {
+	useTempState(t)
 	t.Setenv("AW_WORKSPACE_IMAGE", "ghcr.io/fredericowu/aw-workspace:latest")
 	env := runModuleEnv(
 		BootstrapOpts{WorkspaceSlug: "demo"},
@@ -205,6 +271,7 @@ func TestRunModuleEnvLetsPinnedUpdateImageOverrideInheritedLatest(t *testing.T) 
 // install.sh's AW_WORKSPACE_WORKERS and break the int() parse in
 // src/start/workspace.py.
 func TestRunModuleEnvDefaultsWorkersToOneWithNoStatePath(t *testing.T) {
+	useTempState(t)
 	env := runModuleEnv(BootstrapOpts{WorkspaceSlug: "demo"}, nil)
 
 	if got := lastEnvValue(env, "AW_WORKSPACE_WORKERS"); got != "1" {
@@ -218,6 +285,7 @@ func TestRunModuleEnvDefaultsWorkersToOneWithNoStatePath(t *testing.T) {
 // IMAGE state, and must not silently reset to the image default of 1 on
 // every container recreation.
 func TestRunModuleEnvUsesPersistedWorkerCount(t *testing.T) {
+	useTempState(t)
 	path := t.TempDir() + "/state.json"
 	if err := state.Save(path, &state.State{Workers: 6}); err != nil {
 		t.Fatal(err)

@@ -266,26 +266,72 @@ func (h *Handler) dataDir() string {
 	return "/"
 }
 
+// workspaceStatePath is state.DefaultPath, indirected so a test can point the
+// image resolution/persistence pair below at a temp file rather than the
+// developer's real ~/.aw-remote-host/state.json — same reason vpnStatePath
+// (ops_vpn_bootstrap.go) exists.
+var workspaceStatePath = state.DefaultPath
+
+// workspaceImage is the STEADY-STATE image: what bootstrap/reinstall recreate
+// the container from when no explicit update target was asked for.
+//
+// Precedence is state.json > AW_WORKSPACE_IMAGE > the :latest const above.
+// state.json wins because only Update writes it, and only after the pulled
+// image's digest was checked against the registry (verifyImageDigest). Without
+// that, the env pin whoever created the aw-remote-host container set — on this
+// project's own deployment, repos/aw-stack/docker-compose.yml pins a DIGEST
+// there deliberately, for rollback/reproducibility — would re-assert itself on
+// the very next container recreate and undo the update that had just proven a
+// newer image good. That is how the 2026-09-10 incident perpetuated itself.
+//
+// A deliberate rollback is still expressible, just not by leaving a stale env
+// var lying around: `update` with the older version resolves it by tag,
+// verifies it and rewrites state.json.
 func workspaceImage() string {
+	if path, err := workspaceStatePath(); err == nil {
+		if st, err := state.Load(path); err == nil {
+			if image := strings.TrimSpace(st.WorkspaceImage); image != "" {
+				return image
+			}
+		}
+	}
 	if image := strings.TrimSpace(os.Getenv("AW_WORKSPACE_IMAGE")); image != "" {
 		return image
 	}
 	return WorkspaceImage
 }
 
+// workspaceImageForVersion resolves the UPDATE TARGET, which is deliberately
+// NOT the same concept as workspaceImage above: "install version X" has to
+// reach the registry for X, so whatever digest or tag the configured reference
+// carries is dropped and only the repository is kept.
+//
+// Returning the configured reference unchanged when it was digest-pinned (what
+// this did until 2026-09-10) silently DISCARDED the requested version: the pull
+// of an already-local digest succeeded instantly, the guard passed, and the
+// update reinstalled a 5-day-old image while reporting success — a permanent
+// no-op that also reverted the host tree to that image's baked copy.
 func workspaceImageForVersion(version string) string {
 	image := workspaceImage()
 	version = strings.TrimSpace(version)
 	if version == "" {
 		return image
 	}
+	return imageRepository(image) + ":" + version
+}
+
+// imageRepository strips a "@sha256:…" digest and/or a ":tag" off a reference,
+// leaving the repository. The colon check only fires when nothing after it
+// looks like a path element, so a registry PORT ("localhost:5000/aw-workspace")
+// survives instead of being mangled into "localhost".
+func imageRepository(image string) string {
 	if at := strings.Index(image, "@"); at >= 0 {
-		return image
+		image = image[:at]
 	}
 	if colon := strings.LastIndex(image, ":"); colon >= 0 && !strings.Contains(image[colon+1:], "/") {
-		return image[:colon+1] + version
+		image = image[:colon]
 	}
-	return image + ":" + version
+	return image
 }
 
 func commandError(prefix string, err error, out string) error {
@@ -294,6 +340,116 @@ func commandError(prefix string, err error, out string) error {
 		return fmt.Errorf("%s: %w", prefix, err)
 	}
 	return fmt.Errorf("%s: %w: %s", prefix, err, msg)
+}
+
+// verifyImageDigest proves the image now in local storage is the one the
+// registry currently serves for that reference, and returns the digest that
+// was installed so Update can persist it.
+//
+// This is the "structurally impossible to proceed on a stale image" half of
+// the 2026-09-10 fix: resolving the update target by tag (above) closes the
+// one path that was known to install a stale image, and this closes every
+// other one, including any future path that re-introduces a stale reference.
+// A PROVEN mismatch is a hard failure naming both digests. "Can't tell" —
+// no local digest, an unreadable registry manifest, a single-manifest image
+// with no index to compare against — is a loud warning that proceeds, the
+// same shape guardHostNotAheadOfImage uses, because a false refusal here
+// would strand every future update on hosts this check cannot speak about.
+func (h *Handler) verifyImageDigest(ctx context.Context, image string, emit Emit) (string, error) {
+	local := h.localImageDigests(ctx, image)
+	if len(local) == 0 {
+		emit("warning", "update", "could not read a local digest for "+image+
+			" — proceeding without the registry cross-check")
+		return "", nil
+	}
+	// local[0] is the image's own manifest digest (podman's .Digest); the rest
+	// are its RepoDigests, which on a by-tag pull of a multi-arch image also
+	// carry the index digest. Compare on the whole set, report the first.
+	installed := local[0]
+
+	if strings.Contains(image, "@") {
+		emit("info", "update", "update target "+image+" is an immutable digest reference (local digest "+installed+")")
+		return installed, nil
+	}
+
+	remote := h.registryImageDigests(ctx, image)
+	if len(remote) == 0 {
+		emit("warning", "update", "could not read the registry manifest for "+image+
+			" — proceeding on local digest "+installed+" without the cross-check")
+		return installed, nil
+	}
+	for _, l := range local {
+		for _, r := range remote {
+			if l == r {
+				emit("info", "update", "verified "+image+" against the registry: digest "+installed)
+				return installed, nil
+			}
+		}
+	}
+
+	emit("error", "update", "refusing to install "+image+": local digest "+installed+
+		" is not what the registry serves for that tag ("+strings.Join(remote, ", ")+")")
+	return "", fmt.Errorf(
+		"refusing to install a stale image: %s in local storage is %s, but the registry now serves %s "+
+			"for that tag — the pull did not actually refresh it",
+		image, installed, strings.Join(remote, ", "))
+}
+
+// localImageDigests returns the local image's own manifest digest first,
+// followed by the digest half of each of its RepoDigests.
+func (h *Handler) localImageDigests(ctx context.Context, image string) []string {
+	out, err := h.runner().Run(ctx, "podman", "image", "inspect", image,
+		"--format", "{{.Digest}}{{range .RepoDigests}} {{.}}{{end}}")
+	if err != nil {
+		return nil
+	}
+	var digests []string
+	for _, field := range strings.Fields(out) {
+		if at := strings.Index(field, "@"); at >= 0 {
+			field = field[at+1:]
+		}
+		if strings.HasPrefix(field, "sha256:") {
+			digests = append(digests, field)
+		}
+	}
+	return digests
+}
+
+// registryImageDigests asks the REGISTRY what it currently serves for this
+// reference. `podman manifest inspect` only reads local storage for manifest
+// lists someone built there with `podman manifest create`; for an ordinary
+// image reference it fetches from the registry, which is exactly what makes it
+// usable as an independent second opinion about a local tag (verified against
+// ghcr.io on the affected host, podman 5.4.2).
+//
+// Returns the per-platform manifest digests of an image index. An image that
+// is not an index has none to return — nil, which the caller treats as "can't
+// tell" rather than as a mismatch.
+func (h *Handler) registryImageDigests(ctx context.Context, image string) []string {
+	out, err := h.runner().Run(ctx, "podman", "manifest", "inspect", image)
+	if err != nil {
+		return nil
+	}
+	// The Runner combines stdout and stderr, so a progress/warning line can sit
+	// in front of the JSON.
+	if brace := strings.Index(out, "{"); brace > 0 {
+		out = out[brace:]
+	}
+	var index struct {
+		Manifests []struct {
+			Digest string `json:"digest"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal([]byte(out), &index); err != nil {
+		return nil
+	}
+	var digests []string
+	for _, m := range index.Manifests {
+		if strings.HasPrefix(m.Digest, "sha256:") {
+			digests = append(digests, m.Digest)
+		}
+	}
+	return digests
 }
 
 func podmanPullArgs(image string) []string {
@@ -422,10 +578,26 @@ func (h *Handler) Reinstall(ctx context.Context, opts BootstrapOpts, emit Emit) 
 // intentional rollback.
 func (h *Handler) guardHostNotAheadOfImage(ctx context.Context, hostDir, image string, force bool, emit Emit) error {
 	hostHead := ""
+	headErr := error(nil)
 	if out, err := h.runner().Run(ctx, "git", "-C", hostDir, "rev-parse", "HEAD"); err == nil {
 		hostHead = strings.TrimSpace(out)
+	} else {
+		headErr = err
 	}
 	if hostHead == "" {
+		// A guard that CANNOT RUN must never again be mistaken for a guard that
+		// passed. Confirmed live 2026-09-10: `git` is absent from the
+		// aw-remote-host container image, so this returned nil and guarded
+		// nothing on the exact host whose tree the sync had just reverted —
+		// and stayed inert through the repeat two hours later. Still non-
+		// blocking (failing closed would strand updates on every git-less
+		// host), but no longer silent when there is visibly something to guard.
+		if _, statErr := os.Stat(filepath.Join(hostDir, ".git")); statErr == nil {
+			emit("warning", "update", fmt.Sprintf(
+				"%s IS a git checkout but `git rev-parse HEAD` could not run here (%v) — the ahead-of-image "+
+					"guard is INERT on this host and is checking nothing; the sync will proceed unguarded and "+
+					"can revert committed host work", hostDir, headErr))
+		}
 		return nil // not a git checkout (or git unavailable) — nothing to guard
 	}
 
@@ -481,45 +653,79 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	version, _ := args["version"].(string)
 	version = strings.TrimSpace(version)
 	image := workspaceImageForVersion(version)
-	if version != "" {
-		emit("info", "update", "pulling aw-workspace image "+version)
-	} else {
-		emit("info", "update", "pulling latest aw-workspace image")
+	switch {
+	case version != "":
+		emit("info", "update", "update target for version "+version+" resolved to "+image)
+	case strings.Contains(image, "@"):
+		// No version to resolve by tag, so the configured pin is honoured —
+		// but say so. "pulling latest aw-workspace image" printed over a digest
+		// that cannot move is precisely how the 2026-09-10 no-op looked like a
+		// successful update to everyone watching.
+		emit("warning", "update", "no version was requested and this host's workspace image is digest-pinned ("+
+			image+") — this update can only reinstall that exact digest; pass a version to install a newer one")
+	default:
+		emit("info", "update", "update target resolved to "+image)
 	}
+	emit("info", "update", "pulling "+image)
 	if out, err := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); err != nil {
 		pullErr := commandError("podman pull "+image, err, out)
-		if _, existsErr := h.runner().Run(ctx, "podman", "image", "exists", image); existsErr == nil {
-			emit("warning", "update", "image pull failed; using existing local image "+image)
-		} else {
-			if strings.HasPrefix(image, "ghcr.io/") {
-				_, _ = h.runner().Run(ctx, "podman", "logout", "ghcr.io")
-				if out, retryErr := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); retryErr == nil {
-					err = nil
-				} else {
-					pullErr = commandError("podman pull "+image, retryErr, out)
-				}
-			}
-			if err != nil && version != "" {
-				latestImage := workspaceImage()
-				if latestImage != image {
-					emit("warning", "update", "pinned image pull failed; trying "+latestImage)
-					if out, latestErr := h.runner().Run(ctx, "podman", podmanPullArgs(latestImage)...); latestErr == nil {
-						image = latestImage
-						err = nil
-					} else {
-						pullErr = commandError("podman pull "+latestImage, latestErr, out)
-					}
-				}
-			}
-			if err != nil {
-				emit("error", "update", "image pull failed: "+pullErr.Error())
-				return nil, pullErr
+		emit("warning", "update", "image pull failed ("+pullErr.Error()+") — attempting recovery")
+		pulled := false
+		// A stale/instance-scoped ghcr.io credential is the one pull failure a
+		// retry can actually fix: logout drops it so the retry goes out
+		// anonymously, which is how these public images are served anyway.
+		if strings.HasPrefix(image, "ghcr.io/") {
+			_, _ = h.runner().Run(ctx, "podman", "logout", "ghcr.io")
+			if out, retryErr := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); retryErr == nil {
+				emit("info", "update", "pull succeeded after dropping the ghcr.io credential")
+				pulled = true
+			} else {
+				pullErr = commandError("podman pull "+image, retryErr, out)
 			}
 		}
+		// Last resort for a requested version that simply is not published:
+		// this repository's own :latest TAG. Deliberately a tag and NOT
+		// workspaceImage(), which on a pinned host is a digest podman would
+		// serve straight out of the local cache — i.e. the stale image this
+		// whole path exists to stop installing.
+		if !pulled && version != "" {
+			latestImage := imageRepository(image) + ":latest"
+			if latestImage != image {
+				emit("warning", "update", "pull of "+image+" failed; falling back to "+latestImage)
+				if out, latestErr := h.runner().Run(ctx, "podman", podmanPullArgs(latestImage)...); latestErr == nil {
+					image = latestImage
+					pulled = true
+				} else {
+					pullErr = commandError("podman pull "+latestImage, latestErr, out)
+				}
+			}
+		}
+		// No fall-through to whatever is already in local storage. An update
+		// exists to install NEW code, so it cannot succeed offline — and the
+		// "image pull failed; using existing local image" branch that used to
+		// sit here made every recovery step above dead code on any host that
+		// already had the image, which is every installed host.
+		if !pulled {
+			emit("error", "update", "image pull failed: "+pullErr.Error())
+			return nil, pullErr
+		}
+	}
+	emit("info", "update", "pull finished for "+image)
+
+	digest, err := h.verifyImageDigest(ctx, image, emit)
+	if err != nil {
+		return nil, err
+	}
+	// Recreate from the digest that was just verified rather than from the tag:
+	// a tag can move between this point and the container recreate, a digest
+	// cannot, and this is also the reference persisted below.
+	recreateImage := image
+	if digest != "" {
+		recreateImage = imageRepository(image) + "@" + digest
 	}
 
 	force, _ := args["force"].(bool)
-	if err := h.guardHostNotAheadOfImage(ctx, hostDir, image, force, emit); err != nil {
+	if err := h.guardHostNotAheadOfImage(ctx, hostDir, recreateImage, force, emit); err != nil {
 		return nil, err
 	}
 
@@ -534,7 +740,7 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 
 	seedContainer := WorkspaceContainer + "-update"
 	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", seedContainer)
-	if _, err := h.runner().Run(ctx, "podman", "create", "--name", seedContainer, image); err != nil {
+	if _, err := h.runner().Run(ctx, "podman", "create", "--name", seedContainer, recreateImage); err != nil {
 		return nil, fmt.Errorf("podman create update seed: %w", err)
 	}
 	defer h.runner().Run(ctx, "podman", "rm", "-f", seedContainer)
@@ -547,6 +753,7 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	if err != nil {
 		return nil, err
 	}
+	emit("info", "update", fmt.Sprintf("synced %d top-level entries from the image into %s", len(written), hostDir))
 	// copyPath (inside syncWorkspaceSource) writes as this process's own
 	// user, which leaves the just-synced entries owned by someone the
 	// `ubuntu` user inside the container can't write to. Two cases:
@@ -589,17 +796,50 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 		}
 	}
 
-	emit("info", "update", "recreating workspace container")
+	emit("info", "update", "recreating workspace container from "+recreateImage)
 	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", WorkspaceContainer)
-	if _, err := h.runModulesWithEnv(ctx, opts, false, emit, []string{"AW_WORKSPACE_IMAGE=" + image}); err != nil {
+	if _, err := h.runModulesWithEnv(ctx, opts, false, emit, []string{"AW_WORKSPACE_IMAGE=" + recreateImage}); err != nil {
 		return nil, err
 	}
+	// Only now — a pull that was verified against the registry AND a container
+	// that came back up — does this host's steady-state image move. Everything
+	// that recreates the container later (reinstall, bootstrap) reads this back
+	// through workspaceImage(), so an AW_WORKSPACE_IMAGE env pin set once by
+	// whoever created the aw-remote-host container can no longer quietly pull
+	// the host back to a stale digest on the next recreate.
+	if digest != "" {
+		if err := recordInstalledImage(opts, recreateImage); err != nil {
+			emit("warning", "update", "installed "+recreateImage+
+				" but could not record it in state.json (a later recreate may fall back to the configured image): "+err.Error())
+		} else {
+			emit("info", "update", "recorded "+recreateImage+" as this host's workspace image")
+		}
+	}
 	emit("info", "update", "workspace code updated")
-	data := map[string]any{"updated": true}
+	data := map[string]any{"updated": true, "image": recreateImage}
+	if digest != "" {
+		data["digest"] = digest
+	}
 	if version != "" {
 		data["version"] = version
 	}
 	return data, nil
+}
+
+// recordInstalledImage persists the reference an update actually installed, so
+// workspaceImage() can prefer it over the environment on every later recreate.
+// Writes through state.Update (read-modify-write on disk) rather than saving a
+// struct: this runs inside the long-lived daemon, whose own in-memory State is
+// hours stale by the time an update lands.
+func recordInstalledImage(opts BootstrapOpts, image string) error {
+	path := opts.StatePath
+	if path == "" {
+		var err error
+		if path, err = workspaceStatePath(); err != nil {
+			return err
+		}
+	}
+	return state.Update(path, func(s *state.State) { s.WorkspaceImage = image })
 }
 
 // SelfUpdate installs the requested aw-remote-host release through the public
@@ -966,7 +1206,13 @@ func (h *Handler) runModulesWithEnv(ctx context.Context, opts BootstrapOpts, ful
 }
 
 func runModuleEnv(opts BootstrapOpts, extraEnv []string) []string {
-	env := append(bootstrap.EnvPassthrough("AW_WORKSPACE_IMAGE", "XDG_RUNTIME_DIR"),
+	// AW_WORKSPACE_IMAGE is RESOLVED here rather than passed through from this
+	// process's environment: workspaceImage() prefers the image a verified
+	// update recorded in state.json over the env pin, and a plain passthrough
+	// would hand install.sh that env pin anyway, leaving every recreate after
+	// an update back on the stale digest the update had just replaced.
+	env := append(bootstrap.EnvPassthrough("XDG_RUNTIME_DIR"),
+		"AW_WORKSPACE_IMAGE="+workspaceImage(),
 		"AW_WORKSPACE_SLUG="+opts.WorkspaceSlug,
 		"AW_POSTGRES_PASSWORD="+opts.PostgresPassword,
 		"AW_BACKEND_URL="+opts.ControlPlane,
