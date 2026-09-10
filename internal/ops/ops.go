@@ -622,8 +622,28 @@ func (h *Handler) guardHostNotAheadOfImage(ctx context.Context, hostDir, image s
 			}
 		}
 	}
-	if imageHead == "" || imageHead == hostHead {
-		return nil // unknown image version, or already in sync — nothing to guard
+	if imageHead == "" {
+		return nil // unknown image version — nothing to guard
+	}
+
+	// AW_WORKSPACE_VERSION is baked as whatever string the release was built
+	// with — a tag like "v0.1.83", not necessarily the git commit SHA the
+	// comment above assumes. Resolve it against the host's own git history
+	// before comparing: confirmed live 2026-09-10, AW_WORKSPACE_VERSION was
+	// "v0.1.83" while host HEAD was its commit's raw SHA — the two strings
+	// never matched, so the equality check below never fired, and
+	// `merge-base --is-ancestor "v0.1.83" HEAD` then reported true (a tag is
+	// a valid ref, and a commit is trivially its own ancestor), which the
+	// code below misread as "host is ahead" instead of "identical commit".
+	// A failed resolution leaves imageHead as the raw string, which the
+	// merge-base call further down already treats as "can't tell".
+	if out, err := h.runner().Run(ctx, "git", gitArgs("rev-parse", imageHead+"^{commit}")...); err == nil {
+		if resolved := strings.TrimSpace(out); resolved != "" {
+			imageHead = resolved
+		}
+	}
+	if imageHead == hostHead {
+		return nil // already in sync — nothing to guard
 	}
 
 	if _, err := h.runner().Run(ctx, "git", gitArgs("merge-base", "--is-ancestor", imageHead, hostHead)...); err != nil {

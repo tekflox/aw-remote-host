@@ -315,6 +315,50 @@ func TestUpdateRefusesWhenHostHeadIsAheadOfImage(t *testing.T) {
 	}
 }
 
+// TestUpdateProceedsWhenImageVersionIsATagResolvingToTheSameCommitAsHost is
+// the regression test for the 2026-09-10 false-positive refusal (Kanban
+// aw-remote-host:guard-false-positive-refuses-matching-commit): a release
+// image bakes AW_WORKSPACE_VERSION as the release TAG ("v0.1.83"), not the
+// git commit SHA the guard's own doc comment assumed — confirmed live on
+// host 11e8bd4157845a24, where AW_WORKSPACE_VERSION=v0.1.83 and host HEAD
+// were the identical commit but compared as unequal strings. The guard then
+// fell through to `merge-base --is-ancestor v0.1.83 HEAD`, which resolved
+// the tag and reported it a (trivial, self) ancestor — misread as "host is
+// ahead" and refused a no-op update.
+func TestUpdateProceedsWhenImageVersionIsATagResolvingToTheSameCommitAsHost(t *testing.T) {
+	stubRunModule(t)
+	useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.on("hostsha123", "git", "-c", "safe.directory="+hostDir, "-C", hostDir, "rev-parse", "HEAD")
+	r.on("AW_WORKSPACE_VERSION=v0.1.83", "podman", "image", "inspect",
+		WorkspaceImage, "--format", "{{range .Config.Env}}{{println .}}{{end}}")
+	r.on("hostsha123", "git", "-c", "safe.directory="+hostDir, "-C", hostDir, "rev-parse", "v0.1.83^{commit}")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, _ := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, nil, emit); err != nil {
+		t.Fatalf("Update should treat a tag resolving to the host's own commit as already in sync: %v", err)
+	}
+	for _, call := range r.calls {
+		if contains(call, "merge-base") {
+			t.Fatalf("must not have needed the ancestor check once the resolved commits matched, calls=%v", r.calls)
+		}
+	}
+	staged := false
+	for _, call := range r.calls {
+		if len(call) >= 2 && call[0] == "podman" && call[1] == "cp" {
+			staged = true
+		}
+	}
+	if !staged {
+		t.Fatal("expected the sync to proceed since host and image are at the same commit")
+	}
+}
+
 // force=true must bypass the ahead-of-image guard for an intentional
 // rollback, mirroring the bootstrap downgrade guard's own force arg.
 func TestUpdateForceArgBypassesTheAheadOfImageGuard(t *testing.T) {
