@@ -3,6 +3,7 @@ package vpn
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -345,4 +346,143 @@ func TestBothRecordsAreReadInOnePass(t *testing.T) {
 		t.Fatalf("records did not round-trip: %+v %+v", tunnel, route)
 	}
 	var _ *state.ExternalTunnelState = tunnel
+}
+
+// --- the handshake, which `up` alone could never see ---------------------------
+
+// withStatusNow pins nowUnix so a handshake age is an exact number instead of
+// a range — the same helper, for the same reason, as ops_vpn_external_test's.
+func withStatusNow(t *testing.T, ts int64) {
+	t.Helper()
+	original := nowUnix
+	nowUnix = func() int64 { return ts }
+	t.Cleanup(func() { nowUnix = original })
+}
+
+// THE COMFORTABLE LIE THIS CLOSES. Every measurement this report already made
+// can come back healthy — the device is there, the rule is installed, the kill
+// switch is in force — while the peer at the far end has been unreachable for
+// hours. `up` is interfacePresent and nothing else, and the device outliving
+// the peer is not an anomaly, it is what a dead peer looks like from this
+// side. So the report used to pair `up: true` with a reassuring `since` for a
+// tunnel carrying nothing at all.
+func TestStatusReportsAStaleHandshakeEvenWhileTheInterfaceIsUp(t *testing.T) {
+	isolateState(t)
+	recordATunnelAndARoute(t)
+	now := int64(1788318109)
+	withStatusNow(t, now)
+
+	stale := liveHost()
+	stale.answers["wg show wg0 latest-handshakes"] = fmt.Sprintf("%s\t%d\n", testPeerKey, now-1800)
+
+	got := statusOn(t, stale)
+	if !got.Up {
+		t.Fatal("the interface IS present — this test is about what up:true fails to say, not about up being wrong")
+	}
+	if got.LastHandshakeAgeSeconds == nil || *got.LastHandshakeAgeSeconds != 1800 {
+		t.Fatalf("last_handshake_age_seconds = %v, want 1800", got.LastHandshakeAgeSeconds)
+	}
+	if got.LastHandshakeNever {
+		t.Fatal("last_handshake_never must be false — this peer handshaked, it just did so long ago")
+	}
+	if !hasWarningContaining(got.Warnings, "last completed a handshake") {
+		t.Fatalf("a tunnel that is up and stale must WARN, or nobody reads the number: %v", got.Warnings)
+	}
+}
+
+// The other direction, so the test above cannot pass by always warning: a
+// fresh handshake reports its age and says nothing alarming.
+func TestStatusIsQuietWhenTheHandshakeIsFresh(t *testing.T) {
+	isolateState(t)
+	recordATunnelAndARoute(t)
+	now := int64(1788318109)
+	withStatusNow(t, now)
+
+	fresh := liveHost()
+	fresh.answers["wg show wg0 latest-handshakes"] = fmt.Sprintf("%s\t%d\n", testPeerKey, now-30)
+
+	got := statusOn(t, fresh)
+	if got.LastHandshakeAgeSeconds == nil || *got.LastHandshakeAgeSeconds != 30 {
+		t.Fatalf("last_handshake_age_seconds = %v, want 30", got.LastHandshakeAgeSeconds)
+	}
+	if hasWarningContaining(got.Warnings, "handshake") {
+		t.Fatalf("a fresh handshake must not warn: %v", got.Warnings)
+	}
+}
+
+// ts==0 IS NOT AN AGE. mergeHandshake's rule (ops_vpn_external.go), which
+// exists because rendering 0 as an age computes an age since the Unix epoch —
+// "up since 1970" on a screen a person is trying to trust.
+func TestStatusReportsNeverRatherThanAnAgeSinceTheEpoch(t *testing.T) {
+	isolateState(t)
+	recordATunnelAndARoute(t)
+	withStatusNow(t, 1788318109)
+
+	never := liveHost()
+	never.answers["wg show wg0 latest-handshakes"] = testPeerKey + "\t0\n"
+
+	got := statusOn(t, never)
+	if !got.LastHandshakeNever {
+		t.Fatal("last_handshake_never must be true when wg reports 0")
+	}
+	if got.LastHandshakeAgeSeconds != nil {
+		t.Fatalf("last_handshake_age_seconds = %d, want null — 0 is never, not an age", *got.LastHandshakeAgeSeconds)
+	}
+	if !hasWarningContaining(got.Warnings, "NEVER") {
+		t.Fatalf("a tunnel that never handshaked needs its own sentence: %v", got.Warnings)
+	}
+}
+
+// NEVER AND UNKNOWN ARE DIFFERENT, and this report must not merge them either.
+// A host where `wg` could not be run has measured nothing about its peer;
+// claiming "never handshaked" there sends whoever reads it to check keys and
+// endpoints that were never the problem. Same rule the self-heal loop follows
+// when it declines to repair on a refusal.
+func TestStatusReportsAnUnreadableHandshakeAsUnknownNotAsNever(t *testing.T) {
+	isolateState(t)
+	recordATunnelAndARoute(t)
+	withStatusNow(t, 1788318109)
+
+	refused := liveHost()
+	refused.errs = map[string]error{"wg show wg0 latest-handshakes": fmt.Errorf("sudo: a password is required")}
+
+	got := statusOn(t, refused)
+	if got.LastHandshakeNever {
+		t.Fatal("a refused shellout is not evidence that the peer never answered")
+	}
+	if got.LastHandshakeAgeSeconds != nil {
+		t.Fatalf("last_handshake_age_seconds = %d, want null when nothing could be measured", *got.LastHandshakeAgeSeconds)
+	}
+	if hasWarningContaining(got.Warnings, "handshake") {
+		t.Fatalf("nothing was measured, so there is nothing to warn about: %v", got.Warnings)
+	}
+}
+
+// The contract this report is parsed against is fixed, so the two new fields
+// have to appear in the JSON under the names core will look for — and the age
+// has to be null rather than 0 when absent, the same one-representation-of-
+// absence rule every other nullable field on this struct follows.
+func TestHandshakeFieldsMarshalUnderTheContractsNames(t *testing.T) {
+	isolateState(t)
+	recordATunnelAndARoute(t)
+	withStatusNow(t, 1788318109)
+
+	body, err := json.Marshal(statusOn(t, deadHost()))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, want := range []string{`"last_handshake_age_seconds":null`, `"last_handshake_never":false`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("%s missing from %s", want, body)
+		}
+	}
+}
+
+func hasWarningContaining(warnings []string, substr string) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, substr) {
+			return true
+		}
+	}
+	return false
 }

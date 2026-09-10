@@ -121,6 +121,61 @@ func TestResolveLinuxWithNoSupervisorAtAllIsStillRefused(t *testing.T) {
 	}
 }
 
+// hostedContainer — the "host-with-us" shape: aw-remote-host itself running
+// as an app container on OUR infrastructure on a tenant's behalf, granted
+// ONLY the `tun` hostpower device+capability (internal/hostpower.go's
+// catalog["tun"]: /dev/net/tun + NET_ADMIN, nothing else) — not the broad
+// CapEff b614f41828c8 (awRemoteHostContainer above) actually runs with.
+//
+// Structurally identical to awRemoteHostContainer from this probe's point of
+// view, and that identity IS the point worth writing down: Resolve() never
+// reads a capability set, only HasTUN + Privileged() + a supervisor
+// declaration, which is exactly what the tun grant delivers and nothing
+// more. So the untested part of this path (see the hostpower grant's own
+// doc comment — it has never been exercised by any app) is not "does the
+// eligibility logic work here", which this proves it does; it is "does
+// tailscaled itself run on NET_ADMIN+/dev/net/tun alone with no broader
+// capability", which no Go unit test can answer and stays open until a real
+// hosted container runs this.
+func hostedContainer() Host {
+	return Host{
+		OS: "linux", Arch: "amd64",
+		UID: 0, HasTUN: true,
+		HasSystemd:     false,
+		SupervisorName: "aw-remote-host-entrypoint",
+	}
+}
+
+// The card this fixture exists for: a hosted node must enrol with a REAL TUN
+// interface, never the userspace-networking fallback that looks enrolled
+// while carrying none of the host's traffic (this file's own header).
+func TestResolveHostedContainerEnrolsWithARealTUNInterface(t *testing.T) {
+	e := Resolve(hostedContainer())
+	if !e.CanEnroll {
+		t.Fatalf("a hosted container with the tun grant should enrol: %s", e.EnrollRefusal)
+	}
+	if e.Installer != InstallerUpstreamScript {
+		t.Fatalf("got installer %q, want the real installer — never a fallback", e.Installer)
+	}
+}
+
+// The negative half of the same guarantee: take the device away (the grant
+// was requested but not actually delivered — internal/hostpower.Resolve()
+// models exactly that gap) and this must refuse rather than silently drop to
+// --tun=userspace-networking, which bootstrap/vpn/install.sh and this
+// package both refuse to do.
+func TestResolveHostedContainerWithoutTheTUNDeviceIsRefusedNotDowngraded(t *testing.T) {
+	h := hostedContainer()
+	h.HasTUN = false
+	e := Resolve(h)
+	if e.CanEnroll {
+		t.Fatal("a hosted container that did not actually get /dev/net/tun must refuse, not downgrade")
+	}
+	if !strings.Contains(e.EnrollRefusal, "/dev/net/tun") {
+		t.Fatalf("got %q", e.EnrollRefusal)
+	}
+}
+
 // probeSupervisor turns a claim into a measurement, and these are the two ways
 // the claim goes stale. /run is NOT a tmpfs in every container — on
 // b614f41828c8 it is part of the image's own overlay — so a marker can outlive

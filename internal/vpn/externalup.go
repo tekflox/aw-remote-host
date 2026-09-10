@@ -910,16 +910,27 @@ func externalTunnelAlreadyUp(ctx context.Context, r Runner, plan ExternalUpPlan)
 }
 
 func tunnelPeerPresent(ctx context.Context, r Runner, plan ExternalUpPlan) bool {
+	present, err := tunnelPeerState(ctx, r, plan)
+	return err == nil && present
+}
+
+// tunnelPeerState is tunnelPeerPresent with the read failure kept apart from
+// the answer, for the same reason latestHandshake now returns an error: a
+// refused `wg` is not evidence that the peer is missing, and an unattended
+// loop that treated it as such would tear down a healthy tunnel. The bool-only
+// form above stays because the dial path genuinely wants "not proven present"
+// to mean "converge by re-applying" — it is about to re-apply either way.
+func tunnelPeerState(ctx context.Context, r Runner, plan ExternalUpPlan) (bool, error) {
 	out, err := r.Run(ctx, "wg", "show", plan.Iface, "peers")
 	if err != nil {
-		return false
+		return false, fmt.Errorf("the peers on %s could not be read: %w", plan.Iface, err)
 	}
 	for _, line := range strings.Split(out, "\n") {
 		if strings.TrimSpace(line) == plan.PeerPublicKey {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // defaultInTable reports whether the tunnel's default is in its table, and
@@ -1043,7 +1054,16 @@ func ExternalUp(ctx context.Context, spec ExternalUpSpec, progress Progress) (Ex
 	// is already carrying traffic.
 	if plan.AlreadyUp {
 		res.AlreadyUp, res.Confirmed = true, true
-		res.HandshakeAt = latestHandshake(ctx, runner, *plan)
+		// A failed read leaves HandshakeAt at 0 and is narrated rather than
+		// swallowed. Confirmation is not at stake here — AlreadyUp has already
+		// proven the peer is on the interface and the default is in the table
+		// — so this is evidence, not a verdict, and a host where `wg` cannot
+		// be run should say that instead of implying the peer never answered.
+		handshake, herr := latestHandshake(ctx, runner, *plan)
+		if herr != nil {
+			progress.emit("warn", "tunnel %s is already up, but its latest handshake could not be read: %v", plan.Iface, herr)
+		}
+		res.HandshakeAt = handshake
 		progress.emit("info", "tunnel %s is ALREADY up for this exact profile (%s), in table %d — nothing to change", plan.Iface, shortFingerprint(plan.ProfileSHA256), plan.Table)
 		return res, nil
 	}
@@ -1201,16 +1221,25 @@ func applyExternalUp(ctx context.Context, r Runner, plan ExternalUpPlan) error {
 }
 
 func tunnelDevicePresent(ctx context.Context, r Runner, plan ExternalUpPlan) bool {
+	present, err := tunnelDeviceState(ctx, r, plan)
+	return err == nil && present
+}
+
+// tunnelDeviceState is tunnelDevicePresent keeping the read failure apart from
+// the answer — see tunnelPeerState for why. applyExternalUp keeps using the
+// bool form deliberately: there, "could not tell" and "not there" both mean
+// "do not try to take it down first", which is the safe move either way.
+func tunnelDeviceState(ctx context.Context, r Runner, plan ExternalUpPlan) (bool, error) {
 	out, err := r.Run(ctx, "wg", "show", "interfaces")
 	if err != nil {
-		return false
+		return false, fmt.Errorf("the WireGuard interfaces on this host could not be listed: %w", err)
 	}
 	for _, f := range strings.Fields(out) {
 		if f == plan.Iface {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // revertExternalUp takes the tunnel back down and removes exactly what this
@@ -1424,7 +1453,16 @@ func confirmExternalUpOnce(ctx context.Context, r Runner, plan ExternalUpPlan, h
 		return c
 	}
 
-	c.handshakeAt = latestHandshake(ctx, r, plan)
+	handshake, herr := latestHandshake(ctx, r, plan)
+	if herr != nil {
+		// Not "the peer never answered" — "this host could not be asked".
+		// Reporting the former for the latter blames a working peer for a
+		// local privilege refusal, and sends whoever reads it to check keys
+		// and endpoints that were never the problem.
+		c.reason = herr.Error()
+		return c
+	}
+	c.handshakeAt = handshake
 	if c.handshakeAt == 0 {
 		// PlanExternalUp already refuses a profile with no keepalive, so
 		// reaching here means one WAS configured and the peer still did not
@@ -1440,10 +1478,22 @@ func confirmExternalUpOnce(ctx context.Context, r Runner, plan ExternalUpPlan, h
 // latestHandshake reads the peer's last handshake as unix seconds, 0 when
 // there has never been one. Zero is a real answer and never rendered as an
 // age — the same rule mergeHandshake follows on the read side.
-func latestHandshake(ctx context.Context, r Runner, plan ExternalUpPlan) int64 {
+//
+// "NEVER HANDSHAKED" AND "COULD NOT ASK" ARE DIFFERENT ANSWERS, and that is
+// why this returns an error rather than folding both into 0. It used to
+// answer `0` when the shellout failed, which is harmless in a dial somebody
+// is watching — they see the refusal on screen anyway — and is a false
+// positive that TEARS DOWN A HEALTHY TUNNEL the moment an unattended loop
+// reads it (SelfHealLoop, selfheal.go). `sudo -n wg` being refused, or `wg`
+// missing for an instant mid-upgrade, is not evidence about the peer. A
+// caller that cannot tell the two apart must skip, not repair.
+//
+// An unparseable timestamp is an error for the same reason: it is wg saying
+// something this code does not understand, not wg saying "never".
+func latestHandshake(ctx context.Context, r Runner, plan ExternalUpPlan) (int64, error) {
 	out, err := r.Run(ctx, "wg", "show", plan.Iface, "latest-handshakes")
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("the peer's latest handshake on %s could not be read: %w", plan.Iface, err)
 	}
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
@@ -1452,11 +1502,15 @@ func latestHandshake(ctx context.Context, r Runner, plan ExternalUpPlan) int64 {
 		}
 		ts, convErr := strconv.ParseInt(f[1], 10, 64)
 		if convErr != nil {
-			return 0
+			return 0, fmt.Errorf("wg reported %q as the latest handshake on %s, which is not a unix timestamp: %w", f[1], plan.Iface, convErr)
 		}
-		return ts
+		return ts, nil
 	}
-	return 0
+	// The interface exists and does not list this peer at all. That is a real
+	// "never", not a failed read — and the callers that care about the
+	// difference between "wrong peer" and "no handshake" ask
+	// tunnelPeerPresent, which is the question that actually answers it.
+	return 0, nil
 }
 
 // shortFingerprint is what a narration line may say about a key or a hash.

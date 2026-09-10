@@ -789,12 +789,84 @@ func TestHandshakeIsReadPerPeerAndZeroMeansNever(t *testing.T) {
 
 	r := upHost()
 	r.answers["wg show wg0 latest-handshakes"] = "someoneelse=\t1788318109\n" + testPeerKey + "\t0\n"
-	if got := latestHandshake(context.Background(), r, *plan); got != 0 {
+	got, err := latestHandshake(context.Background(), r, *plan)
+	if err != nil {
+		t.Fatalf("a peer reporting 0 is an ANSWER, not a failure: %v", err)
+	}
+	if got != 0 {
 		t.Fatalf("handshake = %d, want 0 — this peer has never completed one", got)
 	}
 	r.answers["wg show wg0 latest-handshakes"] = testPeerKey + "\t1788318109\n"
-	if got := latestHandshake(context.Background(), r, *plan); got != 1788318109 {
+	got, err = latestHandshake(context.Background(), r, *plan)
+	if err != nil {
+		t.Fatalf("latestHandshake: %v", err)
+	}
+	if got != 1788318109 {
 		t.Fatalf("handshake = %d", got)
+	}
+}
+
+// THE LATENT BUG THIS CARD FIXES. `latestHandshake` used to answer 0 — the
+// same value it uses for "this peer has never handshaked" — when the shellout
+// itself failed. In a dial somebody is watching that is harmless; the refusal
+// is on their screen either way. Under SelfHealLoop it is a false positive
+// that tears down a HEALTHY tunnel every single time `sudo -n wg` is refused,
+// or `wg` is briefly absent mid-package-upgrade. A refused command is not
+// evidence about a peer, and the two answers must not share a representation.
+func TestLatestHandshakeReportsARefusedShelloutAsAnErrorNotAsNever(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	plan := planUpOn(t, upHost(), mustProfile(t))
+
+	refused := upHost()
+	refused.errs = map[string]error{
+		"wg show wg0 latest-handshakes": fmt.Errorf("sudo: a password is required"),
+	}
+	got, err := latestHandshake(context.Background(), refused, *plan)
+	if err == nil {
+		t.Fatal("a refused `wg` must be an error — returning 0 makes it indistinguishable from a peer that never answered")
+	}
+	if got != 0 {
+		t.Fatalf("handshake = %d, want 0 alongside the error", got)
+	}
+
+	// Same rule for output this code cannot parse: that is wg saying something
+	// unrecognised, not wg saying "never".
+	garbled := upHost()
+	garbled.answers["wg show wg0 latest-handshakes"] = testPeerKey + "\tnot-a-timestamp\n"
+	if _, err := latestHandshake(context.Background(), garbled, *plan); err == nil {
+		t.Fatal("an unparseable timestamp must be an error, not a silent 0")
+	}
+}
+
+// The same conflation, one layer up: the two predicates the self-heal loop
+// measures with have bool-only forms whose `false` covers both "not there" and
+// "could not ask". They keep those forms for the dial path — which re-applies
+// either way — and gained error-returning siblings for the loop, which must
+// never repair on a refusal.
+func TestDeviceAndPeerStateSeparateARefusalFromAnAbsence(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	plan := planUpOn(t, upHost(), mustProfile(t))
+
+	refused := upHost()
+	refused.errs = map[string]error{"wg show": fmt.Errorf("sudo: a password is required")}
+	if _, err := tunnelDeviceState(context.Background(), refused, *plan); err == nil {
+		t.Fatal("a refused `wg show interfaces` must be an error, not a missing device")
+	}
+
+	absent := upHost()
+	absent.answers["wg show interfaces"] = "\n"
+	present, err := tunnelDeviceState(context.Background(), absent, *plan)
+	if err != nil || present {
+		t.Fatalf("device = %v, err = %v — a readable host with no wg0 is a plain absence", present, err)
+	}
+
+	peerRefused := upHost()
+	peerRefused.answers["wg show interfaces"] = "wg0\n"
+	peerRefused.errs = map[string]error{"wg show wg0 peers": fmt.Errorf("sudo: a password is required")}
+	if _, err := tunnelPeerState(context.Background(), peerRefused, *plan); err == nil {
+		t.Fatal("a refused `wg show wg0 peers` must be an error, not a missing peer")
 	}
 }
 

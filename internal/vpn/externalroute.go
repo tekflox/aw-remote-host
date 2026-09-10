@@ -1066,34 +1066,12 @@ func reassertPlan(ctx context.Context, r Runner, plan ExternalRoutePlan) (restor
 // into something observable.
 const ReassertInterval = 30 * time.Second
 
-// ReassertLoop re-asserts the recorded external route until ctx is cancelled,
-// reporting each time it actually had to put something back.
-//
-// It runs one pass immediately: a host coming back from a reboot has an empty
-// rule table and a state file that still records a route, and waiting a full
-// interval to notice would be a gap for no reason. Errors are reported and
-// never fatal — the same bargain firewall.SelfHeal makes at the same point in
-// startup, and for the same reason: a self-heal that could not run must not
-// stop this process from linking at all.
-func ReassertLoop(ctx context.Context, r Runner, report func(restored []string, err error)) {
-	pass := func() {
-		restored, err := Reassert(ctx, r)
-		if report != nil && (len(restored) > 0 || err != nil) {
-			report(restored, err)
-		}
-	}
-	pass()
-	ticker := time.NewTicker(ReassertInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			pass()
-		}
-	}
-}
+// The loop that drives Reassert on this interval lives in selfheal.go
+// (SelfHealLoop). It used to be ReassertLoop, here, covering the route and
+// nothing else; it was replaced rather than joined by a second goroutine
+// because the tunnel pass and the route pass both write to table 200 and the
+// tunnel has to go first — a route re-asserted before the interface it points
+// at came back is a route pointing at nothing.
 
 // --- resolution -------------------------------------------------------------
 

@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/state"
 )
@@ -90,6 +91,20 @@ type ExternalStatusReport struct {
 	DeadmanArmed      bool    `json:"deadman_armed"`
 	DeadmanExpiresAt  *string `json:"deadman_expires_at"`
 	Since             *string `json:"since"`
+
+	// THE INTERFACE BEING THERE IS NOT THE TUNNEL WORKING, and until these two
+	// fields existed this report could not say so. `up` is interfacePresent
+	// and nothing more, so a tunnel whose peer died overnight reported
+	// `up: true` next to a reassuring `since` — the device outlives the peer
+	// by design, that is what a dead peer looks like from this side.
+	//
+	// LastHandshakeNever follows mergeHandshake's rule (ops_vpn_external.go):
+	// a wg timestamp of 0 means no handshake has EVER happened, and rendering
+	// that as an age computes an age since the Unix epoch. Never and unknown
+	// are also kept apart — on a host where `wg` could not be run, the age is
+	// null and Never is false, because nothing was measured either way.
+	LastHandshakeAgeSeconds *int64 `json:"last_handshake_age_seconds"`
+	LastHandshakeNever      bool   `json:"last_handshake_never"`
 
 	// Guarantees carries dns_tunneled, kill_switch and warnings at the top
 	// level of the JSON. Unlike the two apply verbs, which report what they
@@ -166,6 +181,36 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 	// thing this function does.
 	report.Up = interfacePresent(ctx, runner, report.Iface)
 
+	// THE HANDSHAKE, MEASURED, on the same principle as the kill switch below:
+	// the thing that can go away silently is the thing that has to be asked
+	// about on every call. Only when a tunnel is recorded (the peer key comes
+	// from the record — it is public by definition and is the only identity
+	// wg indexes handshakes by) and only when the device is actually there,
+	// because `wg show <iface> latest-handshakes` on an absent interface is a
+	// failure that says nothing.
+	//
+	// The WARNINGS this produces are appended further down, after
+	// newExternalGuarantees has built the list — it assigns Warnings whole, so
+	// anything added before it would be silently dropped.
+	if tunnel != nil && report.Up && tunnel.PeerPublicKey != "" {
+		ts, err := latestHandshake(ctx, runner, ExternalUpPlan{Iface: report.Iface, PeerPublicKey: tunnel.PeerPublicKey})
+		switch {
+		case err != nil:
+			// Unknown. Both fields stay at their zero values — null age and
+			// Never false — because a refused shellout is not evidence that
+			// the peer never answered. Same rule the self-heal loop follows
+			// when it declines to repair on a refusal.
+		case ts == 0:
+			report.LastHandshakeNever = true
+		default:
+			age := nowUnix() - ts
+			if age < 0 {
+				age = 0
+			}
+			report.LastHandshakeAgeSeconds = &age
+		}
+	}
+
 	if route != nil {
 		container := route.Container
 		report.Container = &container
@@ -204,6 +249,18 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 	// privacy guarantee that had already lapsed, which is the one lie this
 	// file exists to make impossible.
 	report.ExternalGuarantees = newExternalGuarantees(report.Up || report.RuleInstalled, killSwitch, measuredDNSTunneled(ctx, runner, route))
+
+	// THE SENTENCE THAT USED NOT TO EXIST. Everything above can report a
+	// perfectly healthy tunnel — device present, rule installed, kill switch
+	// in force — while the peer at the other end has been unreachable for
+	// hours, because none of those measurements involve the peer. This is the
+	// only line on this report that does.
+	switch {
+	case report.LastHandshakeNever:
+		report.Warnings = appendWarning(report.Warnings, handshakeNeverWarning(report.Iface))
+	case report.LastHandshakeAgeSeconds != nil && time.Duration(*report.LastHandshakeAgeSeconds)*time.Second > HandshakeStaleAfter:
+		report.Warnings = appendWarning(report.Warnings, handshakeStaleWarning(report.Iface, *report.LastHandshakeAgeSeconds))
+	}
 
 	if d, err := LoadDeadman(); err == nil && d != nil {
 		expires := d.ExpiresAt
@@ -351,6 +408,32 @@ func hostEgressMatchesContainer(hostEgressIP, containerEgressIP *string) string 
 	return containerEgressUnroutedWarning(*hostEgressIP)
 }
 
+// nowUnix is time.Now().Unix(), indirected so a test can fix "now" instead of
+// asserting on a moving age. Same shape, same reason, as ops_vpn_external.go's
+// — the two packages measure the same thing on either side of the wire and a
+// test that could not pin one of them would have to assert on a range.
+var nowUnix = func() int64 { return time.Now().Unix() }
+
+// handshakeStaleWarning is shown when the interface is up and the peer has
+// gone quiet for longer than a keepalive-configured peer can.
+//
+// It says what `up: true` does NOT mean, because that is the specific
+// misreading this whole field exists to stop: the device staying put after the
+// peer dies is normal, not a contradiction, and a person looking at "UP" with
+// a comforting `since` next to it has no way to know that.
+func handshakeStaleWarning(iface string, ageSeconds int64) string {
+	return "Interface " + iface + " is up, but its peer last completed a handshake " +
+		(time.Duration(ageSeconds) * time.Second).Round(time.Second).String() +
+		" ago — longer than the " + HandshakeStaleAfter.String() +
+		" a peer with a keepalive configured should ever go quiet for. `up` only means the device is present, which it stays after the peer dies, so this tunnel is very likely carrying nothing. The daemon's self-heal re-dials it from the recorded config on its own; if this persists across several minutes, the peer or this host's uplink is genuinely down. Check `aw-remote-host vpn external-status` again, and ~/.aw-remote-host/vpn-selfheal.log for what the daemon has already tried."
+}
+
+// handshakeNeverWarning is the same failure at its worst: a tunnel that came
+// up and never worked at all, as opposed to one that stopped working.
+func handshakeNeverWarning(iface string) string {
+	return "Interface " + iface + " is up and its peer has NEVER completed a handshake, so the device exists but the tunnel has never carried traffic. That is a peer, key or endpoint problem rather than something that broke later — the profile is required to configure a keepalive, so the peer should have answered by now. Check the endpoint address and the keys in the profile this was dialled with."
+}
+
 // interfacePresent asks wg which interfaces exist. A host with no `wg` at all
 // answers false rather than erroring: this verb is polled by a screen, and a
 // host that cannot run WireGuard genuinely has no tunnel up.
@@ -384,6 +467,17 @@ func (r ExternalStatusReport) Describe() []string {
 	}
 	if r.RuleInstalled && !r.Up {
 		out = append(out, "WARNING — a policy rule is in force and the tunnel interface is GONE. That is what the dead-man's switch leaves behind when it fires, or what a flush leaves behind. Run `aw-remote-host vpn external-down` to tidy up.")
+	}
+	// Printed next to `up` rather than buried with the warnings, because it is
+	// the qualifier on `up` — the two are one fact and reading either alone is
+	// how "UP" gets believed about a tunnel whose peer is gone.
+	switch {
+	case r.LastHandshakeNever:
+		out = append(out, "last handshake: NEVER — the device is there and the tunnel has never carried traffic")
+	case r.LastHandshakeAgeSeconds != nil:
+		out = append(out, "last handshake: "+(time.Duration(*r.LastHandshakeAgeSeconds)*time.Second).Round(time.Second).String()+" ago")
+	case r.Up:
+		out = append(out, "last handshake: could not be measured on this host")
 	}
 	if r.HostEgressIP != nil {
 		out = append(out, "host egress: "+*r.HostEgressIP+" (this must NOT be the tunnel's address)")
