@@ -577,9 +577,21 @@ func (h *Handler) Reinstall(ctx context.Context, opts BootstrapOpts, emit Emit) 
 // host's HEAD — refuses outright; args["force"]=true overrides it for an
 // intentional rollback.
 func (h *Handler) guardHostNotAheadOfImage(ctx context.Context, hostDir, image string, force bool, emit Emit) error {
+	// safe.directory is not optional here, and installing `git` in the image
+	// (v0.1.96) was only half the fix. This daemon runs as root while the host
+	// tree is owned by the workspace's own uid (1001 on the bare metal), so
+	// every git call below fails with "detected dubious ownership" — which
+	// lands in exactly the same empty-hostHead branch as "git is not
+	// installed", i.e. the guard goes back to returning nil and guarding
+	// nothing. Measured on the affected host 2026-09-10: with git present but
+	// no exception, `rev-parse HEAD` still failed and the guard stayed inert.
+	// Scoped to hostDir rather than "*" so this grants the least it can.
+	gitArgs := func(args ...string) []string {
+		return append([]string{"-c", "safe.directory=" + hostDir, "-C", hostDir}, args...)
+	}
 	hostHead := ""
 	headErr := error(nil)
-	if out, err := h.runner().Run(ctx, "git", "-C", hostDir, "rev-parse", "HEAD"); err == nil {
+	if out, err := h.runner().Run(ctx, "git", gitArgs("rev-parse", "HEAD")...); err == nil {
 		hostHead = strings.TrimSpace(out)
 	} else {
 		headErr = err
@@ -614,7 +626,7 @@ func (h *Handler) guardHostNotAheadOfImage(ctx context.Context, hostDir, image s
 		return nil // unknown image version, or already in sync — nothing to guard
 	}
 
-	if _, err := h.runner().Run(ctx, "git", "-C", hostDir, "merge-base", "--is-ancestor", imageHead, hostHead); err != nil {
+	if _, err := h.runner().Run(ctx, "git", gitArgs("merge-base", "--is-ancestor", imageHead, hostHead)...); err != nil {
 		emit("warning", "update", fmt.Sprintf(
 			"could not confirm host HEAD %s is not ahead of image %s (%v) — the image commit is not in this host's git history, so the ordering can't be proven either way; proceeding with sync",
 			hostHead, imageHead, err))

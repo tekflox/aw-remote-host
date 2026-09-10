@@ -284,10 +284,10 @@ func TestUpdateRefusesWhenHostHeadIsAheadOfImage(t *testing.T) {
 	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
 
 	r := &copyingRunner{fakeRunner: newFakeRunner()}
-	r.on("hostsha123", "git", "-C", hostDir, "rev-parse", "HEAD")
+	r.on("hostsha123", "git", "-c", "safe.directory="+hostDir, "-C", hostDir, "rev-parse", "HEAD")
 	r.on("AW_WORKSPACE_VERSION=imagesha456", "podman", "image", "inspect",
 		WorkspaceImage, "--format", "{{range .Config.Env}}{{println .}}{{end}}")
-	r.on("", "git", "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
+	r.on("", "git", "-c", "safe.directory="+hostDir, "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
 
 	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
 	emit, lines := collectEmits()
@@ -324,10 +324,10 @@ func TestUpdateForceArgBypassesTheAheadOfImageGuard(t *testing.T) {
 	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
 
 	r := &copyingRunner{fakeRunner: newFakeRunner()}
-	r.on("hostsha123", "git", "-C", hostDir, "rev-parse", "HEAD")
+	r.on("hostsha123", "git", "-c", "safe.directory="+hostDir, "-C", hostDir, "rev-parse", "HEAD")
 	r.on("AW_WORKSPACE_VERSION=imagesha456", "podman", "image", "inspect",
 		WorkspaceImage, "--format", "{{range .Config.Env}}{{println .}}{{end}}")
-	r.on("", "git", "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
+	r.on("", "git", "-c", "safe.directory="+hostDir, "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
 
 	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
 	emit, _ := collectEmits()
@@ -358,11 +358,11 @@ func TestUpdateProceedsWhenAncestryCannotBeDetermined(t *testing.T) {
 	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
 
 	r := &copyingRunner{fakeRunner: newFakeRunner()}
-	r.on("hostsha123", "git", "-C", hostDir, "rev-parse", "HEAD")
+	r.on("hostsha123", "git", "-c", "safe.directory="+hostDir, "-C", hostDir, "rev-parse", "HEAD")
 	r.on("AW_WORKSPACE_VERSION=imagesha456", "podman", "image", "inspect",
 		WorkspaceImage, "--format", "{{range .Config.Env}}{{println .}}{{end}}")
 	r.fail(fmt.Errorf("fatal: not a valid object name"),
-		"git", "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
+		"git", "-c", "safe.directory="+hostDir, "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
 
 	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
 	emit, lines := collectEmits()
@@ -595,7 +595,7 @@ func TestUpdateWarnsWhenTheAheadOfImageGuardCannotRun(t *testing.T) {
 
 	r := &copyingRunner{fakeRunner: newFakeRunner()}
 	r.fail(fmt.Errorf(`exec: "git": executable file not found in $PATH`),
-		"git", "-C", hostDir, "rev-parse", "HEAD")
+		"git", "-c", "safe.directory="+hostDir, "-C", hostDir, "rev-parse", "HEAD")
 
 	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
 	emit, lines := collectEmits()
@@ -614,6 +614,48 @@ func TestUpdateWarnsWhenTheAheadOfImageGuardCannotRun(t *testing.T) {
 	}
 }
 
+// Installing git in the image (v0.1.96) was only half of arming this guard.
+// The daemon runs as root while the host tree belongs to the workspace's own
+// uid, so without an explicit safe.directory exception git refuses with
+// "detected dubious ownership" — which lands in the SAME empty-hostHead branch
+// as "git is not installed", i.e. the guard silently goes back to guarding
+// nothing. Measured on the bare metal 2026-09-10: git present, exception
+// absent, `rev-parse HEAD` still failed. Asserted on the argv because that is
+// the only part a unit test can see, and it is the part that regresses.
+func TestAheadOfImageGuardPassesASafeDirectoryException(t *testing.T) {
+	stubRunModule(t)
+	useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.on("hostsha123", "git", "-c", "safe.directory="+hostDir, "-C", hostDir, "rev-parse", "HEAD")
+	r.on("AW_WORKSPACE_VERSION=imagesha456", "podman", "image", "inspect",
+		WorkspaceImage, "--format", "{{range .Config.Env}}{{println .}}{{end}}")
+	r.on("", "git", "-c", "safe.directory="+hostDir, "-C", hostDir, "merge-base", "--is-ancestor", "imagesha456", "hostsha123")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, _ := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, nil, emit); err == nil {
+		t.Fatal("expected the guard to refuse; a guard that cannot read the tree returns nil and guards nothing")
+	}
+
+	var gitCalls int
+	for _, call := range r.calls {
+		if len(call) == 0 || call[0] != "git" {
+			continue
+		}
+		gitCalls++
+		if len(call) < 3 || call[1] != "-c" || call[2] != "safe.directory="+hostDir {
+			t.Fatalf("every git call must carry the safe.directory exception, got: %v", call)
+		}
+	}
+	if gitCalls == 0 {
+		t.Fatal("expected the guard to shell out to git at all")
+	}
+}
+
 // A host with no git checkout at all is the ordinary case (a fresh provision),
 // and must stay quiet — otherwise the warning above becomes noise nobody reads.
 func TestUpdateStaysQuietWhenTheHostIsNotAGitCheckout(t *testing.T) {
@@ -624,7 +666,7 @@ func TestUpdateStaysQuietWhenTheHostIsNotAGitCheckout(t *testing.T) {
 
 	r := &copyingRunner{fakeRunner: newFakeRunner()}
 	r.fail(fmt.Errorf(`exec: "git": executable file not found in $PATH`),
-		"git", "-C", hostDir, "rev-parse", "HEAD")
+		"git", "-c", "safe.directory="+hostDir, "-C", hostDir, "rev-parse", "HEAD")
 
 	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
 	emit, lines := collectEmits()
