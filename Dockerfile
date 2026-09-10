@@ -71,8 +71,14 @@ FROM debian:trixie-slim
 #   iproute2         ip (route/rule/link) — also what discover_bridge() reads
 #   wireguard-tools  wg, wg-quick
 #   openvpn          the other provider protocol
+#   git              ops.go's guardHostNotAheadOfImage shells out to `git
+#                    rev-parse`/`merge-base` against the host tree bind-mount
+#                    to decide whether Update() would silently revert
+#                    committed host work — without this binary that check
+#                    can't read a host HEAD at all and silently no-ops,
+#                    exactly on the containerised host form this ships to.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates bash sudo curl procps psmisc file \
+      ca-certificates bash sudo curl procps psmisc file git \
       iproute2 wireguard-tools openvpn && \
     rm -rf /var/lib/apt/lists/*
 
