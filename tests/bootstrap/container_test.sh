@@ -115,6 +115,75 @@ check "mount_source agrees when podman reports that same literal (symlinked) pat
   "$resolved" "$(mount_source aw-remote-host-postgres /var/lib/postgresql/data)"
 unset AW_POSTGRES_HOST_DIR
 
+# ---------------------------------------------------------------------------
+# container_is_live / start_or_discard
+#
+# The 2026-09-10 outage in one sentence: the outer container was recreated, so
+# every nested container's process died, but podman's DB (on the surviving
+# graphroot) still said "running" — and `podman start` on a container already
+# recorded as running returns 0 WITHOUT STARTING ANYTHING. bootstrap therefore
+# reported success over a host with nothing running on it.
+# ---------------------------------------------------------------------------
+
+# Re-stub podman for the lifecycle calls. Records what it was asked to do so a
+# test can assert the container was actually discarded, not merely "handled".
+FAKE_RUNNING="true"      # what .State.Running reports
+FAKE_PID="0"             # what .State.Pid reports
+PODMAN_CALLS=""
+podman() {
+  PODMAN_CALLS="$PODMAN_CALLS $1"
+  case "$1" in
+    inspect)
+      case "$*" in
+        *State.Running*) printf '%s' "$FAKE_RUNNING" ;;
+        *State.Pid*)     printf '%s' "$FAKE_PID" ;;
+      esac
+      return 0 ;;
+    start|stop|rm) return 0 ;;
+    *) echo "podman: unstubbed subcommand invoked by test: $*" >&2; return 1 ;;
+  esac
+}
+# The /proc probe is gated on rootful Linux. Force that branch on so the test
+# exercises the real code path on any machine CI happens to run on.
+uname() { echo Linux; }
+id() { echo 0; }
+
+FAKE_RUNNING="true"; FAKE_PID="$$"   # our own pid: guaranteed to be in /proc
+PODMAN_CALLS=""
+start_or_discard aw-test-c testmod >/dev/null 2>&1
+check "a genuinely live container is kept" "0" "$?"
+case "$PODMAN_CALLS" in *rm*) bad "a live container must not be removed" "saw rm in:$PODMAN_CALLS" ;; *) ok "a live container is not removed" ;; esac
+
+# THE REGRESSION. podman says running, no such process. Before this fix the
+# bare `podman start || true` returned 0 here and bootstrap carried on.
+FAKE_RUNNING="true"; FAKE_PID="999999999"
+PODMAN_CALLS=""
+start_or_discard aw-test-c testmod >/dev/null 2>&1
+check "a container podman calls running with a dead pid is discarded" "1" "$?"
+case "$PODMAN_CALLS" in *rm*) ok "the dead-but-running container is removed so it gets rebuilt" ;; *) bad "stale container must be removed" "no rm in:$PODMAN_CALLS" ;; esac
+
+# A pid podman cannot report at all is not alive either.
+FAKE_RUNNING="true"; FAKE_PID="0"
+start_or_discard aw-test-c testmod >/dev/null 2>&1
+check "pid 0 is not alive" "1" "$?"
+
+# An honest "not running" needs no /proc lookup to be believed.
+FAKE_RUNNING="false"; FAKE_PID="$$"
+start_or_discard aw-test-c testmod >/dev/null 2>&1
+check "a container that fails to start is discarded" "1" "$?"
+
+# Off rootful-Linux the /proc probe would be meaningless (the pid lives in
+# another namespace or a VM), and a false negative there would discard a
+# HEALTHY container on every bootstrap — worse than the bug being fixed.
+# podman own report must be taken at face value.
+uname() { echo Darwin; }
+FAKE_RUNNING="true"; FAKE_PID="999999999"
+PODMAN_CALLS=""
+start_or_discard aw-test-c testmod >/dev/null 2>&1
+check "off rootful-Linux, podman own report is trusted" "0" "$?"
+case "$PODMAN_CALLS" in *rm*) bad "must not discard on a non-Linux host" "saw rm in:$PODMAN_CALLS" ;; *) ok "no discard on a non-Linux host" ;; esac
+uname() { echo Linux; }
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

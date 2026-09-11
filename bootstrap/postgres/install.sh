@@ -51,7 +51,7 @@ if podman container exists "$CONTAINER_NAME"; then
   if [ "$current_src" = "$DATA_DIR" ]; then
     echo "postgres: container already exists on $DATA_DIR, ensuring it's running"
     podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    podman start "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    start_or_discard "$CONTAINER_NAME" postgres || true
   else
     echo "postgres: container is on legacy storage ($current_src) — recreating on $DATA_DIR"
     podman stop "$CONTAINER_NAME" >/dev/null 2>&1 || true

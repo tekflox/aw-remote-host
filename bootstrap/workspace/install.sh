@@ -113,6 +113,9 @@ fi
 NETWORK_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/network.sh
 source "$NETWORK_LIB_DIR/../lib/network.sh"
+# start_or_discard (used further down) lives here.
+# shellcheck source=../lib/container.sh
+source "$NETWORK_LIB_DIR/../lib/container.sh"
 ensure_network "$NETWORK_NAME"
 
 # First-run seed: the repo is baked into the image at $CONTAINER_WORKDIR, but a
@@ -287,8 +290,13 @@ fi
 if podman container exists "$CONTAINER_NAME"; then
   echo "workspace: container already exists, ensuring it's running"
   podman network connect "$NETWORK_NAME" "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  podman start "$CONTAINER_NAME" >/dev/null 2>&1 || true
-else
+  # Two steps rather than if/else: start_or_discard REMOVES a container that
+  # will not run, and the create path below is what rebuilds it. An `else`
+  # here would skip that path on the one run that needs it most.
+  start_or_discard "$CONTAINER_NAME" workspace || true
+fi
+
+if ! podman container exists "$CONTAINER_NAME"; then
   if podman image exists "$IMAGE"; then
     echo "workspace: using existing local image $IMAGE"
   else
