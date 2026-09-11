@@ -129,6 +129,16 @@ RUN chmod +x /entrypoint.sh /healthcheck.sh
 ENV HOME=/home/aw-remote-host
 RUN mkdir -p "$HOME"
 
+# Declares which HOST FORM this is, for internal/hostfacts.ContainerForm. It is
+# what makes the control plane's "update" recreate this container from a new
+# image instead of only replacing the binary inside it — the binary lives in
+# this container's writable layer, so on its own it updates the host until the
+# next recreate and no further. Set here rather than sniffed at runtime
+# (/.dockerenv and friends) because the image is the only thing that knows for
+# certain what it is; see that function's comment for what each kind of wrong
+# guess costs.
+ENV AW_REMOTE_HOST_FORM=container
+
 # Baking the podman BINARY without its CONFIG would be worse than not baking
 # it at all. /etc/containers/storage.conf lives in this container's writable
 # layer too, so a recreate takes it with everything else — and a podman with

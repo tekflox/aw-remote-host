@@ -421,6 +421,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 
 	hostname, _ := os.Hostname()
 	usernsContained, usernsMeasured := hostfacts.UsernsContained()
+	containerForm, containerID := hostfacts.ContainerForm()
 	c := link.New(*controlPlane, *token)
 	c.Info = link.RegisterInfo{
 		Hostname:           hostname,
@@ -436,6 +437,10 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		UsernsContained: usernsContained,
 		UsernsMeasured:  usernsMeasured,
 		UIDMap:          hostfacts.UIDMap(),
+		// What makes "update" mean the IMAGE on this host form rather than
+		// just the binary — see hostfacts.ContainerForm.
+		ContainerForm: containerForm,
+		ContainerID:   containerID,
 	}
 
 	type registration struct {

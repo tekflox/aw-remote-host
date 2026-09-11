@@ -87,6 +87,15 @@ type RegisterInfo struct {
 	UsernsContained bool
 	UsernsMeasured  bool
 	UIDMap          string
+	// ContainerForm reports that this daemon IS the packaged container image,
+	// and ContainerID which container. They are what let the control plane
+	// send this host the update it can actually use: replacing the binary is
+	// the whole job on a BYOD Mac or VM, but inside the image it updates the
+	// host only until the next recreate. See hostfacts.ContainerForm for why
+	// the recreate has to happen from outside, and why ContainerID is allowed
+	// to be empty even when ContainerForm is true.
+	ContainerForm bool
+	ContainerID   string
 }
 
 // RegisteredReply is the server's response to a register frame.
@@ -190,6 +199,18 @@ func (c *Client) registerFrame() map[string]any {
 	if c.Info.UsernsMeasured {
 		frame["userns_contained"] = c.Info.UsernsContained
 		frame["uid_map"] = c.Info.UIDMap
+	}
+	// Only sent by the container form. Omitted entirely elsewhere so the
+	// backend's "only overwrite on a key that is present" reconnect path
+	// leaves the columns alone — same discipline as userns_contained above.
+	// container_id can still be absent within it: a container whose hostname
+	// was pinned by the operator cannot report one, and an empty string would
+	// be a worse answer than none (see hostfacts.ContainerForm).
+	if c.Info.ContainerForm {
+		frame["container_form"] = true
+		if c.Info.ContainerID != "" {
+			frame["container_id"] = c.Info.ContainerID
+		}
 	}
 	return frame
 }

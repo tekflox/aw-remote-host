@@ -123,7 +123,7 @@ type Handler struct {
 
 // Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|"update"|
 // "self-update"|"uninstall"|"health"|"exec_start"|"exec_status"|"exec_wait"|
-// "exec_kill"|"list_processes"|"fs_stat"|"fs_list"|"fs_mkdir"|"fs_delete"|
+// "exec_kill"|"list_processes"|"agent_sessions"|"fs_stat"|"fs_list"|"fs_mkdir"|"fs_delete"|
 // "fs_read_chunk"|"fs_write_chunk"|"firewall_apply"|"firewall_status"|
 // "vpn_status"|"vpn_bootstrap"|"vpn_advertise_exit"|"vpn_use_exit"|
 // "vpn_clear_exit"|"vpn_public_ip"|"vpn_external_route"|
@@ -168,6 +168,8 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.ExecKill(ctx, args, emit)
 	case "list_processes":
 		return h.ListProcesses(ctx), nil
+	case "agent_sessions":
+		return h.AgentSessions(ctx)
 	case "fs_stat":
 		return h.FsStat(ctx, args)
 	case "fs_list":
