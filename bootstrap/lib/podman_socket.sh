@@ -47,9 +47,13 @@ _systemd_is_init() {
 # bootstrap run.
 _start_socket_directly() {
   local sock="$1"
-  if [ -S "$sock" ]; then
+  # Liveness, not existence — a leftover socket file from a service that died
+  # with a container restart would otherwise make this a no-op and leave the
+  # host with a dead socket it believes in. See podman_socket_alive.
+  if podman_socket_alive "$sock"; then
     return 0
   fi
+  [ -S "$sock" ] && rm -f "$sock"
   mkdir -p "$(dirname "$sock")"
   # >&2 — this function's stdout is reserved for the socket path a caller
   # captures via $(...); a log line on stdout would corrupt that value
@@ -58,7 +62,7 @@ _start_socket_directly() {
   nohup podman system service --time=0 "unix://${sock}" >/tmp/podman-system-service.log 2>&1 &
   disown 2>/dev/null || true
   for _ in $(seq 1 30); do
-    if [ -S "$sock" ]; then
+    if podman_socket_alive "$sock"; then
       # `podman system service` run this way (root, no systemd socket unit
       # to set a group/mode for us) creates the socket root:root 0600 — a
       # Tier-2 app container bind-mounting it in (workspace/install.sh)
@@ -80,14 +84,41 @@ _start_socket_directly() {
 # host and prints its path on success (nothing on stdout on failure). Safe
 # to call unconditionally and repeatedly — every caller just wants "give me
 # a working socket path, however that has to happen on THIS host."
+# podman_socket_alive <sock>
+#
+# True only when something is ANSWERING on <sock>. A socket FILE outlives the
+# process that created it, so `[ -S ]` answers a different question than the
+# one every caller is asking.
+#
+# THE INCIDENT (2026-09-11): the aw-remote-host container was restarted. /run
+# is part of its writable layer, so the socket file survived while the
+# `podman system service` holding it did not. ensure_podman_socket saw the
+# file, reported success, and bootstrap printed "podman: API socket ready" —
+# over a dead socket. The workspace container was then rebuilt with that dead
+# inode bind-mounted in, so every Tier-2 app container it tried to manage
+# failed with "Cannot connect to the Docker daemon", and the workspace's own
+# component listing 500'd. Nothing in the chain reported a problem, because
+# every check in it was asking whether a file existed.
+#
+# Probes with podman itself rather than curl: podman is by definition present
+# here (this is its own socket), curl is not guaranteed on a BYOD host.
+podman_socket_alive() {
+  [ -S "$1" ] || return 1
+  podman --remote --url "unix://$1" version >/dev/null 2>&1
+}
+
 ensure_podman_socket() {
   local sock
   sock="$(podman_socket_default_path)"
 
-  if [ -S "$sock" ]; then
+  if podman_socket_alive "$sock"; then
     printf '%s' "$sock"
     return 0
   fi
+  # A socket file with nothing behind it would make every path below skip the
+  # bring-up it needs, so it goes. Removing it is safe precisely BECAUSE
+  # nothing is listening: a live socket never reaches this line.
+  [ -S "$sock" ] && rm -f "$sock"
 
   if _systemd_is_init && command -v systemctl >/dev/null 2>&1; then
     if [ "$(id -u)" = "0" ]; then
@@ -100,7 +131,7 @@ ensure_podman_socket() {
       systemctl --user enable --now podman.socket >/dev/null 2>&1 || true
     fi
     for _ in $(seq 1 20); do
-      [ -S "$sock" ] && { printf '%s' "$sock"; return 0; }
+      podman_socket_alive "$sock" && { printf '%s' "$sock"; return 0; }
       sleep 0.5
     done
   fi
@@ -108,7 +139,7 @@ ensure_podman_socket() {
   # Either there's no systemd init to hand this to, or the unit didn't bring
   # the socket up (e.g. this distro's podman package lacks podman.socket) —
   # fall back to running the API service ourselves.
-  if _start_socket_directly "$sock"; then
+  if _start_socket_directly "$sock" && podman_socket_alive "$sock"; then
     printf '%s' "$sock"
     return 0
   fi

@@ -30,6 +30,7 @@ jobs:
           bash tests/bootstrap/podman_storage_test.sh
           bash tests/bootstrap/podman_firewall_test.sh
           bash tests/bootstrap/redis_ready_test.sh
+          bash tests/bootstrap/podman_socket_test.sh
       - name: shellcheck bootstrap scripts
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then
