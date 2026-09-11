@@ -77,6 +77,16 @@ FROM debian:trixie-slim
 #                    can't read a host HEAD at all and silently no-ops,
 #                    exactly on the containerised host form this ships to.
 #   podman           the container runtime this host's whole job is to run
+#   catatonit        podman's `--init` pid-1 reaper. Explicit because it is a
+#                    RECOMMENDS of podman, not a depends, so
+#                    --no-install-recommends above drops it — and the workspace
+#                    module creates its container with --init, so without this
+#                    every recreate ends in `lookup init binary: exec:
+#                    "catatonit": executable file not found in $PATH` and the
+#                    workspace never comes back. It arrived for free while
+#                    podman was apt-installed at runtime (where recommends were
+#                    on), which is exactly the kind of invisible dependency
+#                    baking a package into an image has to make explicit.
 #
 # WHY podman IS BAKED IN (2026-09-11). It used to be installed at RUNTIME by
 # bootstrap/podman/install.sh (`apt-get install -y podman`), which put the
@@ -96,7 +106,37 @@ FROM debian:trixie-slim
 # podman` no-ops the moment podman is on PATH.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates bash sudo curl procps psmisc file git \
-      iproute2 wireguard-tools openvpn podman && \
+      iproute2 wireguard-tools openvpn && \
+    rm -rf /var/lib/apt/lists/*
+
+# podman WITH its recommends, deliberately — the only apt line in this file
+# that keeps them.
+#
+# bootstrap/podman/install.sh has always run plain `apt-get install -y podman`
+# at runtime, recommends ON, and that is the package set this stack has been
+# running on for months. Baking podman in under this file's blanket
+# --no-install-recommends quietly installed a DIFFERENT set, and the two
+# things it dropped both broke production on the first real recreate
+# (2026-09-11):
+#
+#   catatonit     podman's --init pid-1 reaper. The workspace module creates
+#                 its container with --init, so every recreate ended in
+#                 `lookup init binary: exec: "catatonit": executable file not
+#                 found in $PATH` and the workspace never came back.
+#   aardvark-dns  the resolver netavark hands container DNS to, installed to
+#                 /usr/lib/podman/ rather than onto PATH (podman looks it up
+#                 there itself) — which is why a `command -v` check said it was
+#                 fine. Without it
+#                 podman warns "container dns will not be enabled" and every
+#                 container-name lookup inside the podman network fails —
+#                 which is every app in the workspace talking to every other.
+#
+# Curating a hand-written list of which recommends matter would be the same
+# guess that produced this bug, one layer along: the next one nobody thought
+# of fails the same silent way. Taking the set the runtime installer takes
+# means the image and the BYOD host run the same podman, which is the whole
+# contract between this file and that script.
+RUN apt-get update && apt-get install -y podman && \
     rm -rf /var/lib/apt/lists/*
 
 # tailscale, baked in rather than installed at runtime. This container is the
@@ -161,6 +201,29 @@ ENV AW_REMOTE_HOST_FORM=container
 # $HOME is already ENV above, so graphroot resolves to exactly the path the
 # runtime call would produce; the guards in both functions then find their own
 # output already in place and no-op on every bootstrap forever after.
+# Every binary the bootstrap modules shell out to, asserted at BUILD time.
+#
+# A missing one is invisible until a host is recreated and then fails deep
+# inside a module, hours or days later, with an error that names a package
+# nobody remembers depending on. catatonit is why this exists: it is a
+# RECOMMENDS of podman rather than a depends, so --no-install-recommends
+# dropped it, and the first real image-update recreate died on `lookup init
+# binary: exec: "catatonit": executable file not found in $PATH` with the
+# workspace container unable to come back. It had always been there while
+# podman was apt-installed at runtime with recommends on.
+#
+# Baking a package into an image means owning the dependencies the package
+# manager used to infer. This line is that ownership, and it fails the BUILD
+# rather than a production recreate.
+RUN set -eu; \
+    for bin in podman catatonit conmon crun git ip wg openvpn tailscaled ps bash sudo curl; do \
+      command -v "$bin" >/dev/null || { echo "image is missing $bin — a bootstrap module shells out to it" >&2; exit 1; }; \
+    done; \
+    for helper in netavark aardvark-dns; do \
+      [ -x "/usr/lib/podman/$helper" ] || { echo "image is missing $helper — podman networking/DNS cannot come up" >&2; exit 1; }; \
+    done; \
+    echo "image: all bootstrap-required binaries present"
+
 COPY bootstrap/lib/podman_storage.sh /tmp/lib/podman_storage.sh
 COPY bootstrap/lib/podman_firewall.sh /tmp/lib/podman_firewall.sh
 RUN bash -c '. /tmp/lib/podman_storage.sh  && configure_podman_graphroot /etc/containers/storage.conf "$HOME" && \
