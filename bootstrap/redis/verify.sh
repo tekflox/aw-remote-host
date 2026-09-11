@@ -39,6 +39,19 @@ fi
 # more than it looks).
 # shellcheck source=../lib/redis_ready.sh
 source "$SCRIPT_DIR/../lib/redis_ready.sh"
+
+# Waiting is only meaningful for a container that COULD still answer. After
+# the host container is recreated every nested container is recorded as
+# running with a pid that no longer exists (see container_is_live), and a
+# redis in that state can never reply — so the wait below burned its full
+# budget, a measured 60 seconds, on every single recreate before install.sh
+# was even allowed to rebuild it. Failing fast here hands over immediately;
+# install.sh's start_or_discard is what knows how to fix it.
+if ! container_is_live "$CONTAINER_NAME"; then
+  echo "redis: $CONTAINER_NAME is not running — handing over to install.sh to rebuild it" >&2
+  exit 1
+fi
+
 if ! redis_wait_ready "$CONTAINER_NAME" 60; then
   exit 1
 fi
