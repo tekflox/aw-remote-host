@@ -38,7 +38,21 @@ type AgentSession struct {
 	// LastRunID is warmCurrentRunIDPath's content — see that constant's
 	// comment for why this is "last dispatched", not "currently running".
 	LastRunID string `json:"last_run_id,omitempty"`
-	Draining  bool   `json:"draining"`
+	// NeverDispatched is the one thing about a sandbox this host CAN state as
+	// fact: the turn file has never been written, so no turn has ever been
+	// dispatched into it, so it cannot be running one now. That is a pure
+	// idle pool container and destroying it costs nothing.
+	//
+	// Reported as its own field rather than inferred from an empty LastRunID,
+	// because "the file is not there" and "this host could not read it" are
+	// different answers and an empty string cannot tell them apart. Readers
+	// that conflate the two turn an unreadable sandbox into an idle one — the
+	// exact mistake that has cost this stack three separate outages.
+	NeverDispatched bool `json:"never_dispatched"`
+	// RunIDUnreadable says the probe itself failed. Neither idle nor busy:
+	// unknown.
+	RunIDUnreadable bool `json:"run_id_unreadable,omitempty"`
+	Draining        bool `json:"draining"`
 }
 
 // AgentSessions inventories the agent sandboxes running on this host.
@@ -85,11 +99,18 @@ func (h *Handler) AgentSessions(ctx context.Context) (map[string]any, error) {
 			CLI:       c.Labels["aw.cli"],
 			Draining:  strings.Contains(name, "-draining-"),
 		}
-		// Best effort by design: a sandbox that has not taken a turn yet has
-		// no such file, and one mid-restart may refuse the exec. Neither is
-		// worth failing the whole inventory over — the name and session id
-		// above already identify it.
-		if runID, err := h.runner().Run(ctx, "podman", "exec", name, "cat", warmCurrentRunIDPath); err == nil {
+		// `cat ... || true` on purpose: a plain `cat` of a missing file exits
+		// non-zero, which is indistinguishable from the exec itself failing.
+		// Swallowing the missing-file case INSIDE the container leaves a
+		// non-zero exit here meaning only one thing — this host could not ask.
+		runID, err := h.runner().Run(ctx, "podman", "exec", name, "sh", "-c",
+			"cat "+warmCurrentRunIDPath+" 2>/dev/null || true")
+		switch {
+		case err != nil:
+			s.RunIDUnreadable = true
+		case strings.TrimSpace(runID) == "":
+			s.NeverDispatched = true
+		default:
 			s.LastRunID = strings.TrimSpace(runID)
 		}
 		sessions = append(sessions, s)
