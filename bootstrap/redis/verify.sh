@@ -31,9 +31,15 @@ if [ "$actual_dir" != "$expected_dir" ]; then
   exit 1
 fi
 
-reply=$(podman exec "$CONTAINER_NAME" redis-cli PING)
-if [ "$reply" != "PONG" ]; then
-  echo "redis: unexpected reply: $reply" >&2
+# A redis replaying its AOF answers LOADING, not PONG — which is NOT YET
+# rather than broken, and failing on it fails the whole module chain right
+# after a recreate, i.e. exactly when there is a dataset to replay. Same
+# helper install.sh waits with, so the two can never disagree about what
+# "ready" means (bootstrap/lib/container.sh's header explains why that matters
+# more than it looks).
+# shellcheck source=../lib/redis_ready.sh
+source "$SCRIPT_DIR/../lib/redis_ready.sh"
+if ! redis_wait_ready "$CONTAINER_NAME" 60; then
   exit 1
 fi
 echo "redis: healthy"

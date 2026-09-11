@@ -77,13 +77,16 @@ if ! podman container exists "$CONTAINER_NAME"; then
 fi
 
 echo "redis: waiting for readiness..."
-for _ in $(seq 1 30); do
-  if podman exec "$CONTAINER_NAME" redis-cli PING >/dev/null 2>&1; then
-    echo "redis: ready ($DATA_DIR)"
-    exit 0
-  fi
-  sleep 1
-done
+# Waits for a real PONG, not merely for the server to answer. `redis-cli PING`
+# exits 0 while replaying the append-only file, so the old exit-status-only
+# check declared readiness mid-load and verify.sh failed the module seconds
+# later — see bootstrap/lib/redis_ready.sh.
+# shellcheck source=../lib/redis_ready.sh
+source "$SCRIPT_DIR/../lib/redis_ready.sh"
+if redis_wait_ready "$CONTAINER_NAME" 120; then
+  echo "redis: ready ($DATA_DIR)"
+  exit 0
+fi
 
 echo "redis: did not become ready in time" >&2
 exit 1
