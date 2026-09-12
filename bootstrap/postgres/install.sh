@@ -25,6 +25,15 @@ source "$SCRIPT_DIR/../lib/publish.sh"
 source "$SCRIPT_DIR/../lib/network.sh"
 # shellcheck source=../lib/container.sh
 source "$SCRIPT_DIR/../lib/container.sh"
+# postgres_wait_ready / postgres_has_database — "it answered" is not "it is
+# ready", and verify.sh has to ask the database question the same way.
+# shellcheck source=../lib/postgres_ready.sh
+source "$SCRIPT_DIR/../lib/postgres_ready.sh"
+
+# The database the aw-workspace runtime connects to. Named once here and in
+# verify.sh from the same constant so the two can never disagree about which
+# database "installed" means.
+WORKSPACE_DB="aw_workspace"
 
 DATA_DIR="$(resolve_data_dir AW_POSTGRES_HOST_DIR postgres-data)"
 LEGACY_VOLUME="aw-remote-host-postgres-data"
@@ -92,12 +101,16 @@ if ! podman container exists "$CONTAINER_NAME"; then
 fi
 
 echo "postgres: waiting for readiness..."
-for _ in $(seq 1 30); do
-  if podman exec "$CONTAINER_NAME" pg_isready -U postgres >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+# NOT a bare pg_isready: during initdb the entrypoint runs a temporary server
+# on the unix socket only, and probing that socket reports it ready seconds
+# before the real server exists. See bootstrap/lib/postgres_ready.sh for the
+# install this broke. Failing loudly here also beats falling through to the
+# CREATE DATABASE below and dying there with a psql error nobody can read.
+if ! postgres_wait_ready "$CONTAINER_NAME" 90; then
+  echo "postgres: never accepted a TCP connection — refusing to continue" >&2
+  podman logs --tail 40 "$CONTAINER_NAME" >&2 2>/dev/null || true
+  exit 1
+fi
 
 # Postgres only applies POSTGRES_PASSWORD on the data dir's FIRST init. If
 # state.json (which holds AW_POSTGRES_PASSWORD) was lost while the data
@@ -105,15 +118,14 @@ done
 # baked into the data dir, and auth fails silently downstream. Re-apply the
 # current password unconditionally so the pair self-corrects regardless of
 # whether this run created a fresh data dir or reused an existing one.
-podman exec "$CONTAINER_NAME" psql -U postgres -c \
+podman exec "$CONTAINER_NAME" psql -h 127.0.0.1 -U postgres -c \
   "ALTER USER postgres WITH PASSWORD '${POSTGRES_PASSWORD}';" >/dev/null
 echo "postgres: password re-applied (idempotent)"
 
 # Create the workspace database (the aw-workspace runtime connects to
 # .../aw_workspace) and enable pgvector inside it. Idempotent.
-if ! podman exec "$CONTAINER_NAME" psql -U postgres -tAc \
-      "SELECT 1 FROM pg_database WHERE datname='aw_workspace'" | grep -q 1; then
-  podman exec "$CONTAINER_NAME" psql -U postgres -c "CREATE DATABASE aw_workspace;" >/dev/null
+if ! postgres_has_database "$CONTAINER_NAME" "$WORKSPACE_DB"; then
+  podman exec "$CONTAINER_NAME" psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE ${WORKSPACE_DB};" >/dev/null
 fi
-podman exec "$CONTAINER_NAME" psql -U postgres -d aw_workspace -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
+podman exec "$CONTAINER_NAME" psql -h 127.0.0.1 -U postgres -d "$WORKSPACE_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null
 echo "postgres: ready, aw_workspace db + pgvector enabled ($DATA_DIR)"
