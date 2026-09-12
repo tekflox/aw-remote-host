@@ -116,6 +116,9 @@ source "$NETWORK_LIB_DIR/../lib/network.sh"
 # start_or_discard (used further down) lives here.
 # shellcheck source=../lib/container.sh
 source "$NETWORK_LIB_DIR/../lib/container.sh"
+# ensure_image_current — a cached moving tag is not a current moving tag.
+# shellcheck source=../lib/image.sh
+source "$NETWORK_LIB_DIR/../lib/image.sh"
 ensure_network "$NETWORK_NAME"
 
 # First-run seed: the repo is baked into the image at $CONTAINER_WORKDIR, but a
@@ -124,7 +127,9 @@ ensure_network "$NETWORK_NAME"
 # (non-empty) host dir is left untouched — never clobber the user's files/apps.
 if [ -z "$(ls -A "$HOST_DIR" 2>/dev/null)" ]; then
   echo "workspace: seeding $HOST_DIR from image $IMAGE (first run)"
-  podman pull "${PULL_ARGS[@]}" "$IMAGE" >/dev/null 2>&1 || true
+  # The seed defines what the workspace's files ARE on this host, for as long
+  # as the host lives — a stale image here is not corrected by a later pull.
+  ensure_image_current "$IMAGE" workspace ${PULL_ARGS[@]+"${PULL_ARGS[@]}"} || true
   SEED_CONTAINER="${CONTAINER_NAME}-seed"
   podman rm -f "$SEED_CONTAINER" >/dev/null 2>&1 || true
   podman create --pull=never --name "$SEED_CONTAINER" "$IMAGE" >/dev/null
@@ -297,11 +302,10 @@ if podman container exists "$CONTAINER_NAME"; then
 fi
 
 if ! podman container exists "$CONTAINER_NAME"; then
-  if podman image exists "$IMAGE"; then
-    echo "workspace: using existing local image $IMAGE"
-  else
-    podman pull "${PULL_ARGS[@]}" "$IMAGE" >/dev/null
-  fi
+  # NOT "if podman image exists": $IMAGE defaults to a MOVING tag, and a
+  # cached copy of a moving tag says nothing about whether it is current.
+  # See bootstrap/lib/image.sh for the update this silently reverted.
+  ensure_image_current "$IMAGE" workspace ${PULL_ARGS[@]+"${PULL_ARGS[@]}"} || true
   podman run -d \
     --pull=never \
     --name "$CONTAINER_NAME" \
