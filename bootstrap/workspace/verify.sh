@@ -43,4 +43,29 @@ if [ "$(podman inspect "$CONTAINER_NAME" --format '{{.HostConfig.Init}}')" != "t
   exit 1
 fi
 
+# The RUNNING container, not just the image: a container built from a bad
+# layer keeps that layer for its whole life, so repairing the image alone
+# would leave this host broken until something else happened to recreate it.
+#
+# Exiting 1 is the repair: install.sh re-extracts the image and rebuilds the
+# container. That is the same contract the --init and storage checks above
+# use, and the reason this file exists at all — anything install.sh guarantees
+# about HOW the container was created has to be asserted here too.
+#
+# Non-fatal when the probe itself cannot run (no sudo in the image, exec
+# refused): a check that could not be performed is not evidence of a fault,
+# and recreating the workspace on every boot over an unanswerable question
+# would be worse than the fault.
+_sudo_mode="$(podman exec "$CONTAINER_NAME" stat -c '%a' /usr/bin/sudo 2>/dev/null | tr -d '[:space:]')"
+case "${_sudo_mode:-skip}" in
+  skip|"") : ;;                       # could not ask — not a verdict
+  4*)      : ;;                       # setuid present
+  *)
+    echo "workspace: /usr/bin/sudo is mode ${_sudo_mode} — the image layer lost its" \
+         "setuid metadata, so sudo and every installer using it will fail." \
+         "Recreating from a re-extracted image." >&2
+    exit 1
+    ;;
+esac
+
 echo "workspace: healthy"

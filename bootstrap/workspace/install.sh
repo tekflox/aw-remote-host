@@ -119,6 +119,9 @@ source "$NETWORK_LIB_DIR/../lib/container.sh"
 # ensure_image_current — a cached moving tag is not a current moving tag.
 # shellcheck source=../lib/image.sh
 source "$NETWORK_LIB_DIR/../lib/image.sh"
+# image_layer_intact — a CURRENT tag can still be a wrongly EXTRACTED layer.
+# shellcheck source=../lib/image_integrity.sh
+source "$NETWORK_LIB_DIR/../lib/image_integrity.sh"
 ensure_network "$NETWORK_NAME"
 
 # First-run seed: the repo is baked into the image at $CONTAINER_WORKDIR, but a
@@ -306,6 +309,12 @@ if ! podman container exists "$CONTAINER_NAME"; then
   # cached copy of a moving tag says nothing about whether it is current.
   # See bootstrap/lib/image.sh for the update this silently reverted.
   ensure_image_current "$IMAGE" workspace ${PULL_ARGS[@]+"${PULL_ARGS[@]}"} || true
+  # Current is not the same as correct. A layer extracted inside a
+  # userns-remapped host can lose setuid bits and file ownership, and every
+  # check above says "yes" to it — see lib/image_integrity.sh for the two
+  # failures that caused. Repaired HERE, before the container is built from
+  # it, because a container created on a bad layer stays bad.
+  image_layer_intact "$IMAGE" || repair_image_layer "$IMAGE" ${PULL_ARGS[@]+"${PULL_ARGS[@]}"} || true
   podman run -d \
     --pull=never \
     --name "$CONTAINER_NAME" \

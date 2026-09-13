@@ -1411,8 +1411,33 @@ func (h *Handler) diskUsage(ctx context.Context) any {
 	return map[string]any{"used": usedKB * 1024, "total": totalKB * 1024}
 }
 
+// startedAtLayouts are the two shapes `{{.State.StartedAt}}` comes back in.
+//
+// RFC3339Nano is what the API returns. The Go TEMPLATE returns something
+// else entirely: podman renders the field with time.Time's String(), which is
+// "2026-09-13 08:20:02.004424754 +0000 UTC" — a space instead of the T, no Z,
+// and a trailing zone NAME.
+//
+// Only RFC3339Nano was tried, so the parse failed on every host and uptime_s
+// came back null EVERYWHERE — measured across four workspaces on 2026-09-13,
+// healthy ones included. The field had never once carried a value; nothing
+// noticed because a null uptime looks like "not up yet" rather than like a
+// bug.
+var startedAtLayouts = []string{
+	time.RFC3339Nano,
+	"2006-01-02 15:04:05.999999999 -0700 MST",
+	"2006-01-02 15:04:05 -0700 MST",
+}
+
 func parseStartedAt(raw string) (int64, error) {
-	t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw))
+	raw = strings.TrimSpace(raw)
+	var t time.Time
+	var err error
+	for _, layout := range startedAtLayouts {
+		if t, err = time.Parse(layout, raw); err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return 0, err
 	}
