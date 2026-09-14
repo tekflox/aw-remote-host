@@ -73,6 +73,69 @@ func TestRestartCommandIncludesSlugForLaunchdLabels(t *testing.T) {
 	}
 }
 
+// The 2026-09-14 incident: kickstart alone fails silently (exit 113) when
+// this job was never `launchctl load`ed — e.g. a --foreground run, or a job
+// that crash-looped out of launchd's table — and nothing checks its exit
+// code, so the live process just keeps running the OLD binary forever. The
+// darwin restart command must chain a real fallback, mirroring the Linux
+// branch's `|| kill $PPID` precedent immediately below it in the switch.
+func TestDarwinRestartCommandHasFallbackChain(t *testing.T) {
+	cmd := restartCommandFor("darwin", "acme")
+
+	kickstart := "launchctl kickstart -k gui/$(id -u)/'com.tekflox.aw-remote-host.acme'"
+	if !strings.Contains(cmd, kickstart) {
+		t.Fatalf("must still try kickstart first (cheapest path): %s", cmd)
+	}
+
+	bootstrap := "launchctl bootstrap gui/$(id -u) $HOME/Library/LaunchAgents/'com.tekflox.aw-remote-host.acme'.plist"
+	if !strings.Contains(cmd, bootstrap) {
+		t.Fatalf("must fall back to re-bootstrapping the plist already on disk: %s", cmd)
+	}
+
+	if strings.Count(cmd, "kill $PPID") != 2 {
+		t.Fatalf("must self-kill after a successful bootstrap (to free the /link race) AND as the final bare fallback: %s", cmd)
+	}
+
+	if strings.Index(cmd, kickstart) > strings.Index(cmd, bootstrap) {
+		t.Fatalf("kickstart must be tried before bootstrap: %s", cmd)
+	}
+	if strings.Index(cmd, "||") < 0 {
+		t.Fatalf("stages must be OR-chained so a failure falls through to the next one: %s", cmd)
+	}
+	// The bare "kill $PPID" as the outermost fallback must run only when
+	// BOTH kickstart and the bootstrap-then-kill pair failed — i.e. it must
+	// be the last thing in the chain, not spliced in the middle.
+	if !strings.HasSuffix(strings.TrimSpace(cmd), "kill $PPID") {
+		t.Fatalf("the bare self-kill fallback must be the last stage in the chain: %s", cmd)
+	}
+}
+
+// Regression for the exact failure mode reproduced live: kickstart exits
+// non-zero (it doesn't run here — no launchd on Linux CI — but the shape of
+// the chain must tolerate it) and the script must still reach a terminal
+// action rather than the shell parsing it as one flat unconditional list.
+func TestDarwinRestartCommandGroupsBootstrapAndKillTogether(t *testing.T) {
+	cmd := restartCommandFor("darwin", "acme")
+	// "|| (bootstrap && kill $PPID) || kill $PPID" — the middle stage must
+	// be parenthesized, or `bootstrap && kill $PPID || kill $PPID` would
+	// run the final kill whenever bootstrap succeeds too (&& binds tighter
+	// than the intended grouping only accidentally, and a maintainer could
+	// easily drop the parens without a test catching it).
+	if !strings.Contains(cmd, "(launchctl bootstrap") || !strings.Contains(cmd, "&& kill $PPID)") {
+		t.Fatalf("bootstrap and its follow-up kill must be grouped in one subshell: %s", cmd)
+	}
+}
+
+func TestDarwinRestartCommandOmitsSlugSuffixWhenEmpty(t *testing.T) {
+	cmd := restartCommandFor("darwin", "")
+	if !strings.Contains(cmd, "'com.tekflox.aw-remote-host'") {
+		t.Fatalf("label must fall back to the bare prefix when slug is empty: %s", cmd)
+	}
+	if strings.Contains(cmd, "com.tekflox.aw-remote-host.'") || strings.Contains(cmd, "host..") {
+		t.Fatalf("must not leave a trailing dot when slug is empty: %s", cmd)
+	}
+}
+
 // A Windows path carries a username, and `$` is legal in one. Under a
 // DOUBLE-quoted PowerShell string `C:\Users\$dev\bin` silently becomes
 // `C:\Users\bin` — a rollback that restores over the wrong path, or an

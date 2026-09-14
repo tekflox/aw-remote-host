@@ -303,7 +303,34 @@ func restartCommandFor(goos, slug string) string {
 		if strings.TrimSpace(slug) != "" {
 			label += "." + strings.TrimSpace(slug)
 		}
-		return fmt.Sprintf("launchctl kickstart -k gui/$(id -u)/%s", shellQuote(label))
+		quotedLabel := shellQuote(label)
+		// kickstart only bounces a job launchd already has loaded. A
+		// --foreground run (this process's own default) was never
+		// `launchctl load`ed as that job, and a job that previously
+		// crash-looped out of launchd's table has the same symptom either
+		// way, kickstart fails silently: nothing checks its exit code,
+		// so without a fallback the live process just keeps running the
+		// OLD binary forever (2026-09-14 incident, fredericowu/Mac.Home).
+		//
+		// Fallback 1: `bootstrap` (re-)registers the plist that install
+		// already wrote to disk. RunAtLoad=true starts it immediately, so
+		// this briefly leaves two live processes — the still-running old
+		// one (this very process) and the freshly bootstrapped new one.
+		// `kill $PPID` ends the old one; $PPID is this process (the
+		// caller of startDetached, which Start()s this whole script as
+		// its child), same trick the Linux branch below uses. Killing it
+		// lets the new instance win aw-backend's /link registration race
+		// (host_link.py's `_connected` map evicts a displaced connection
+		// on its own — no fallback needed there).
+		//
+		// Fallback 2: if even `bootstrap` fails (no plist on disk, or
+		// launchd itself unreachable), a bare self-kill so the process at
+		// least exits visibly instead of masking the failure forever —
+		// matching the Linux branch's philosophy below.
+		kickstart := fmt.Sprintf("launchctl kickstart -k gui/$(id -u)/%s", quotedLabel)
+		plistPath := "$HOME/Library/LaunchAgents/" + quotedLabel + ".plist"
+		bootstrap := fmt.Sprintf("launchctl bootstrap gui/$(id -u) %s && kill $PPID", plistPath)
+		return fmt.Sprintf("%s || (%s) || kill $PPID", kickstart, bootstrap)
 	case "linux":
 		// A normal rootless BYOD host has this installed as a systemd --user
 		// service (Restart=always — see servicemgr/systemd.go), so the
