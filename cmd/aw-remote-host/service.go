@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/tekflox/aw-remote-host/internal/rlog"
 	"github.com/tekflox/aw-remote-host/internal/servicemgr"
 )
 
@@ -52,6 +53,6 @@ func installAndStartService(cfg servicemgr.Config) error {
 	if err := mgr.Start(cfg); err != nil {
 		return fmt.Errorf("start %s service: %w", mgr.Name(), err)
 	}
-	fmt.Printf("%s service installed (%s) and started.\n", mgr.Name(), path)
+	rlog.Printf("%s service installed (%s) and started.\n", mgr.Name(), path)
 	return nil
 }

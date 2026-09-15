@@ -8,6 +8,8 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/tekflox/aw-remote-host/internal/rlog"
 )
 
 // version is set via -ldflags "-X main.version=vX.Y.Z" at release build time.
@@ -30,6 +32,7 @@ const defaultControlPlane = "https://api.aw.tekflox.com"
 
 func main() {
 	redirectOutputIfWindowless()
+	rlog.Init(os.Stdout)
 
 	if len(os.Args) < 2 {
 		usage()
@@ -65,6 +68,7 @@ func main() {
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "aw-remote-host: %v\n", err)
+		rlog.Printf("fatal: %v", err)
 		os.Exit(1)
 	}
 }

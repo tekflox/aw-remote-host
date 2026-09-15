@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/ops"
+	"github.com/tekflox/aw-remote-host/internal/rlog"
 	"github.com/tekflox/aw-remote-host/internal/vpn"
 )
 
@@ -271,23 +272,23 @@ func runVPNExternalRoute(args []string) error {
 			return nil
 		}
 		if resolved.Refusal != "" {
-			fmt.Printf("vpn: REFUSED — %s\n", resolved.Refusal)
+			rlog.Printf("vpn: REFUSED — %s\n", resolved.Refusal)
 			return fmt.Errorf("%s", resolved.Refusal)
 		}
-		fmt.Printf("vpn: would route %s (%s/32) out through %s via table %d at priority %d\n",
+		rlog.Printf("vpn: would route %s (%s/32) out through %s via table %d at priority %d\n",
 			resolved.Container, resolved.SourceIP, resolved.TunnelDev, resolved.Table, resolved.Priority)
 		for _, ex := range resolved.Exclusions {
-			fmt.Printf("vpn:   %s stays OUTSIDE the tunnel\n", ex)
+			rlog.Printf("vpn:   %s stays OUTSIDE the tunnel\n", ex)
 		}
 		if len(resolved.DNSServers) > 0 {
-			fmt.Printf("vpn: would ALSO point network %s's resolver upstream at %s, reached over a %s-table route into %s\n",
+			rlog.Printf("vpn: would ALSO point network %s's resolver upstream at %s, reached over a %s-table route into %s\n",
 				resolved.DNSNetwork, strings.Join(resolved.DNSServers, ", "), "main", resolved.TunnelDev)
-			fmt.Printf("vpn:   this affects EVERY container on %s, not only %s — aardvark's upstream is scoped to the network and has no per-container form\n", resolved.DNSNetwork, resolved.Container)
-			fmt.Printf("vpn:   the dead-man's switch would undo it with `%s network update %s --dns-drop ...`\n", resolved.DNSPodmanPath, resolved.DNSNetwork)
+			rlog.Printf("vpn:   this affects EVERY container on %s, not only %s — aardvark's upstream is scoped to the network and has no per-container form\n", resolved.DNSNetwork, resolved.Container)
+			rlog.Printf("vpn:   the dead-man's switch would undo it with `%s network update %s --dns-drop ...`\n", resolved.DNSPodmanPath, resolved.DNSNetwork)
 		} else if *tunnelDNS {
-			fmt.Println("vpn: --tunnel-dns was asked for but could NOT be planned on this host (no usable resolver in the profile, a runtime that is not podman, a podman that could not be resolved to an absolute path, or a container on more than one network). The route would be applied and DNS reported as NOT tunnelled.")
+			rlog.Println("vpn: --tunnel-dns was asked for but could NOT be planned on this host (no usable resolver in the profile, a runtime that is not podman, a podman that could not be resolved to an absolute path, or a container on more than one network). The route would be applied and DNS reported as NOT tunnelled.")
 		}
-		fmt.Println("vpn: this MACHINE's own public IP would NOT change. That is asserted, not hoped for: a host whose address moved is a failed apply that reverts.")
+		rlog.Println("vpn: this MACHINE's own public IP would NOT change. That is asserted, not hoped for: a host whose address moved is a failed apply that reverts.")
 		return nil
 	}
 
@@ -369,7 +370,7 @@ func runVPNExternalStatus(args []string) error {
 		return printJSON(externalStatusJSON(report))
 	}
 	for _, line := range report.Describe() {
-		fmt.Printf("vpn: %s\n", line)
+		rlog.Printf("vpn: %s\n", line)
 	}
 	return nil
 }
@@ -483,30 +484,30 @@ func printExternalUpPlan(p vpn.ExternalUpPlan, warning string) {
 		printProgress("warning", warning)
 	}
 	if p.Refusal != "" {
-		fmt.Printf("vpn: REFUSED — %s\n", p.Refusal)
-		fmt.Println("vpn: what follows is a read-only preview; applying it on this host is not possible.")
+		rlog.Printf("vpn: REFUSED — %s\n", p.Refusal)
+		rlog.Println("vpn: what follows is a read-only preview; applying it on this host is not possible.")
 	}
-	fmt.Printf("vpn: would dial %s on %s, building table %d\n", p.Endpoint, p.Iface, p.Table)
+	rlog.Printf("vpn: would dial %s on %s, building table %d\n", p.Endpoint, p.Iface, p.Table)
 	if p.AlreadyUp {
-		fmt.Println("vpn: this exact profile is ALREADY up in that table — a re-run would converge and change nothing")
+		rlog.Println("vpn: this exact profile is ALREADY up in that table — a re-run would converge and change nothing")
 	}
-	fmt.Printf("vpn: would write a synthesized config to %s (0600), with Table = off so wg-quick installs no routes of its own\n", p.ConfPath)
-	fmt.Println("vpn: table would be built in THIS ORDER — connected routes first, endpoint pin, default LAST:")
+	rlog.Printf("vpn: would write a synthesized config to %s (0600), with Table = off so wg-quick installs no routes of its own\n", p.ConfPath)
+	rlog.Println("vpn: table would be built in THIS ORDER — connected routes first, endpoint pin, default LAST:")
 	for _, c := range p.Connected {
-		fmt.Printf("vpn:   %-20s dev %s   (discovered from this host's main table, never hardcoded)\n", c.Prefix, c.Dev)
+		rlog.Printf("vpn:   %-20s dev %s   (discovered from this host's main table, never hardcoded)\n", c.Prefix, c.Dev)
 	}
 	if p.EndpointIP != "" {
-		fmt.Printf("vpn:   %-20s via %s dev %s onlink   (the tunnel endpoint, so its own packets cannot route into it)\n", p.EndpointIP+"/32", p.MainGateway, p.MainDev)
+		rlog.Printf("vpn:   %-20s via %s dev %s onlink   (the tunnel endpoint, so its own packets cannot route into it)\n", p.EndpointIP+"/32", p.MainGateway, p.MainDev)
 	}
-	fmt.Printf("vpn:   %-20s dev %s\n", "default", p.Iface)
+	rlog.Printf("vpn:   %-20s dev %s\n", "default", p.Iface)
 	if len(p.DNS) > 0 {
-		fmt.Printf("vpn: the profile's resolvers (%s) would be RECORDED and NOT written into the config — wg-quick's DNS= rewrites the whole host's resolver\n", strings.Join(p.DNS, ", "))
+		rlog.Printf("vpn: the profile's resolvers (%s) would be RECORDED and NOT written into the config — wg-quick's DNS= rewrites the whole host's resolver\n", strings.Join(p.DNS, ", "))
 	}
 	for _, w := range p.Warnings {
-		fmt.Printf("vpn: WARNING — %s\n", w)
+		rlog.Printf("vpn: WARNING — %s\n", w)
 	}
-	fmt.Println("vpn: would arm a dead-man's switch BEFORE the first route change, reverting with `wg-quick down` plus a flush of that table if this run does not confirm the tunnel")
-	fmt.Println("vpn: this MACHINE's own public IP would NOT change. That is asserted before and after, and a host whose address moved is a failed apply that reverts.")
+	rlog.Println("vpn: would arm a dead-man's switch BEFORE the first route change, reverting with `wg-quick down` plus a flush of that table if this run does not confirm the tunnel")
+	rlog.Println("vpn: this MACHINE's own public IP would NOT change. That is asserted before and after, and a host whose address moved is a failed apply that reverts.")
 }
 
 // vpnExternalUsage is printed by the top-level usage; kept next to the flags

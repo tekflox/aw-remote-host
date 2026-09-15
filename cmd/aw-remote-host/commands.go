@@ -23,6 +23,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/lanfastpath"
 	"github.com/tekflox/aw-remote-host/internal/link"
 	"github.com/tekflox/aw-remote-host/internal/ops"
+	"github.com/tekflox/aw-remote-host/internal/rlog"
 	"github.com/tekflox/aw-remote-host/internal/servicemgr"
 	"github.com/tekflox/aw-remote-host/internal/shell"
 	"github.com/tekflox/aw-remote-host/internal/state"
@@ -79,11 +80,11 @@ func reportStatuses(statuses []bootstrap.ModuleStatus) {
 	for _, st := range statuses {
 		switch {
 		case st.AlreadyOK:
-			fmt.Printf("%s: already ok, skipped install\n", st.Module)
+			rlog.Printf("%s: already ok, skipped install\n", st.Module)
 		case st.OK:
-			fmt.Printf("%s: installed and verified\n", st.Module)
+			rlog.Printf("%s: installed and verified\n", st.Module)
 		default:
-			fmt.Printf("%s: FAILED\n", st.Module)
+			rlog.Printf("%s: FAILED\n", st.Module)
 		}
 	}
 }
@@ -149,7 +150,7 @@ func resolveHostPower(requested []string) (string, error) {
 	res := hostpower.Resolve(requested)
 	for _, name := range requested {
 		if reason, denied := res.Refused[name]; denied {
-			fmt.Fprintf(os.Stderr, "host-power: %s NOT granted — %s\n", name, reason)
+			rlog.Printf("host-power: %s NOT granted — %s\n", name, reason)
 		}
 	}
 	if len(res.Effective) == 0 {
@@ -157,7 +158,7 @@ func resolveHostPower(requested []string) (string, error) {
 			"host-power: none of %s can be delivered by this host — see the reasons above",
 			strings.Join(requested, ","))
 	}
-	fmt.Printf("host-power: %s\n", hostpower.Describe(res.Effective))
+	rlog.Printf("host-power: %s\n", hostpower.Describe(res.Effective))
 	return hostpower.Format(res.Effective), nil
 }
 
@@ -261,7 +262,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	// Linux host of the same workspace, which the control plane models fine.
 	if provisionWorkspace && runtime.GOOS == "windows" {
 		if *plan {
-			fmt.Printf("[plan] would provision the workspace inside a WSL2 distro (%s):\n", wsl.DefaultDistro)
+			rlog.Printf("[plan] would provision the workspace inside a WSL2 distro (%s):\n", wsl.DefaultDistro)
 			for _, step := range []string{
 				"update the WSL kernel",
 				"download the Ubuntu rootfs and import it as " + wsl.DefaultDistro,
@@ -270,14 +271,14 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 				"run bootstrap-workspace --with-workspace in there (podman, postgres, redis, workspace)",
 				"install a systemd service inside it, and a Startup-folder keep-alive out here",
 			} {
-				fmt.Printf("[plan] wsl: %s\n", step)
+				rlog.Printf("[plan] wsl: %s\n", step)
 			}
 			return nil
 		}
 		return wsl.ProvisionWorkspace(wsl.Options{
 			Token:        *token,
 			ControlPlane: *controlPlane,
-			Log:          func(f string, a ...any) { fmt.Printf(f+"\n", a...) },
+			Log:          func(f string, a ...any) { rlog.Printf(f+"\n", a...) },
 		})
 	}
 
@@ -288,14 +289,14 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 
 	if *plan {
 		if provisionWorkspace {
-			fmt.Printf("[plan] would link to %s as this machine, then run:\n", *controlPlane)
+			rlog.Printf("[plan] would link to %s as this machine, then run:\n", *controlPlane)
 			for _, a := range bootstrap.Plan(m.Default()) {
-				fmt.Printf("[plan] %s: %s — %s\n", a.Module, a.Step, a.Detail)
+				rlog.Printf("[plan] %s: %s — %s\n", a.Module, a.Step, a.Detail)
 			}
 		} else {
-			fmt.Printf("[plan] would link to %s as this machine (lean: no local provisioning — use 'bootstrap-workspace --with-workspace' to also run):\n", *controlPlane)
+			rlog.Printf("[plan] would link to %s as this machine (lean: no local provisioning — use 'bootstrap-workspace --with-workspace' to also run):\n", *controlPlane)
 			for _, a := range bootstrap.Plan(m.Default()) {
-				fmt.Printf("[plan] (skipped — lean %s) %s: %s — %s\n", cmdName, a.Module, a.Step, a.Detail)
+				rlog.Printf("[plan] (skipped — lean %s) %s: %s — %s\n", cmdName, a.Module, a.Step, a.Detail)
 			}
 		}
 		return nil
@@ -321,9 +322,9 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 
 	if !*yes {
 		if provisionWorkspace {
-			fmt.Println("This will install/verify: podman, postgres+pgvector, redis, and start the aw-workspace runtime on this machine.")
+			rlog.Println("This will install/verify: podman, postgres+pgvector, redis, and start the aw-workspace runtime on this machine.")
 		} else {
-			fmt.Println("This will register this machine with the control plane and hold the /link connection open (enables exec_* + a control-plane-driven \"bootstrap\" later) — no local runtime (podman, postgres, redis, aw-workspace) is installed. Use 'bootstrap-workspace --with-workspace' to also do that now.")
+			rlog.Println("This will register this machine with the control plane and hold the /link connection open (enables exec_* + a control-plane-driven \"bootstrap\" later) — no local runtime (podman, postgres, redis, aw-workspace) is installed. Use 'bootstrap-workspace --with-workspace' to also do that now.")
 		}
 		if !confirm("Continue? [y/N] ") {
 			return fmt.Errorf("aborted")
@@ -335,8 +336,8 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	// retype the obvious"; handing every app container on this machine full
 	// root-equivalent access to the host is not the obvious.
 	if hostPowerChanged && contains(hostPowerRequested, hostpower.Privileged) && !*yes {
-		fmt.Println("--host-power=privileged removes container isolation for every app that requests it on this machine: an app container gets every device and every Linux capability, which is root-equivalent access to this host.")
-		fmt.Println("Prefer naming the specific grants an app needs (e.g. --host-power=kvm,tun), or --host-power=all for every device grant without dropping isolation.")
+		rlog.Println("--host-power=privileged removes container isolation for every app that requests it on this machine: an app container gets every device and every Linux capability, which is root-equivalent access to this host.")
+		rlog.Println("Prefer naming the specific grants an app needs (e.g. --host-power=kvm,tun), or --host-power=all for every device grant without dropping isolation.")
 		if !confirm("Grant privileged anyway? [y/N] ") {
 			return fmt.Errorf("aborted")
 		}
@@ -415,7 +416,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 			return err
 		}
 		if err := state.RecordBootstrapVersion(statePath, version); err != nil {
-			fmt.Fprintf(os.Stderr, "state: could not record bootstrap version: %v\n", err)
+			rlog.Printf("state: could not record bootstrap version: %v\n", err)
 		}
 	}
 
@@ -465,7 +466,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	// has never had a rule applied, and never fatal — a self-heal failure
 	// must not block this process from linking at all.
 	if err := firewall.SelfHeal(ctx, ops.DefaultRunner); err != nil {
-		fmt.Fprintf(os.Stderr, "firewall: self-heal failed (continuing): %v\n", err)
+		rlog.Printf("firewall: self-heal failed (continuing): %v\n", err)
 	}
 
 	// Same bargain for the external VPN, and it is not optional here. Two
@@ -487,10 +488,10 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	reassertRunner := vpn.PrivilegedRunner{Inner: ops.DefaultRunner, Sudo: runtime.GOOS != "darwin" && runtime.GOOS != "windows" && os.Geteuid() != 0}
 	go vpn.SelfHealLoop(ctx, reassertRunner, func(restored []string, err error) {
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "vpn: self-heal could not put the external VPN back (continuing): %v\n", err)
+			rlog.Printf("vpn: self-heal could not put the external VPN back (continuing): %v\n", err)
 			return
 		}
-		fmt.Fprintf(os.Stderr, "vpn: self-heal restored what something had taken away: %s\n", strings.Join(restored, ", "))
+		rlog.Printf("vpn: self-heal restored what something had taken away: %s\n", strings.Join(restored, ", "))
 	})
 
 	go func() {
@@ -508,11 +509,11 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 					// kernel. Only the field this callback actually owns
 					// may be written.
 					if err := state.Update(statePath, func(s *state.State) { s.WorkspaceSlug = reply.WorkspaceSlug }); err != nil {
-						fmt.Fprintf(os.Stderr, "state: could not record the workspace slug: %v\n", err)
+						rlog.Printf("state: could not record the workspace slug: %v\n", err)
 					}
 				}
 				if err := updater.ClearPending(); err != nil {
-					fmt.Fprintf(os.Stderr, "self-update: could not clear rollback marker after registration: %v\n", err)
+					rlog.Printf("self-update: could not clear rollback marker after registration: %v\n", err)
 				}
 				hostCredential := reply.HostCredential
 				if hostCredential == "" && existingCreds != nil {
@@ -532,7 +533,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 					StatePath:        statePath,
 					CLIVersion:       version,
 				}
-				fmt.Printf("link: registered (remote_host_id=%s, workspace=%s)\n", reply.RemoteHostID, reply.WorkspaceSlug)
+				rlog.Printf("link: registered (remote_host_id=%s, workspace=%s)\n", reply.RemoteHostID, reply.WorkspaceSlug)
 				if reply.WorkspaceSlug != "" {
 					lanOnce.Do(func() { startLANFastPath(ctx, reply.WorkspaceSlug) })
 				}
@@ -546,7 +547,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 			},
 			OnDisconnect: func(err error) {
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "link: disconnected: %v\n", err)
+					rlog.Printf("link: disconnected: %v\n", err)
 				}
 			},
 			OnCommand: func(ctx context.Context, verb string, args map[string]any, emit link.Emit) (any, error) {
@@ -609,7 +610,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		// button, stay usable the whole time.
 		go bootstrapWorkspaceSelfHeal(ctx, m.Only("workspace"), wsOpts, statePath, st)
 	} else {
-		fmt.Println("lean link: local runtime NOT installed — run 'bootstrap-workspace --with-workspace' (no --token needed, already linked) to provision it here, or trigger it from the control plane (the \"bootstrap\" verb over this same /link connection — see README).")
+		rlog.Println("lean link: local runtime NOT installed — run 'bootstrap-workspace --with-workspace' (no --token needed, already linked) to provision it here, or trigger it from the control plane (the \"bootstrap\" verb over this same /link connection — see README).")
 	}
 
 	if runInBackground {
@@ -620,15 +621,15 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		if err := installAndStartService(svcCfg); err != nil {
 			return err
 		}
-		fmt.Println("Detaching — the background service now holds the /link connection.")
+		rlog.Println("Detaching — the background service now holds the /link connection.")
 		switch runtime.GOOS {
 		case "darwin":
-			fmt.Println("(loginctl-equivalent not needed on macOS: LaunchAgents start automatically at login)")
+			rlog.Println("(loginctl-equivalent not needed on macOS: LaunchAgents start automatically at login)")
 		case "windows":
-			fmt.Println("(loginctl-equivalent not needed on Windows: the Scheduled Task's logon trigger starts it at sign-in)")
-			fmt.Println("Note: it starts at SIGN-IN, not at boot — a rebooted machine sitting at the lock screen is not linked yet.")
+			rlog.Println("(loginctl-equivalent not needed on Windows: the Scheduled Task's logon trigger starts it at sign-in)")
+			rlog.Println("Note: it starts at SIGN-IN, not at boot — a rebooted machine sitting at the lock screen is not linked yet.")
 		default:
-			fmt.Println("Run: loginctl enable-linger $USER   # so it survives logout/reboot")
+			rlog.Println("Run: loginctl enable-linger $USER   # so it survives logout/reboot")
 		}
 		stop() // cancel our own /link connection — the service owns it now
 		<-runDone
@@ -636,9 +637,9 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	}
 
 	if provisionWorkspace {
-		fmt.Printf("workspace %q linked — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
+		rlog.Printf("workspace %q linked — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
 	} else {
-		fmt.Printf("linked to workspace %q (lean, no local runtime) — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
+		rlog.Printf("linked to workspace %q (lean, no local runtime) — holding the /link connection open (Ctrl-C to stop this foreground run)\n", reg.slug)
 	}
 	<-ctx.Done()
 	return <-runDone
@@ -659,7 +660,7 @@ func bootstrapWorkspaceSelfHeal(ctx context.Context, m *bootstrap.Manifest, opts
 			if !st.Provisioned {
 				st.Provisioned = true
 				if err := state.Save(statePath, st); err != nil {
-					fmt.Fprintf(os.Stderr, "workspace: bootstrapped but could not persist provisioned state: %v\n", err)
+					rlog.Printf("workspace: bootstrapped but could not persist provisioned state: %v\n", err)
 				}
 			}
 			return
@@ -667,7 +668,7 @@ func bootstrapWorkspaceSelfHeal(ctx context.Context, m *bootstrap.Manifest, opts
 		if ctx.Err() != nil {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "workspace: bootstrap failed, retrying in %s: %v\n", backoff, err)
+		rlog.Printf("workspace: bootstrap failed, retrying in %s: %v\n", backoff, err)
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
@@ -692,7 +693,7 @@ func startLANFastPath(ctx context.Context, slug string) {
 	}
 	certFile, keyFile, ok := lanfastpath.LocateCert(slug)
 	if !ok {
-		fmt.Printf("lan-fastpath: no cert at %s yet — local bypass off, tunnel path unaffected\n", certFile)
+		rlog.Printf("lan-fastpath: no cert at %s yet — local bypass off, tunnel path unaffected\n", certFile)
 		return
 	}
 	port := lanfastpath.DefaultPort
@@ -702,14 +703,14 @@ func startLANFastPath(ctx context.Context, slug string) {
 		}
 	}
 	if addrs := lanfastpath.LANAddrs(); len(addrs) > 0 {
-		fmt.Printf("lan-fastpath: LAN addrs %s — serving https :%d -> %s\n", strings.Join(addrs, ","), port, lanfastpath.DefaultTarget)
+		rlog.Printf("lan-fastpath: LAN addrs %s — serving https :%d -> %s\n", strings.Join(addrs, ","), port, lanfastpath.DefaultTarget)
 	} else {
-		fmt.Printf("lan-fastpath: no private LAN addr found — serving https :%d anyway (localhost only)\n", port)
+		rlog.Printf("lan-fastpath: no private LAN addr found — serving https :%d anyway (localhost only)\n", port)
 	}
 	go func() {
 		cfg := lanfastpath.Config{Port: port, CertFile: certFile, KeyFile: keyFile}
 		if err := lanfastpath.Serve(ctx, cfg); err != nil && ctx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "lan-fastpath: terminator stopped: %v\n", err)
+			rlog.Printf("lan-fastpath: terminator stopped: %v\n", err)
 		}
 	}()
 }
@@ -721,14 +722,14 @@ func startLANFastPath(ctx context.Context, slug string) {
 // provide it, and then debugging a slow VM instead of a missing device.
 func reportHostPowerStatus(requested []string) {
 	if len(requested) == 0 {
-		fmt.Println("host-power: none (app containers get no host devices — the default)")
+		rlog.Println("host-power: none (app containers get no host devices — the default)")
 		return
 	}
 	res := hostpower.Resolve(requested)
-	fmt.Printf("host-power: requested %s -> effective %s\n",
+	rlog.Printf("host-power: requested %s -> effective %s\n",
 		hostpower.Format(requested), hostpower.Describe(res.Effective))
 	for name, reason := range res.Refused {
-		fmt.Printf("host-power:   %s NOT available — %s\n", name, reason)
+		rlog.Printf("host-power:   %s NOT available — %s\n", name, reason)
 	}
 }
 
@@ -739,7 +740,7 @@ func runStatus(args []string) error {
 		return err
 	}
 	if *plan {
-		fmt.Printf("[plan] would query link + module status from %s\n", *controlPlane)
+		rlog.Printf("[plan] would query link + module status from %s\n", *controlPlane)
 		return nil
 	}
 
@@ -752,9 +753,9 @@ func runStatus(args []string) error {
 		return err
 	}
 	if creds == nil {
-		fmt.Println("linked: no (no credentials found — run bootstrap-workspace --token <awbs_...>)")
+		rlog.Println("linked: no (no credentials found — run bootstrap-workspace --token <awbs_...>)")
 	} else {
-		fmt.Printf("linked: yes (remote_host_id=%s)\n", creds.RemoteHostID)
+		rlog.Printf("linked: yes (remote_host_id=%s)\n", creds.RemoteHostID)
 	}
 
 	statePath, err := state.DefaultPath()
@@ -766,21 +767,21 @@ func runStatus(args []string) error {
 		return err
 	}
 	if st.WorkspaceSlug != "" {
-		fmt.Printf("workspace: %s\n", st.WorkspaceSlug)
+		rlog.Printf("workspace: %s\n", st.WorkspaceSlug)
 	}
 	reportHostPowerStatus(st.HostPower)
 	reportVPNStatus(context.Background(), st)
 
 	if mgr, mgrErr := servicemgr.Default(); mgrErr != nil {
-		fmt.Printf("service: no supported service manager (%v)\n", mgrErr)
+		rlog.Printf("service: no supported service manager (%v)\n", mgrErr)
 	} else {
 		svcPath, pathErr := mgr.Path(servicemgr.Config{Slug: st.WorkspaceSlug})
 		if pathErr != nil {
-			fmt.Printf("service (%s): could not resolve path: %v\n", mgr.Name(), pathErr)
+			rlog.Printf("service (%s): could not resolve path: %v\n", mgr.Name(), pathErr)
 		} else if _, statErr := os.Stat(svcPath); statErr == nil {
-			fmt.Printf("service (%s): installed at %s\n", mgr.Name(), svcPath)
+			rlog.Printf("service (%s): installed at %s\n", mgr.Name(), svcPath)
 		} else {
-			fmt.Printf("service (%s): not installed (run bootstrap-workspace --background to install)\n", mgr.Name())
+			rlog.Printf("service (%s): not installed (run bootstrap-workspace --background to install)\n", mgr.Name())
 		}
 	}
 
@@ -794,7 +795,7 @@ func runStatus(args []string) error {
 	}
 
 	if !st.Provisioned {
-		fmt.Println("provisioned: no (lean link — run bootstrap-workspace --with-workspace to install podman/postgres/redis/aw-workspace here)")
+		rlog.Println("provisioned: no (lean link — run bootstrap-workspace --with-workspace to install podman/postgres/redis/aw-workspace here)")
 		return nil
 	}
 
@@ -807,10 +808,10 @@ func runStatus(args []string) error {
 	for _, mod := range m.Default().Modules {
 		ok, out := bootstrap.Detect(ctx, mod, opts)
 		if ok {
-			fmt.Printf("%s: healthy\n", mod.Name)
+			rlog.Printf("%s: healthy\n", mod.Name)
 		} else {
 			allOK = false
-			fmt.Printf("%s: not healthy\n%s\n", mod.Name, out)
+			rlog.Printf("%s: not healthy\n%s\n", mod.Name, out)
 		}
 	}
 	if !allOK {
@@ -827,10 +828,10 @@ func runUnlink(args []string) error {
 		return err
 	}
 	if *plan {
-		fmt.Printf("[plan] would remove ~/.aw-remote-host/credentials.json and unlink from %s\n", *controlPlane)
-		fmt.Println("[plan] would also stop and uninstall the background service, if installed")
+		rlog.Printf("[plan] would remove ~/.aw-remote-host/credentials.json and unlink from %s\n", *controlPlane)
+		rlog.Println("[plan] would also stop and uninstall the background service, if installed")
 		if *stopContainers {
-			fmt.Println("[plan] would also stop: aw-remote-host-postgres, aw-remote-host-redis, aw-remote-host-workspace")
+			rlog.Println("[plan] would also stop: aw-remote-host-postgres, aw-remote-host-redis, aw-remote-host-workspace")
 		}
 		return nil
 	}
@@ -842,9 +843,9 @@ func runUnlink(args []string) error {
 				if svcPath, pathErr := mgr.Path(svcCfg); pathErr == nil {
 					if _, statErr := os.Stat(svcPath); statErr == nil {
 						if path, err := mgr.Uninstall(svcCfg); err != nil {
-							fmt.Fprintf(os.Stderr, "unlink: could not uninstall %s service: %v\n", mgr.Name(), err)
+							rlog.Printf("unlink: could not uninstall %s service: %v\n", mgr.Name(), err)
 						} else {
-							fmt.Printf("unlink: uninstalled %s service (%s)\n", mgr.Name(), path)
+							rlog.Printf("unlink: uninstalled %s service (%s)\n", mgr.Name(), path)
 						}
 					}
 				}
@@ -856,9 +857,9 @@ func runUnlink(args []string) error {
 		for _, name := range []string{"aw-remote-host-workspace", "aw-remote-host-postgres", "aw-remote-host-redis"} {
 			cmd := exec.Command("podman", "stop", name)
 			if err := cmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "unlink: could not stop %s: %v\n", name, err)
+				rlog.Printf("unlink: could not stop %s: %v\n", name, err)
 			} else {
-				fmt.Printf("unlink: stopped %s\n", name)
+				rlog.Printf("unlink: stopped %s\n", name)
 			}
 		}
 	}
@@ -870,7 +871,7 @@ func runUnlink(args []string) error {
 	if err := link.DeleteCredentials(credPath); err != nil {
 		return err
 	}
-	fmt.Println("unlink: removed local credentials")
+	rlog.Println("unlink: removed local credentials")
 	return nil
 }
 

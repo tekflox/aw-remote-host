@@ -285,6 +285,23 @@ itself out of the existing data volume.
   elevation, so `--elevated` refuses up front outside an elevated prompt
   rather than failing halfway through `schtasks /Create`.
 
+### Logs
+
+Every line this client logs (link/reconnect, self-heal, VPN state, bootstrap
+module status) gets an RFC3339 **UTC** timestamp and goes to two places:
+stdout (so `docker logs`/launchd/systemd capture is unaffected), and a
+rotating file at **`~/.aw-remote-host/client.log`** — size-capped at 5MB,
+keeping up to 3 rotated generations (`client.log.1` .. `client.log.3`). That
+file is what makes a Linux/container install, which otherwise has nothing
+durable on disk at all, diagnosable after the fact — and the UTC timestamp
+is what lets a line here be lined up directly against `docker logs
+aw-backend` without a manual timezone conversion. See `internal/rlog`.
+
+This is separate from the Windows-only `~/.aw-remote-host/aw-remote-host.log`
+above, which is `aw-remote-hostw.exe`'s raw (untimestamped, unrotated)
+stdout/stderr redirect — that one exists because a GUI-subsystem binary has
+no console at all, not to serve as the durable operational log.
+
 ### Firewall management (needs a privileged install)
 
 This host can manage its own firewall (`internal/firewall`) — the control

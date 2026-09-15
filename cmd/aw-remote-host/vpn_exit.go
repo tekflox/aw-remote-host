@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/tekflox/aw-remote-host/internal/ops"
+	"github.com/tekflox/aw-remote-host/internal/rlog"
 	"github.com/tekflox/aw-remote-host/internal/state"
 	"github.com/tekflox/aw-remote-host/internal/vpn"
 )
@@ -75,23 +76,23 @@ func runVPNUseExit(args []string) error {
 		// resolves to. It leads with the refusal so it cannot be mistaken for
 		// a go-ahead.
 		if resolved.Refusal != "" {
-			fmt.Printf("vpn: REFUSED — %s\n", resolved.Refusal)
-			fmt.Println("vpn: what follows is a read-only preview; applying it on this host is not possible.")
+			rlog.Printf("vpn: REFUSED — %s\n", resolved.Refusal)
+			rlog.Println("vpn: what follows is a read-only preview; applying it on this host is not possible.")
 		}
 		printPlanHeader(*resolved)
-		fmt.Printf("[plan] would arm a dead-man's switch for %s BEFORE changing anything, reverting with `tailscale set --exit-node=` if this run does not confirm BOTH halves\n", *deadman)
+		rlog.Printf("[plan] would arm a dead-man's switch for %s BEFORE changing anything, reverting with `tailscale set --exit-node=` if this run does not confirm BOTH halves\n", *deadman)
 		// The commands come from the platform rather than from this file, so
 		// a preview cannot claim an `ip rule` on a machine that has none.
 		for _, line := range resolved.Narration {
-			fmt.Printf("[plan] %s\n", line)
+			rlog.Printf("[plan] %s\n", line)
 		}
 		if resolved.ProbeNetwork != "" {
-			fmt.Printf("[plan] would then measure container egress from a throwaway container on network %q (%s) and %s, AND re-measure this host's own public IP and require it to be UNCHANGED — reverting immediately if either fails\n", resolved.ProbeNetwork, resolved.ProbeNetworkReason, expectationSentence(*expectEgress))
+			rlog.Printf("[plan] would then measure container egress from a throwaway container on network %q (%s) and %s, AND re-measure this host's own public IP and require it to be UNCHANGED — reverting immediately if either fails\n", resolved.ProbeNetwork, resolved.ProbeNetworkReason, expectationSentence(*expectEgress))
 		} else {
-			fmt.Printf("[plan] container egress could not be measured: %s\n", resolved.ProbeNetworkReason)
+			rlog.Printf("[plan] container egress could not be measured: %s\n", resolved.ProbeNetworkReason)
 		}
 		if !*persist {
-			fmt.Printf("[plan] would install the %s boot guard, so a restart clears the selection rather than coming back up on a gate nothing re-confirmed\n", vpn.BootGuardName())
+			rlog.Printf("[plan] would install the %s boot guard, so a restart clears the selection rather than coming back up on a gate nothing re-confirmed\n", vpn.BootGuardName())
 		}
 		return nil
 	}
@@ -116,11 +117,11 @@ func runVPNClearExit(args []string) error {
 	}
 
 	if *plan {
-		fmt.Println("[plan] would stand down any armed dead-man's switch")
-		fmt.Println("[plan] would run: tailscale set --exit-node= --exit-node-allow-lan-access=false --accept-dns=false")
-		fmt.Println("[plan] would remove every ip rule this module installs — the container routes, the host bypass, the mesh-preserve rule and the exclusions (on macOS there is nothing to remove)")
-		fmt.Printf("[plan] would remove the %s boot guard\n", vpn.BootGuardName())
-		fmt.Println("[plan] would then measure BOTH the host's and the containers' egress, which with no gate in force should be the same address")
+		rlog.Println("[plan] would stand down any armed dead-man's switch")
+		rlog.Println("[plan] would run: tailscale set --exit-node= --exit-node-allow-lan-access=false --accept-dns=false")
+		rlog.Println("[plan] would remove every ip rule this module installs — the container routes, the host bypass, the mesh-preserve rule and the exclusions (on macOS there is nothing to remove)")
+		rlog.Printf("[plan] would remove the %s boot guard\n", vpn.BootGuardName())
+		rlog.Println("[plan] would then measure BOTH the host's and the containers' egress, which with no gate in force should be the same address")
 		return nil
 	}
 
@@ -134,34 +135,34 @@ func runVPNClearExit(args []string) error {
 func printProgress(level, message string) {
 	switch level {
 	case "warning":
-		fmt.Printf("vpn: WARNING — %s\n", message)
+		rlog.Printf("vpn: WARNING — %s\n", message)
 	case "error":
-		fmt.Printf("vpn: %s\n", message)
+		rlog.Printf("vpn: %s\n", message)
 	default:
-		fmt.Printf("vpn: %s\n", message)
+		rlog.Printf("vpn: %s\n", message)
 	}
 }
 
 func printPlanHeader(p vpn.UseExitPlan) {
-	fmt.Printf("vpn: exit gate %s (%s), path %s\n", p.Gate.Name, p.GateIP, p.Gate.PathDescription())
+	rlog.Printf("vpn: exit gate %s (%s), path %s\n", p.Gate.Name, p.GateIP, p.Gate.PathDescription())
 	if p.Runtime.Present() {
-		fmt.Printf("vpn: container runtime: %s (%s)\n", p.Runtime.Name, p.Runtime.Version)
+		rlog.Printf("vpn: container runtime: %s (%s)\n", p.Runtime.Name, p.Runtime.Version)
 	}
 	if len(p.Routes.Containers) > 0 {
-		fmt.Println("vpn: these CONTAINER networks would move onto the gate — and nothing else would:")
+		rlog.Println("vpn: these CONTAINER networks would move onto the gate — and nothing else would:")
 		for _, c := range p.Routes.Containers {
-			fmt.Printf("vpn:   %-20s %s\n", c.Prefix, strings.Join(c.Networks, ", "))
+			rlog.Printf("vpn:   %-20s %s\n", c.Prefix, strings.Join(c.Networks, ", "))
 		}
-		fmt.Println("vpn: this MACHINE's own public IP would NOT change. That is asserted, not hoped for: a host whose address moved is a failed apply and reverts.")
+		rlog.Println("vpn: this MACHINE's own public IP would NOT change. That is asserted, not hoped for: a host whose address moved is a failed apply and reverts.")
 	}
 	if len(p.Exclusions.Exclusions) > 0 {
-		fmt.Println("vpn: these prefixes stay OUTSIDE the tunnel, for the containers too:")
+		rlog.Println("vpn: these prefixes stay OUTSIDE the tunnel, for the containers too:")
 		for _, e := range p.Exclusions.Exclusions {
-			fmt.Printf("vpn:   %-20s %s\n", e.Prefix, e.Reason)
+			rlog.Printf("vpn:   %-20s %s\n", e.Prefix, e.Reason)
 		}
 	}
 	if p.Manageability != "" {
-		fmt.Printf("vpn: WARNING — %s\n", p.Manageability)
+		rlog.Printf("vpn: WARNING — %s\n", p.Manageability)
 	}
 }
 
@@ -181,22 +182,22 @@ func reportExitStatus(ctx context.Context, prefs vpn.Prefs, prefsErr error, st *
 	runner := vpn.PrivilegedRunner{Inner: ops.DefaultRunner, Sudo: host.OS != "darwin" && host.UID != 0}
 
 	if deadman, err := vpn.LoadDeadman(); err == nil && deadman != nil {
-		fmt.Printf("vpn: %s\n", deadman.Describe())
+		rlog.Printf("vpn: %s\n", deadman.Describe())
 	}
 
 	live, err := vpn.ListRouteRules(ctx, runner)
 	if err == nil && len(live) > 0 {
-		fmt.Printf("vpn: routing rules in force: %s\n", strings.Join(live, "; "))
+		rlog.Printf("vpn: routing rules in force: %s\n", strings.Join(live, "; "))
 	}
 
 	if prefsErr != nil || !prefs.UsesExitNode {
 		// A rule set with no selection to justify it is precisely the
 		// leftover-state shape that cost two days of silent downtime here.
 		if len(live) > 0 {
-			fmt.Println("vpn: NOTE — those rules exist but NO exit node is selected. They are inert: the `lookup main` ones send traffic where it would go anyway, and the `lookup 52` ones find no default route in that table while nothing is selected, so the kernel falls through. Nothing should have left them behind: run `aw-remote-host vpn clear-exit` to tidy up.")
+			rlog.Println("vpn: NOTE — those rules exist but NO exit node is selected. They are inert: the `lookup main` ones send traffic where it would go anyway, and the `lookup 52` ones find no default route in that table while nothing is selected, so the kernel falls through. Nothing should have left them behind: run `aw-remote-host vpn clear-exit` to tidy up.")
 		}
 		if recorded := recordedExit(st); recorded != "" && prefsErr == nil {
-			fmt.Printf("vpn: NOTE — local state records exit node %q, but this node has none selected. Something cleared it — most likely the dead-man's switch or the boot guard.\n", recorded)
+			rlog.Printf("vpn: NOTE — local state records exit node %q, but this node has none selected. Something cleared it — most likely the dead-man's switch or the boot guard.\n", recorded)
 		}
 		return
 	}
@@ -208,12 +209,12 @@ func reportExitStatus(ctx context.Context, prefs vpn.Prefs, prefsErr error, st *
 	// the machine. Matching the stable node id is what turns it back into a
 	// name a human recognises.
 	gate := exitNodeLabel(ctx, prefs)
-	fmt.Printf("vpn: EXIT NODE IN FORCE — this host's CONTAINER networks go through %s\n", gate.label)
+	rlog.Printf("vpn: EXIT NODE IN FORCE — this host's CONTAINER networks go through %s\n", gate.label)
 	if !prefs.ExitNodeAllowLANAccess {
-		fmt.Println("vpn: WARNING — exit-node-allow-lan-access is OFF, so this host's own LAN is inside the tunnel. Nothing this command installs turns that off; something else set it.")
+		rlog.Println("vpn: WARNING — exit-node-allow-lan-access is OFF, so this host's own LAN is inside the tunnel. Nothing this command installs turns that off; something else set it.")
 	}
 	if prefs.AcceptsDNS {
-		fmt.Println("vpn: WARNING — accept-dns is ON while an exit node is in force. That rewrites this host's resolver, which is the same lockout arriving through DNS instead of routing. Nothing in this module turns it on.")
+		rlog.Println("vpn: WARNING — accept-dns is ON while an exit node is in force. That rewrites this host's resolver, which is the same lockout arriving through DNS instead of routing. Nothing in this module turns it on.")
 	}
 
 	// The honest part: the interface being up proves nothing, so say what the
@@ -222,29 +223,29 @@ func reportExitStatus(ctx context.Context, prefs vpn.Prefs, prefsErr error, st *
 	// equal addresses here mean either the gate did nothing or the host moved
 	// too, and those are indistinguishable from the container's number alone.
 	if dev, devErr := vpn.RouteDevice(ctx, runner, "1.1.1.1"); devErr == nil && dev != "" {
-		fmt.Printf("vpn: this HOST's route for 1.1.1.1 leaves via %s (a tailscale interface here would mean the host is routed, which it must not be)\n", dev)
+		rlog.Printf("vpn: this HOST's route for 1.1.1.1 leaves via %s (a tailscale interface here would mean the host is routed, which it must not be)\n", dev)
 	}
 	if egress, egressErr := vpn.PublicIP(ctx); egressErr == nil {
-		fmt.Printf("vpn: HOST public egress IP: %s (measured via %s) — with a gate in force this must be the SAME address as before it\n", egress.IP, egress.Via)
+		rlog.Printf("vpn: HOST public egress IP: %s (measured via %s) — with a gate in force this must be the SAME address as before it\n", egress.IP, egress.Via)
 	} else {
-		fmt.Printf("vpn: HOST public egress IP: UNKNOWN — this host could not reach the internet at all (%v).\n", egressErr)
+		rlog.Printf("vpn: HOST public egress IP: UNKNOWN — this host could not reach the internet at all (%v).\n", egressErr)
 	}
 	reportContainerEgress(ctx, runner)
 	if !vpn.BootGuardInstalled() {
-		fmt.Printf("vpn: WARNING — the %s boot guard is NOT installed. An exit-node selection survives a reboot and nothing re-confirms it on the way back up, so this host can come back with its default route on a gate that has since stopped forwarding.\n", vpn.BootGuardName())
+		rlog.Printf("vpn: WARNING — the %s boot guard is NOT installed. An exit-node selection survives a reboot and nothing re-confirms it on the way back up, so this host can come back with its default route on a gate that has since stopped forwarding.\n", vpn.BootGuardName())
 	}
 	if recorded := recordedExit(st); recorded != "" && gate.name != "" && gate.name != recorded {
-		fmt.Printf("vpn: NOTE — local state records exit node %q, but %q is what is actually in force.\n", recorded, gate.name)
+		rlog.Printf("vpn: NOTE — local state records exit node %q, but %q is what is actually in force.\n", recorded, gate.name)
 	}
 	// On darwin an empty rule list is the design, not a fault — this module
 	// installs no routes there — so the warning would be false. The same fact
 	// is still reported, as the manageability sentence use-exit prints, rather
 	// than as an accusation that something went wrong.
 	if len(live) == 0 && host.OS == "linux" {
-		fmt.Println("vpn: WARNING — an exit node is in force and this module's routing rules are NOT installed. That means tailscale's own `from all lookup 52` is unopposed, so this MACHINE's traffic is going through the gate and not just its containers' — the exact scope this feature was rewritten to stop. Run `aw-remote-host vpn clear-exit` now, or re-select the gate with `vpn use-exit`, which installs them.")
+		rlog.Println("vpn: WARNING — an exit node is in force and this module's routing rules are NOT installed. That means tailscale's own `from all lookup 52` is unopposed, so this MACHINE's traffic is going through the gate and not just its containers' — the exact scope this feature was rewritten to stop. Run `aw-remote-host vpn clear-exit` now, or re-select the gate with `vpn use-exit`, which installs them.")
 	}
 	if host.OS == "darwin" {
-		fmt.Println("vpn: NOTE — on macOS this module installs no routing rules of its own, and cannot route containers separately from the machine at all. A selection in force here is routing the WHOLE Mac. Run `aw-remote-host vpn clear-exit` from this keyboard, or restart — the boot guard clears the selection at login.")
+		rlog.Println("vpn: NOTE — on macOS this module installs no routing rules of its own, and cannot route containers separately from the machine at all. A selection in force here is routing the WHOLE Mac. Run `aw-remote-host vpn clear-exit` from this keyboard, or restart — the boot guard clears the selection at login.")
 	}
 }
 
@@ -257,21 +258,21 @@ func reportExitStatus(ctx context.Context, prefs vpn.Prefs, prefsErr error, st *
 func reportContainerEgress(ctx context.Context, runner vpn.Runner) {
 	runtime, err := vpn.DetectContainerRuntime(ctx, runner)
 	if err != nil {
-		fmt.Printf("vpn: CONTAINER egress IP: not measurable — %v\n", err)
+		rlog.Printf("vpn: CONTAINER egress IP: not measurable — %v\n", err)
 		return
 	}
 	networks, err := vpn.ContainerNetworks(ctx, runner, runtime)
 	if err != nil || len(networks) == 0 {
-		fmt.Printf("vpn: CONTAINER egress IP: not measurable — %s answers but defines no network with an IPv4 subnet\n", runtime.Name)
+		rlog.Printf("vpn: CONTAINER egress IP: not measurable — %s answers but defines no network with an IPv4 subnet\n", runtime.Name)
 		return
 	}
 	probeNetwork, _ := vpn.PickProbeNetwork(runtime, networks)
 	res := vpn.MeasureContainerEgress(ctx, runner, runtime, probeNetwork)
 	if res.IP == "" {
-		fmt.Printf("vpn: CONTAINER egress IP: UNKNOWN — %s\n", res.Error)
+		rlog.Printf("vpn: CONTAINER egress IP: UNKNOWN — %s\n", res.Error)
 		return
 	}
-	fmt.Printf("vpn: CONTAINER egress IP: %s (measured via %s, from a throwaway container on %s network %s)\n", res.IP, res.Via, res.Runtime, res.Network)
+	rlog.Printf("vpn: CONTAINER egress IP: %s (measured via %s, from a throwaway container on %s network %s)\n", res.IP, res.Via, res.Runtime, res.Network)
 }
 
 // exitGate is the gate a selection points at: the peer's name when it could

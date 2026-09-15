@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/tekflox/aw-remote-host/internal/homedir"
+	"github.com/tekflox/aw-remote-host/internal/rlog"
 )
 
 // persisted is the on-disk shape of ~/.aw-remote-host/firewall.json — the
@@ -97,13 +98,13 @@ func SelfHeal(ctx context.Context, runner Runner) error {
 		return fmt.Errorf("firewall self-heal: probe failed: %w", err)
 	}
 	if !privileged {
-		fmt.Fprintf(os.Stderr, "firewall: self-heal skipped — %s backend not privileged: %s\n", name, reason)
+		rlog.Printf("firewall: self-heal skipped — %s backend not privileged: %s\n", name, reason)
 		return nil
 	}
 	if err := backend.Apply(ctx, p.Rules, p.Lockdown); err != nil {
 		return fmt.Errorf("firewall self-heal: apply failed: %w", err)
 	}
-	fmt.Printf("firewall: self-heal reapplied %d rule(s) (revision %d, lockdown=%v) via %s\n",
+	rlog.Printf("firewall: self-heal reapplied %d rule(s) (revision %d, lockdown=%v) via %s\n",
 		len(p.Rules), p.Revision, p.Lockdown, name)
 	return nil
 }

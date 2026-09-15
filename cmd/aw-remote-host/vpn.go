@@ -11,6 +11,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
 	"github.com/tekflox/aw-remote-host/internal/link"
 	"github.com/tekflox/aw-remote-host/internal/ops"
+	"github.com/tekflox/aw-remote-host/internal/rlog"
 	"github.com/tekflox/aw-remote-host/internal/state"
 	"github.com/tekflox/aw-remote-host/internal/vpn"
 )
@@ -70,20 +71,20 @@ func runVPNEnroll(args []string) error {
 
 	if *plan {
 		if *loginServer == "" {
-			fmt.Println("[plan] --login-server is required to enrol (no default: one headscale per tenant, never hardcoded)")
+			rlog.Println("[plan] --login-server is required to enrol (no default: one headscale per tenant, never hardcoded)")
 			return nil
 		}
 		// An already-enrolled node has no installer, and printing "would
 		// install tailscale via " with nothing after it is the same kind of
 		// half-truth this whole file exists to avoid.
 		if elig.AlreadyEnrolled {
-			fmt.Println("[plan] tailscale is already installed and this node is already on the mesh — nothing would be installed")
+			rlog.Println("[plan] tailscale is already installed and this node is already on the mesh — nothing would be installed")
 		} else {
-			fmt.Printf("[plan] would install tailscale via %s\n", elig.Installer)
+			rlog.Printf("[plan] would install tailscale via %s\n", elig.Installer)
 		}
-		fmt.Printf("[plan] would run: tailscale up --login-server=%s --accept-routes=false --accept-dns=%t%s\n",
+		rlog.Printf("[plan] would run: tailscale up --login-server=%s --accept-routes=false --accept-dns=%t%s\n",
 			*loginServer, *acceptDNS, exitFlagPlan(*advertiseExit, elig))
-		fmt.Println("[plan] would NOT select an exit node and would NOT change this machine's default route (phase 2, deliberately out of scope)")
+		rlog.Println("[plan] would NOT select an exit node and would NOT change this machine's default route (phase 2, deliberately out of scope)")
 		return nil
 	}
 
@@ -171,14 +172,14 @@ func exitFlagPlan(want bool, elig vpn.Eligibility) string {
 
 func reportEligibility(e vpn.Eligibility) {
 	h := e.Host
-	fmt.Printf("vpn: host is %s/%s%s, uid %d%s\n",
+	rlog.Printf("vpn: host is %s/%s%s, uid %d%s\n",
 		h.OS, h.Arch, wslNote(h.WSL), h.UID, sudoNote(h))
-	fmt.Printf("vpn: %s\n", e.Describe())
+	rlog.Printf("vpn: %s\n", e.Describe())
 	// Two lines, not one. On Mac.Home the two verdicts disagree — it can
 	// never enrol and can still be pointed at a gate — and collapsing them
 	// sent the reader off to fix Homebrew for a problem Homebrew does not
 	// cause.
-	fmt.Printf("vpn: %s\n", e.DescribeSelectExit())
+	rlog.Printf("vpn: %s\n", e.DescribeSelectExit())
 }
 
 func wslNote(wsl bool) string {
@@ -213,25 +214,25 @@ func reportVPNStatus(ctx context.Context, st *state.State) {
 	if st.VPN == nil && elig.Host.TailscalePath == "" {
 		// Not enrolled and no client installed: say what this host WOULD be
 		// allowed to do, since that is the question the mesh UI will ask.
-		fmt.Printf("vpn: not enrolled — %s\n", elig.Describe())
+		rlog.Printf("vpn: not enrolled — %s\n", elig.Describe())
 		return
 	}
 	if st.VPN != nil {
-		fmt.Printf("vpn: enrolled as %q against %s%s\n",
+		rlog.Printf("vpn: enrolled as %q against %s%s\n",
 			st.VPN.NodeName, st.VPN.LoginServer, enrolledAtNote(st.VPN.EnrolledAt))
 	}
 
 	status, err := vpn.FetchStatus(ctx, ops.DefaultRunner)
 	if err != nil {
-		fmt.Printf("vpn: could not read tailscale status: %v\n", err)
+		rlog.Printf("vpn: could not read tailscale status: %v\n", err)
 		return
 	}
 	if !status.Running() {
-		fmt.Printf("vpn: node is NOT up (BackendState=%s)\n", status.BackendState)
+		rlog.Printf("vpn: node is NOT up (BackendState=%s)\n", status.BackendState)
 		return
 	}
 
-	fmt.Printf("vpn: node %s (%s) %s on tailnet %s\n",
+	rlog.Printf("vpn: node %s (%s) %s on tailnet %s\n",
 		status.NodeName, strings.Join(status.MeshIPs, ", "),
 		onlineWord(status.Online), status.Tailnet)
 
@@ -251,12 +252,12 @@ func reportVPNStatus(ctx context.Context, st *state.State) {
 	}
 	switch {
 	case status.OffersExit:
-		fmt.Println("vpn: offers itself as an exit node (route advertised AND approved)")
+		rlog.Println("vpn: offers itself as an exit node (route advertised AND approved)")
 	case advertised:
-		fmt.Println("vpn: exit node ADVERTISED BUT NOT APPROVED — no peer can select this host until a headscale admin approves its 0.0.0.0/0 route")
+		rlog.Println("vpn: exit node ADVERTISED BUT NOT APPROVED — no peer can select this host until a headscale admin approves its 0.0.0.0/0 route")
 	case st.VPN != nil && st.VPN.AdvertiseExit:
 		// Asked for at enrolment, not advertised now: something reset it.
-		fmt.Println("vpn: exit node was REQUESTED at enrolment but this node is not advertising one — re-run 'aw-remote-host vpn --advertise-exit-node'")
+		rlog.Println("vpn: exit node was REQUESTED at enrolment but this node is not advertising one — re-run 'aw-remote-host vpn --advertise-exit-node'")
 	}
 
 	// Phase 2: which gate is in force, what the REAL egress IP is, what is
@@ -267,16 +268,16 @@ func reportVPNStatus(ctx context.Context, st *state.State) {
 	reportExitStatus(ctx, prefs, prefsErr, st)
 
 	if prefsErr == nil && !SameOrEmpty(prefs.LoginServer, stateLoginServer(st)) {
-		fmt.Printf("vpn: NOTE — this node answers to %s, but local state records %s\n",
+		rlog.Printf("vpn: NOTE — this node answers to %s, but local state records %s\n",
 			prefs.LoginServer, stateLoginServer(st))
 	}
 
 	if len(status.Peers) == 0 {
-		fmt.Println("vpn: no peers")
+		rlog.Println("vpn: no peers")
 		return
 	}
 	for _, p := range status.Peers {
-		fmt.Printf("vpn:   peer %-20s %-15s %s%s\n",
+		rlog.Printf("vpn:   peer %-20s %-15s %s%s\n",
 			p.Name, firstIP(p.IPs), p.PathDescription(), offersExitNote(p.OffersExit))
 	}
 }
