@@ -117,6 +117,45 @@ type Client struct {
 
 	MinBackoff time.Duration // default 1s
 	MaxBackoff time.Duration // default 60s
+
+	// RegisterReadTimeout bounds how long register() waits for the server's
+	// "registered" reply after a successful WebSocket upgrade (default 30s).
+	// PumpReadTimeout bounds how long pump()'s read loop waits for the next
+	// frame from the server once registered (default 90s). Both exist so a
+	// server that accepted the upgrade but never writes back — or a TCP
+	// connection that dies silently mid-read, no FIN/RST — surfaces as a
+	// read error within a bounded time instead of blocking conn.ReadMessage
+	// forever, which used to wedge the process indefinitely: Run's
+	// reconnect/backoff loop never got the chance to iterate because the
+	// read it was blocked on never returned. Zero means "use the default".
+	RegisterReadTimeout time.Duration
+	PumpReadTimeout     time.Duration
+}
+
+// defaultRegisterReadTimeout / defaultPumpReadTimeout are the production
+// defaults behind Client.RegisterReadTimeout / PumpReadTimeout above.
+// defaultPumpReadTimeout is set comfortably above aw-backend's own
+// PONG_TIMEOUT_S (60s = 2x its 30s PING_INTERVAL_S, see host_link.py) so a
+// healthy connection's normal server-initiated ping cadence never trips it,
+// while the server's own dead-connection cleanup fires first in the common
+// case and this is just the client-side backstop for when it doesn't.
+const (
+	defaultRegisterReadTimeout = 30 * time.Second
+	defaultPumpReadTimeout     = 90 * time.Second
+)
+
+func (c *Client) registerReadTimeout() time.Duration {
+	if c.RegisterReadTimeout > 0 {
+		return c.RegisterReadTimeout
+	}
+	return defaultRegisterReadTimeout
+}
+
+func (c *Client) pumpReadTimeout() time.Duration {
+	if c.PumpReadTimeout > 0 {
+		return c.PumpReadTimeout
+	}
+	return defaultPumpReadTimeout
 }
 
 // New builds a Client from the CLI's --control-plane and --token flags.
@@ -215,9 +254,12 @@ func (c *Client) registerFrame() map[string]any {
 	return frame
 }
 
-func register(conn *websocket.Conn, frame map[string]any) (*RegisteredReply, error) {
+func register(conn *websocket.Conn, frame map[string]any, readTimeout time.Duration) (*RegisteredReply, error) {
 	if err := conn.WriteJSON(frame); err != nil {
 		return nil, fmt.Errorf("send register frame: %w", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		return nil, fmt.Errorf("set read deadline: %w", err)
 	}
 	_, data, err := conn.ReadMessage()
 	if err != nil {
@@ -248,7 +290,7 @@ func (c *Client) Connect(ctx context.Context, token, credentialsPath string) (*C
 	if err != nil {
 		return nil, err
 	}
-	reply, err := register(conn, c.registerFrame())
+	reply, err := register(conn, c.registerFrame(), c.registerReadTimeout())
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -385,7 +427,7 @@ func (c *Client) Run(ctx context.Context, credentialsPath string, cb RunCallback
 			cb.OnRegistered(result.Reply)
 		}
 
-		pumpErr := pump(ctx, result.Conn, cb.OnCommand, cb.OnShell, cb.OnTunnelProxy)
+		pumpErr := pump(ctx, result.Conn, c.pumpReadTimeout(), cb.OnCommand, cb.OnShell, cb.OnTunnelProxy)
 		result.Conn.Close()
 		if cb.OnDisconnect != nil {
 			cb.OnDisconnect(pumpErr)
@@ -424,7 +466,13 @@ func (w *frameWriter) WriteJSON(v any) error {
 // Every open PTY session / ws proxy session is torn down (CloseAll/
 // CloseAllWS) when the connection drops, since a dead tunnel can never
 // deliver another pty_input/ws_msg for any of them.
-func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler, newShell NewShellManagerFunc, newTunnelProxy NewTunnelProxyFunc) error {
+//
+// Each iteration renews conn's read deadline to now+readTimeout before
+// blocking on ReadMessage, so a connection that goes silent — the server
+// hangs, or the TCP path dies with no FIN/RST — surfaces as a read error
+// (and this function returning) within readTimeout instead of blocking
+// forever and starving Run's reconnect/backoff loop of its next iteration.
+func pump(ctx context.Context, conn *websocket.Conn, readTimeout time.Duration, handler CommandHandler, newShell NewShellManagerFunc, newTunnelProxy NewTunnelProxyFunc) error {
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -452,6 +500,9 @@ func pump(ctx context.Context, conn *websocket.Conn, handler CommandHandler, new
 	}
 
 	for {
+		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+			return err
+		}
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			return err

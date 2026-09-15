@@ -547,3 +547,116 @@ func TestRegisterFrameSendsEmptyHostPowerNotOmitted(t *testing.T) {
 		}
 	}
 }
+
+// TestConnectFailsWithinReadTimeoutWhenServerNeverRepliesToRegister is the
+// regression test for the confirmed crispal production incident: a server
+// that accepts the WebSocket upgrade but never writes the "registered"
+// reply back used to leave register()'s conn.ReadMessage() — and the whole
+// process — blocked forever, because no read deadline was ever set. This
+// asserts Connect surfaces a read error well within RegisterReadTimeout
+// instead of hanging.
+func TestConnectFailsWithinReadTimeoutWhenServerNeverRepliesToRegister(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	upgrader := websocket.Upgrader{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Accept the upgrade, then go completely silent — never read the
+		// register frame, never write a reply. Held open until the test
+		// releases it so httptest.Server.Close() doesn't itself hang
+		// waiting for this handler to return.
+		<-release
+	}))
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+	c.RegisterReadTimeout = 100 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Connect(context.Background(), "awbs_test", credPath)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a read-timeout error, got nil")
+		}
+		if !strings.Contains(err.Error(), "i/o timeout") {
+			t.Errorf("expected an i/o timeout error, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect blocked past its read deadline — this is exactly the bug this test guards against (the crispal incident: link stayed blocked in ReadMessage forever)")
+	}
+}
+
+// TestRunReconnectsAfterPumpReadTimeoutWhenServerGoesSilent covers the other
+// blocking read in this file: pump()'s main frame loop. A server that
+// registers the client normally and then goes silent forever (no further
+// pings, no close) used to block pump's conn.ReadMessage() forever too,
+// which meant Run's reconnect/backoff loop never got to iterate again. This
+// asserts Run reconnects (a second OnRegistered fires) once the pump read
+// deadline trips, and that the reported disconnect error is the timeout.
+func TestRunReconnectsAfterPumpReadTimeoutWhenServerGoesSilent(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.acceptTokens["awlk_minted"] = "" // reconnect: no new credential minted
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+	c.MinBackoff = 5 * time.Millisecond
+	c.MaxBackoff = 20 * time.Millisecond
+	c.PumpReadTimeout = 100 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var registeredCount int32
+	var mu sync.Mutex
+	var disconnectErrs []error
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnRegistered: func(reply *RegisteredReply) {
+				n := atomic.AddInt32(&registeredCount, 1)
+				if n >= 2 {
+					cancel() // stop once the pump timeout has let Run reconnect once
+				}
+			},
+			OnDisconnect: func(err error) {
+				mu.Lock()
+				disconnectErrs = append(disconnectErrs, err)
+				mu.Unlock()
+			},
+		})
+	}()
+
+	<-done
+
+	if atomic.LoadInt32(&registeredCount) < 2 {
+		t.Fatalf("expected Run to reconnect after the pump read deadline fired, got %d registration(s) — "+
+			"without the fix the server going silent blocks pump's ReadMessage forever and the reconnect "+
+			"loop never runs again", registeredCount)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	sawTimeout := false
+	for _, err := range disconnectErrs {
+		if err != nil && strings.Contains(err.Error(), "i/o timeout") {
+			sawTimeout = true
+		}
+	}
+	if !sawTimeout {
+		t.Errorf("expected at least one OnDisconnect with an i/o timeout error, got %v", disconnectErrs)
+	}
+}
