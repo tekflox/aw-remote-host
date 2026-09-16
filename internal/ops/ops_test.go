@@ -267,22 +267,22 @@ func TestRunModuleEnvLetsPinnedUpdateImageOverrideInheritedLatest(t *testing.T) 
 }
 
 // No StatePath (tests, or any caller that never wired one up) must still
-// yield a valid worker count — "1", never "" or "0", which would reach
+// yield a valid worker count — "5", never "" or "0", which would reach
 // install.sh's AW_WORKSPACE_WORKERS and break the int() parse in
 // src/start/workspace.py.
-func TestRunModuleEnvDefaultsWorkersToOneWithNoStatePath(t *testing.T) {
+func TestRunModuleEnvDefaultsWorkersToFiveWithNoStatePath(t *testing.T) {
 	useTempState(t)
 	env := runModuleEnv(BootstrapOpts{WorkspaceSlug: "demo"}, nil)
 
-	if got := lastEnvValue(env, "AW_WORKSPACE_WORKERS"); got != "1" {
-		t.Fatalf("AW_WORKSPACE_WORKERS = %q, want 1", got)
+	if got := lastEnvValue(env, "AW_WORKSPACE_WORKERS"); got != "5" {
+		t.Fatalf("AW_WORKSPACE_WORKERS = %q, want 5", got)
 	}
 }
 
 // A worker count persisted in this host's state must survive into the env
 // passed to install.sh's podman run — the whole point of the card this
 // mirrors AW_HOST_POWER's pattern for: worker count is HOST state, not
-// IMAGE state, and must not silently reset to the image default of 1 on
+// IMAGE state, and must not silently reset to the image default of 5 on
 // every container recreation.
 func TestRunModuleEnvUsesPersistedWorkerCount(t *testing.T) {
 	useTempState(t)

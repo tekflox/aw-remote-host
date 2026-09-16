@@ -213,7 +213,7 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	}
 	hostPower := fs.String("host-power", "", "comma-separated elevated host access to grant app containers on this machine (default: none). Grants:\n"+hostpower.Help()+
 		"Only what this host can actually deliver is granted — each grant is probed, and anything undeliverable is reported, not silently assumed. An app must ALSO declare it in runtime.host_power and hold the matching host:* permission. Re-run with a different value to change it; pass --host-power=none to revoke.")
-	workers := fs.String("workers", "", "worker-process count for this host's workspace container (default: 1, matching the image). Persists across a container recreation, the same way --host-power does. Re-run with a different value to change it. NOTE: this workspace's code does not yet support running with more than 1 worker safely — leave this unset until told otherwise.")
+	workers := fs.String("workers", "", "worker-process count for this host's workspace container (default: 5, kept in sync with the image's own default — the two live in separate repos and must be bumped together). Persists across a container recreation, the same way --host-power does. Re-run with a different value to change it.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

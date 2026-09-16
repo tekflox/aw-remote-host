@@ -302,16 +302,17 @@ func Update(path string, mutate func(*State)) error {
 	return Save(path, s)
 }
 
-// EffectiveWorkers returns the persisted AW_WORKSPACE_WORKERS value, or the
-// Dockerfile's own baked default of 1 when nothing has been configured yet
-// (Workers == 0). Kept on State rather than duplicated at each call site
-// (cmd/aw-remote-host and internal/ops both need it) so the default lives
-// in exactly one place.
+// EffectiveWorkers returns the persisted AW_WORKSPACE_WORKERS value, or 5
+// when nothing has been configured yet (Workers == 0) — kept in sync with
+// the aw-workspace image's own ENV default on purpose, not by coincidence;
+// the two live in separate repos and must be bumped together. Kept on
+// State rather than duplicated at each call site (cmd/aw-remote-host and
+// internal/ops both need it) so the default lives in exactly one place.
 func (s *State) EffectiveWorkers() int {
 	if s.Workers > 0 {
 		return s.Workers
 	}
-	return 1
+	return 5
 }
 
 // RecordBootstrapVersion updates the state at path with runningVersion as

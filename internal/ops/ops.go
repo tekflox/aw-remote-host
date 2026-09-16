@@ -1281,17 +1281,18 @@ func effectiveHostPower(statePath string) string {
 
 // effectiveWorkers reads this host's persisted worker-process count for the
 // workspace container, mirroring effectiveHostPower above. Falls back to
-// "1" (the Dockerfile's own baked default) when nothing is configured yet,
-// including when statePath is empty (tests, or any caller that never wired
-// one up) — never "" or "0", which would reach install.sh's
-// AW_WORKSPACE_WORKERS and break the int() parse in src/start/workspace.py.
+// "5" (kept in sync with the aw-workspace image's own ENV default on
+// purpose) when nothing is configured yet, including when statePath is
+// empty (tests, or any caller that never wired one up) — never "" or "0",
+// which would reach install.sh's AW_WORKSPACE_WORKERS and break the int()
+// parse in src/start/workspace.py.
 func effectiveWorkers(statePath string) string {
 	if statePath == "" {
-		return "1"
+		return "5"
 	}
 	st, err := state.Load(statePath)
 	if err != nil {
-		return "1"
+		return "5"
 	}
 	return strconv.Itoa(st.EffectiveWorkers())
 }

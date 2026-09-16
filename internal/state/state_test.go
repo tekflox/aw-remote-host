@@ -35,12 +35,13 @@ func TestProvisionedRoundTrips(t *testing.T) {
 	}
 }
 
-// Zero (never configured) must fall back to 1, the Dockerfile's own baked
-// default — not 0 workers, which would break the container.
-func TestEffectiveWorkersDefaultsToOne(t *testing.T) {
+// Zero (never configured) must fall back to 5, kept in sync with the
+// aw-workspace image's own ENV default — not 0 workers, which would break
+// the container.
+func TestEffectiveWorkersDefaultsToFive(t *testing.T) {
 	st := &State{}
-	if got := st.EffectiveWorkers(); got != 1 {
-		t.Fatalf("EffectiveWorkers() = %d, want 1", got)
+	if got := st.EffectiveWorkers(); got != 5 {
+		t.Fatalf("EffectiveWorkers() = %d, want 5", got)
 	}
 }
 

@@ -74,13 +74,14 @@ AW_HOST_POWER="${AW_HOST_POWER:-}"
 
 # Worker-process count for this container — persisted HOST state (see
 # internal/state.State.Workers / EffectiveWorkers), NOT baked into the image
-# beyond its own ENV default of 1. Set by the Go layer the same way
-# AW_HOST_POWER is; defaults to 1 here too so a direct invocation of this
-# script (local dev, or any caller that never wired the env var up) still
-# gets a valid value instead of `-e AW_WORKSPACE_WORKERS=` with an empty
-# string, which would break `int(os.environ["AW_WORKSPACE_WORKERS"])` in
-# src/start/workspace.py.
-AW_WORKSPACE_WORKERS="${AW_WORKSPACE_WORKERS:-1}"
+# beyond its own ENV default of 5 (kept in sync with the image's own default
+# on purpose — the two live in separate repos and must be bumped together).
+# Set by the Go layer the same way AW_HOST_POWER is; defaults to 5 here too
+# so a direct invocation of this script (local dev, or any caller that never
+# wired the env var up) still gets a valid value instead of
+# `-e AW_WORKSPACE_WORKERS=` with an empty string, which would break
+# `int(os.environ["AW_WORKSPACE_WORKERS"])` in src/start/workspace.py.
+AW_WORKSPACE_WORKERS="${AW_WORKSPACE_WORKERS:-5}"
 
 if [ -z "${AW_WORKSPACE_HOST_DIR:-}" ] && [ ! -e "$DEFAULT_HOST_DIR" ] && [ -e "$LEGACY_HOST_DIR" ]; then
   if podman container exists "$CONTAINER_NAME"; then
