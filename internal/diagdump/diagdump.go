@@ -12,48 +12,30 @@
 // SIGQUIT's default behaviour is deliberately left untouched, so a genuinely
 // wedged process can still be killed-with-evidence via SIGQUIT if that is
 // ever wanted, while SIGUSR1 is safe to fire speculatively.
+//
+// Start (see diagdump_unix.go / diagdump_windows.go) is platform-split the
+// same way internal/vpn's deadman switch is: SIGUSR1 doesn't exist on
+// Windows, and the hosted container form this exists for is Linux-only
+// anyway (a Windows BYOD host's workspace runs inside the WSL2 distro
+// internal/wsl provisions, which is where this would need to be armed
+// instead, same as deadman_windows.go's reasoning) — Start still needs to
+// exist as a symbol so this builds for windows/amd64, which the release
+// workflow does.
 package diagdump
 
 import (
-	"context"
-	"os"
-	"os/signal"
 	"runtime"
-	"syscall"
 
 	"github.com/tekflox/aw-remote-host/internal/rlog"
 )
 
 // initialBufSize is generous enough for a normal process (a few dozen
-// goroutines); growBufSize below re-dumps into a bigger buffer instead of
-// silently truncating whenever it isn't.
+// goroutines); dump grows the buffer instead of silently truncating
+// whenever it isn't.
 const (
 	initialBufSize = 64 * 1024
 	maxBufSize     = 8 * 1024 * 1024
 )
-
-// Start arms the SIGUSR1 handler and runs until ctx is done. Safe to call
-// once per process (typically from the same place that builds the SIGTERM/
-// SIGINT NotifyContext) — each SIGUSR1 received logs every goroutine's
-// stack via rlog.Printf (console + the rotating client.log file) and then
-// goes right back to waiting for the next one, unlike SIGQUIT which never
-// returns.
-func Start(ctx context.Context) {
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGUSR1)
-
-	go func() {
-		defer signal.Stop(sigCh)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-sigCh:
-				dump()
-			}
-		}
-	}()
-}
 
 // dump writes every goroutine's stack to the log, growing the buffer if the
 // first attempt was too small rather than emitting a truncated dump that
