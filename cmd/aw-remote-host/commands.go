@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
+	"github.com/tekflox/aw-remote-host/internal/diagdump"
 	"github.com/tekflox/aw-remote-host/internal/firewall"
 	"github.com/tekflox/aw-remote-host/internal/hostfacts"
 	"github.com/tekflox/aw-remote-host/internal/hostpower"
@@ -388,6 +389,11 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// RODADA 10 D6 item 2 — non-fatal goroutine dump on SIGUSR1. See
+	// internal/diagdump's package doc for why this exists instead of just
+	// relying on Go's default (process-killing) SIGQUIT handler.
+	diagdump.Start(ctx)
 
 	// Lean by default: skip local infra provisioning entirely unless
 	// --with-workspace opted in. The /link registration below (and the
