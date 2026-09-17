@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -658,5 +659,56 @@ func TestRunReconnectsAfterPumpReadTimeoutWhenServerGoesSilent(t *testing.T) {
 	}
 	if !sawTimeout {
 		t.Errorf("expected at least one OnDisconnect with an i/o timeout error, got %v", disconnectErrs)
+	}
+}
+
+func TestTouchHeartbeatCreatesFileOnFirstCall(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "heartbeat")
+
+	touchHeartbeat(path)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected heartbeat file to be created, stat failed: %v", err)
+	}
+}
+
+func TestTouchHeartbeatUpdatesMtimeOnExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "heartbeat")
+	old := time.Now().Add(-time.Hour)
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	touchHeartbeat(path)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !info.ModTime().After(old) {
+		t.Fatalf("expected mtime to advance past %v, got %v", old, info.ModTime())
+	}
+}
+
+func TestTouchHeartbeatIsNoOpForEmptyPath(t *testing.T) {
+	// Must not panic or create anything — this is the codepath a supervisor
+	// with no AW_REMOTE_HOST_HEARTBEAT_FILE configured takes on every read.
+	touchHeartbeat("")
+}
+
+func TestTouchHeartbeatIsBestEffortOnAnUnwritablePath(t *testing.T) {
+	// A missing parent directory means the OpenFile fallback can't create the
+	// file either — must swallow the error rather than panic or propagate it,
+	// since the caller (the read loop) has nothing useful to do with it. See
+	// touchHeartbeat's own doc comment.
+	path := filepath.Join(t.TempDir(), "missing-parent", "heartbeat")
+
+	touchHeartbeat(path)
+
+	if _, err := os.Stat(path); err == nil {
+		t.Fatalf("expected no file to be created under a missing parent dir")
 	}
 }
