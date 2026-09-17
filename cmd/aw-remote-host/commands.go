@@ -592,6 +592,16 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		return fmt.Errorf("registered but the control plane didn't return a workspace_slug")
 	}
 
+	// Runs for the lifetime of this process, independent of provisionWorkspace
+	// (--with-workspace) — that flag only governs whether THIS invocation does
+	// the initial install; a host provisioned by an EARLIER run still needs
+	// its nested containers watched. selfHealTick itself is the no-op guard
+	// for a lean host that has never had a local runtime at all (see
+	// internal/ops/selfheal.go's incident writeup for why this exists).
+	go opsHandler.ZombieHealLoop(ctx, func(level, phase, message string) {
+		rlog.Printf("selfheal[%s/%s]: %s\n", level, phase, message)
+	})
+
 	if provisionWorkspace {
 		wsOpts := bootstrap.RunOptions{
 			ExtractDir: extractDir,
