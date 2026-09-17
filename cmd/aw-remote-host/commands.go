@@ -424,6 +424,11 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	usernsContained, usernsMeasured := hostfacts.UsernsContained()
 	containerForm, containerID := hostfacts.ContainerForm()
 	c := link.New(*controlPlane, *token)
+	// Set by the hosted container's entrypoint.sh only — see
+	// resilience:hosted-entrypoint-signal-and-hang-supervision. Empty
+	// (the default everywhere else, including a plain developer `link`)
+	// leaves HeartbeatFile disabled.
+	c.HeartbeatFile = strings.TrimSpace(os.Getenv("AW_REMOTE_HOST_HEARTBEAT_FILE"))
 	c.Info = link.RegisterInfo{
 		Hostname:           hostname,
 		OS:                 runtime.GOOS,

@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -130,6 +131,21 @@ type Client struct {
 	// read it was blocked on never returned. Zero means "use the default".
 	RegisterReadTimeout time.Duration
 	PumpReadTimeout     time.Duration
+
+	// HeartbeatFile, when set, has its mtime touched once per completed
+	// pump() read-loop iteration — i.e. proof the loop is actually turning
+	// (received and dispatched a frame), not merely that this process still
+	// exists. Empty disables it (default: most callers, e.g. a plain `link`
+	// on a developer machine, have no supervisor watching this file).
+	//
+	// This exists for the hosted container's entrypoint.sh, which restarts
+	// this process on exit but previously had no way to notice one that is
+	// alive yet wedged (deadlocked on the shared frameWriter mutex, stuck in
+	// a handler, whatever) and so never exits on its own. The watcher on the
+	// other end must use a staleness threshold well above PumpReadTimeout —
+	// see resilience:hosted-entrypoint-signal-and-hang-supervision — or it
+	// will kill a link that is merely idle, which is worse than the bug.
+	HeartbeatFile string
 }
 
 // defaultRegisterReadTimeout / defaultPumpReadTimeout are the production
@@ -427,7 +443,7 @@ func (c *Client) Run(ctx context.Context, credentialsPath string, cb RunCallback
 			cb.OnRegistered(result.Reply)
 		}
 
-		pumpErr := pump(ctx, result.Conn, c.pumpReadTimeout(), cb.OnCommand, cb.OnShell, cb.OnTunnelProxy)
+		pumpErr := pump(ctx, result.Conn, c.pumpReadTimeout(), c.HeartbeatFile, cb.OnCommand, cb.OnShell, cb.OnTunnelProxy)
 		result.Conn.Close()
 		if cb.OnDisconnect != nil {
 			cb.OnDisconnect(pumpErr)
@@ -472,7 +488,7 @@ func (w *frameWriter) WriteJSON(v any) error {
 // hangs, or the TCP path dies with no FIN/RST — surfaces as a read error
 // (and this function returning) within readTimeout instead of blocking
 // forever and starving Run's reconnect/backoff loop of its next iteration.
-func pump(ctx context.Context, conn *websocket.Conn, readTimeout time.Duration, handler CommandHandler, newShell NewShellManagerFunc, newTunnelProxy NewTunnelProxyFunc) error {
+func pump(ctx context.Context, conn *websocket.Conn, readTimeout time.Duration, heartbeatFile string, handler CommandHandler, newShell NewShellManagerFunc, newTunnelProxy NewTunnelProxyFunc) error {
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -507,6 +523,7 @@ func pump(ctx context.Context, conn *websocket.Conn, readTimeout time.Duration, 
 		if err != nil {
 			return err
 		}
+		touchHeartbeat(heartbeatFile)
 		var msg map[string]any
 		if json.Unmarshal(data, &msg) != nil {
 			continue
@@ -542,6 +559,25 @@ func pump(ctx context.Context, conn *websocket.Conn, readTimeout time.Duration, 
 			handleTCPClose(msg, proxy)
 		}
 	}
+}
+
+// touchHeartbeat updates path's mtime to now, creating it on the first call.
+// Best-effort: a supervisor reading a stale or missing file treats it the
+// same as "not turning", so any error here just leaves that signal as-is
+// rather than being worth failing the pump over. No-op when path is empty.
+func touchHeartbeat(path string) {
+	if path == "" {
+		return
+	}
+	now := time.Now()
+	if err := os.Chtimes(path, now, now); err == nil {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return
+	}
+	f.Close()
 }
 
 func ptyDims(msg map[string]any) (id string, cols, rows uint16) {
