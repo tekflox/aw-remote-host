@@ -3,6 +3,7 @@ package link
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -710,5 +711,305 @@ func TestTouchHeartbeatIsBestEffortOnAnUnwritablePath(t *testing.T) {
 
 	if _, err := os.Stat(path); err == nil {
 		t.Fatalf("expected no file to be created under a missing parent dir")
+	}
+}
+
+// refusingLinkServer answers every register with the control plane's
+// {"op":"register_error"} frame and closes — what aw-backend now does when a
+// bootstrap token is redeemed for a workspace that already has a host holding
+// its placement (Kanban 3df5bf3b).
+type refusingLinkServer struct {
+	upgrader      websocket.Upgrader
+	registerCount int32
+}
+
+func (s *refusingLinkServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	if _, _, err := conn.ReadMessage(); err != nil {
+		return
+	}
+	atomic.AddInt32(&s.registerCount, 1)
+	_ = conn.WriteJSON(map[string]any{
+		"op":      "register_error",
+		"code":    "placement_occupied",
+		"message": "workspace 'acme' is already linked to host old-box (incumbent1).",
+	})
+}
+
+func TestConnectReturnsTypedRefusalOnRegisterError(t *testing.T) {
+	srv := &refusingLinkServer{}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	c := New(ts.URL, "awbs_test")
+	c.Info = RegisterInfo{Hostname: "thief", OS: "linux", Arch: "amd64"}
+
+	_, err := c.Connect(context.Background(), "awbs_test", filepath.Join(t.TempDir(), "credentials.json"))
+	if err == nil {
+		t.Fatal("Connect: expected a refusal, got nil")
+	}
+	if !errors.Is(err, ErrRegisterRefused) {
+		t.Fatalf("Connect: error %v does not match ErrRegisterRefused", err)
+	}
+	var refused *RegisterRefusedError
+	if !errors.As(err, &refused) {
+		t.Fatalf("Connect: error %v is not a *RegisterRefusedError", err)
+	}
+	if refused.Code != "placement_occupied" {
+		t.Errorf("Code = %q, want placement_occupied", refused.Code)
+	}
+	// The operator-facing text is the whole point of the frame — it names the
+	// incumbent and what to do about it. Losing it here loses the feature.
+	if !strings.Contains(err.Error(), "already linked to host") {
+		t.Errorf("Error() = %q, want the control plane's message", err.Error())
+	}
+}
+
+func TestRunReturnsImmediatelyOnRefusalInsteadOfBackingOff(t *testing.T) {
+	srv := &refusingLinkServer{}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	c := New(ts.URL, "awbs_test")
+	c.Info = RegisterInfo{Hostname: "thief"}
+	// Long enough that a single retry would blow the deadline below — the
+	// assertion is "did NOT back off", not "was fast".
+	c.MinBackoff = 30 * time.Second
+	c.MaxBackoff = 30 * time.Second
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(context.Background(), filepath.Join(t.TempDir(), "credentials.json"),
+			RunCallbacks{})
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrRegisterRefused) {
+			t.Fatalf("Run returned %v, want ErrRegisterRefused", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run backed off and retried a refusal instead of returning it — " +
+			"under --background nobody would ever see the reason")
+	}
+
+	if n := atomic.LoadInt32(&srv.registerCount); n != 1 {
+		t.Errorf("register attempts = %d, want 1", n)
+	}
+}
+
+func TestRunStillRetriesAnOrdinaryConnectFailure(t *testing.T) {
+	// The control for the above: a refusal is terminal, a dropped dial is not.
+	// Points at a closed port so every dial fails.
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := ts.URL
+	ts.Close()
+
+	c := New(url, "awbs_test")
+	c.MinBackoff = 10 * time.Millisecond
+	c.MaxBackoff = 10 * time.Millisecond
+
+	var disconnects int32
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := c.Run(ctx, filepath.Join(t.TempDir(), "credentials.json"), RunCallbacks{
+		OnDisconnect: func(error) { atomic.AddInt32(&disconnects, 1) },
+	})
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run returned %v, want the ctx deadline (i.e. it kept retrying)", err)
+	}
+	if n := atomic.LoadInt32(&disconnects); n < 2 {
+		t.Errorf("dial attempts = %d, want it to have retried more than once", n)
+	}
+}
+
+func TestDetachPostsTheHostCredentialAndSucceeds(t *testing.T) {
+	var gotAuth, gotPath, gotMethod string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth, gotPath, gotMethod = r.Header.Get("Authorization"), r.URL.Path, r.Method
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer ts.Close()
+
+	if err := Detach(context.Background(), ts.URL, "awlk_mine"); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/api/link/detach" {
+		t.Errorf("path = %q, want /api/link/detach", gotPath)
+	}
+	// Its OWN credential — this route revokes exactly the row that token
+	// names, which is what makes it safe to expose unauthenticated to the
+	// rest of the world.
+	if gotAuth != "Bearer awlk_mine" {
+		t.Errorf("authorization = %q, want Bearer awlk_mine", gotAuth)
+	}
+}
+
+func TestDetachReportsANonSuccessStatus(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer ts.Close()
+
+	err := Detach(context.Background(), ts.URL, "awlk_stale")
+	if err == nil {
+		t.Fatal("Detach: expected an error on 401")
+	}
+	// unlink prints this to the operator, so it has to say what happened.
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("Error() = %q, want it to name the status", err.Error())
+	}
+}
+
+// countingLinkServer refuses or drops every register, and counts attempts. The
+// `refuse` flag is what makes the terminal-vs-retryable split testable from one
+// harness.
+type countingLinkServer struct {
+	upgrader      websocket.Upgrader
+	refuse        bool
+	registerCount int32
+}
+
+func (s *countingLinkServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	if _, _, err := conn.ReadMessage(); err != nil {
+		return
+	}
+	atomic.AddInt32(&s.registerCount, 1)
+	if s.refuse {
+		_ = conn.WriteJSON(map[string]any{
+			"op":      "register_error",
+			"code":    "placement_occupied",
+			"message": "workspace 'acme' is already linked to host old-box (incumbent1).",
+		})
+		return
+	}
+	// Anything that is not a refusal: close without replying, which Connect
+	// reports as an ordinary (retryable) error.
+}
+
+// TestRunRefusalDoesNotFallBackOntoTheBootstrapToken pins the one path the
+// other refusal tests cannot reach.
+//
+// Run's credential fallback ("the stored awlk_ was rejected — try the operator's
+// --token once") happens BEFORE the terminal check in the error branch, so
+// guarding only the backoff leaves a refused reconnect quietly redeeming the
+// single-use bootstrap token against the registration it was just refused for.
+// The existing refusal tests all run with no stored credential, where token ==
+// c.Token and the fallback branch is skipped entirely — so they stay green with
+// the bug present. This one stores a DIFFERENT credential on purpose.
+func TestRunRefusalDoesNotFallBackOntoTheBootstrapToken(t *testing.T) {
+	srv := &countingLinkServer{refuse: true}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	if err := SaveCredentials(credPath, &Credentials{
+		RemoteHostID: "host1", HostCredential: "awlk_stored_credential",
+	}); err != nil {
+		t.Fatalf("SaveCredentials: %v", err)
+	}
+
+	c := New(ts.URL, "awbs_operators_single_use_token")
+	c.Info = RegisterInfo{Hostname: "second-box"}
+	c.MinBackoff = 30 * time.Second
+	c.MaxBackoff = 30 * time.Second
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(context.Background(), credPath, RunCallbacks{})
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrRegisterRefused) {
+			t.Fatalf("Run returned %v, want ErrRegisterRefused", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return the refusal")
+	}
+
+	if n := atomic.LoadInt32(&srv.registerCount); n != 1 {
+		t.Errorf("register attempts = %d, want exactly 1 — a second attempt means "+
+			"the refused reconnect fell through and redeemed the bootstrap token", n)
+	}
+}
+
+// TestRunTerminalVsRetryableSplit is the table form of the whole contract: a
+// refusal stops the loop, anything else keeps it going.
+func TestRunTerminalVsRetryableSplit(t *testing.T) {
+	cases := []struct {
+		name           string
+		refuse         bool
+		wantTerminal   bool
+		wantOneAttempt bool
+	}{
+		{
+			name:         "register_error is terminal",
+			refuse:       true,
+			wantTerminal: true,
+			// Proves it neither backed off NOR fell back to --token.
+			wantOneAttempt: true,
+		},
+		{
+			name:         "an ordinary failure keeps retrying",
+			refuse:       false,
+			wantTerminal: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &countingLinkServer{refuse: tc.refuse}
+			ts := httptest.NewServer(srv)
+			defer ts.Close()
+
+			credPath := filepath.Join(t.TempDir(), "credentials.json")
+			if err := SaveCredentials(credPath, &Credentials{
+				RemoteHostID: "host1", HostCredential: "awlk_stored_credential",
+			}); err != nil {
+				t.Fatalf("SaveCredentials: %v", err)
+			}
+
+			c := New(ts.URL, "awbs_operators_single_use_token")
+			c.Info = RegisterInfo{Hostname: "box"}
+			c.MinBackoff = 10 * time.Millisecond
+			c.MaxBackoff = 10 * time.Millisecond
+
+			ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+			defer cancel()
+			err := c.Run(ctx, credPath, RunCallbacks{})
+
+			if tc.wantTerminal {
+				if !errors.Is(err, ErrRegisterRefused) {
+					t.Fatalf("Run returned %v, want ErrRegisterRefused", err)
+				}
+				if n := atomic.LoadInt32(&srv.registerCount); tc.wantOneAttempt && n != 1 {
+					t.Errorf("register attempts = %d, want exactly 1", n)
+				}
+				return
+			}
+
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Run returned %v, want the ctx deadline (i.e. it kept retrying)", err)
+			}
+			if n := atomic.LoadInt32(&srv.registerCount); n < 2 {
+				t.Errorf("register attempts = %d, want it to have retried", n)
+			}
+		})
 	}
 }

@@ -42,10 +42,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,7 +111,41 @@ type RegisteredReply struct {
 	RemoteHostID   string `json:"remote_host_id"`
 	HostCredential string `json:"host_credential,omitempty"`
 	WorkspaceSlug  string `json:"workspace_slug,omitempty"`
+	// Only carried by an {"op":"register_error"} reply — see
+	// RegisterRefusedError. The control plane sends one and closes when it
+	// declines a registration it could otherwise have accepted (today: the
+	// workspace already has a host holding its placement).
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
 }
+
+// ErrRegisterRefused marks a registration the control plane DECIDED against,
+// as opposed to one that failed. Match with errors.Is.
+var ErrRegisterRefused = errors.New("registration refused by the control plane")
+
+// RegisterRefusedError is the {"op":"register_error"} reply, typed.
+//
+// It exists because Run treats every Connect failure as retryable, which is
+// right for a dropped network and wrong for a decision: a refusal will be
+// made identically on every retry, so backing off on it means an operator
+// running --background never sees the reason at all — the service just sits
+// there reconnecting forever. Terminal, so it reaches the operator's stdout.
+type RegisterRefusedError struct {
+	Code    string
+	Message string
+}
+
+func (e *RegisterRefusedError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Code != "" {
+		return fmt.Sprintf("registration refused (%s)", e.Code)
+	}
+	return ErrRegisterRefused.Error()
+}
+
+func (e *RegisterRefusedError) Unwrap() error { return ErrRegisterRefused }
 
 // Client holds the connection parameters for a /link session.
 type Client struct {
@@ -285,6 +322,9 @@ func register(conn *websocket.Conn, frame map[string]any, readTimeout time.Durat
 	if err := json.Unmarshal(data, &reply); err != nil {
 		return nil, fmt.Errorf("parse registered reply: %w", err)
 	}
+	if reply.Op == "register_error" {
+		return nil, &RegisterRefusedError{Code: reply.Code, Message: reply.Message}
+	}
 	if reply.Op != "registered" {
 		return nil, fmt.Errorf("unexpected reply op %q", reply.Op)
 	}
@@ -321,6 +361,56 @@ func (c *Client) Connect(ctx context.Context, token, credentialsPath string) (*C
 		}
 	}
 	return &ConnectResult{Conn: conn, Reply: reply}, nil
+}
+
+// DetachTimeout bounds the one HTTP call unlink makes. Short on purpose: it
+// is best-effort courtesy to the control plane, and an operator unlinking a
+// machine that has already lost its network must not wait on it.
+const DetachTimeout = 10 * time.Second
+
+// Detach tells the control plane this host is unlinking itself — POST
+// /api/link/detach (aw-backend's host_link.HostLinkRoutes.detach_self),
+// authenticated by this host's OWN awlk_ credential and revoking only its own
+// RemoteHost row.
+//
+// unlink used to be purely local: it uninstalled the service, deleted
+// credentials.json, and never said a word to the control plane, so a
+// workspace's remote_host_id outlived the host holding it and the console
+// reported a machine that had already gone (Kanban 3df5bf3b). The caller
+// treats a failure here as a warning, not a fatal — the local unlink still
+// has to finish on a machine that is offline.
+func Detach(ctx context.Context, controlPlane, hostCredential string) error {
+	u, err := url.Parse(controlPlane)
+	if err != nil {
+		return fmt.Errorf("parse control plane url: %w", err)
+	}
+	u.Path = "/api/link/detach"
+	u.RawQuery = ""
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("build detach request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+hostCredential)
+
+	client := &http.Client{Timeout: DetachTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("post %s: %w", u.String(), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Bounded: an error body is a sentence, not a payload, and an HTML
+		// error page from a proxy in front of the control plane could be
+		// megabytes.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		detail := strings.TrimSpace(string(body))
+		if detail != "" {
+			return fmt.Errorf("control plane returned %s: %s", resp.Status, detail)
+		}
+		return fmt.Errorf("control plane returned %s", resp.Status)
+	}
+	return nil
 }
 
 // Emit sends an unsolicited activity event ({"op":"activity", ...}) back
@@ -420,16 +510,34 @@ func (c *Client) Run(ctx context.Context, credentialsPath string, cb RunCallback
 		}
 
 		result, err := c.Connect(ctx, token, credentialsPath)
-		if err != nil && c.Token != "" && c.Token != token {
+		if err != nil && !errors.Is(err, ErrRegisterRefused) && c.Token != "" && c.Token != token {
 			// A saved host credential can become invalid after an uninstall or
 			// workspace reset. If the operator supplied a fresh bootstrap token,
 			// fall back to it once before backing off so BYOD reinstall can
 			// recover without manual credential-file cleanup.
+			//
+			// Skipped on a refusal, and that exclusion is load-bearing — it is
+			// NOT covered by the terminal check below, because this retry runs
+			// FIRST. The control plane refuses a reconnect whose workspace is
+			// placed elsewhere; falling through to here would then redeem the
+			// operator's single-use bootstrap token against the very
+			// registration we were just told to stop attempting, burning it on
+			// a machine that will be refused again anyway. The operator is then
+			// left with no token and a 4403 that explains nothing.
 			result, err = c.Connect(ctx, c.Token, credentialsPath)
 		}
 		if err != nil {
 			if cb.OnDisconnect != nil {
 				cb.OnDisconnect(err)
+			}
+			// Terminal: the control plane refused this registration on
+			// purpose, and will refuse it identically for as long as whatever
+			// it named stays true. Retrying would bury the one message that
+			// tells the operator what to do about it under a backoff loop
+			// nobody reads — and under --background, nobody would ever see it.
+			// Returned so runLinkOrBootstrap's runDone path prints it.
+			if errors.Is(err, ErrRegisterRefused) {
+				return err
 			}
 			if !sleepBackoff(ctx, backoff) {
 				return ctx.Err()

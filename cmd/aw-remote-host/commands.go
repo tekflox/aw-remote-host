@@ -850,6 +850,7 @@ func runUnlink(args []string) error {
 	}
 	if *plan {
 		rlog.Printf("[plan] would remove ~/.aw-remote-host/credentials.json and unlink from %s\n", *controlPlane)
+		rlog.Println("[plan] would also POST /api/link/detach so the control plane revokes this host's credential and stops listing it")
 		rlog.Println("[plan] would also stop and uninstall the background service, if installed")
 		if *stopContainers {
 			rlog.Println("[plan] would also stop: aw-remote-host-postgres, aw-remote-host-redis, aw-remote-host-workspace")
@@ -889,6 +890,25 @@ func runUnlink(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Tell the control plane BEFORE deleting the credential that authenticates
+	// the call — without this, unlink was purely local and the workspace kept
+	// pointing at a host that had already gone (Kanban 3df5bf3b). Best-effort:
+	// a machine being unlinked is often one that has lost its network, and a
+	// control plane that cannot be reached must not stop the local unlink from
+	// finishing. The operator is told what is left over instead.
+	if creds, credErr := link.LoadCredentials(credPath); credErr == nil &&
+		creds != nil && creds.HostCredential != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), link.DetachTimeout)
+		if detachErr := link.Detach(ctx, *controlPlane, creds.HostCredential); detachErr != nil {
+			rlog.Printf("unlink: could not tell %s this host is unlinking: %v\n", *controlPlane, detachErr)
+			rlog.Println("unlink: this host may still be listed in the console — remove it there with Delete")
+		} else {
+			rlog.Println("unlink: control plane revoked this host's credential")
+		}
+		cancel()
+	}
+
 	if err := link.DeleteCredentials(credPath); err != nil {
 		return err
 	}
