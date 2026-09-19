@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/homedir"
+	"github.com/tekflox/aw-remote-host/internal/instance"
 )
 
 const (
@@ -66,12 +67,20 @@ type Pending struct {
 	CreatedAt   float64 `json:"created_at"`
 }
 
+// Dir returns ~/.aw-remote-host/self-update.
+//
+// PER-MACHINE: there is ONE aw-remote-host binary on this host, so there
+// is one update in flight and one rollback marker, however many tenant
+// identities are linked from it. The stated consequence of that (accepted,
+// not discovered — see the Kanban card behind internal/instance): an update
+// triggered by instance A restarts B too, because it replaces the binary
+// both of them are running.
 func Dir() (string, error) {
-	home, err := homedir.Dir()
+	dir, err := instance.MachineDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".aw-remote-host", "self-update"), nil
+	return filepath.Join(dir, "self-update"), nil
 }
 
 func PendingPath() (string, error) {
@@ -288,20 +297,40 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	return out.Close()
 }
 
+// restartCommand restarts the service of the instance THIS process is
+// running as. One binary serves every instance on a machine, so the unit to
+// bounce is not derivable from the binary alone — it comes from the
+// --instance this process was started with.
 func restartCommand(slug string) string {
-	return restartCommandFor(runtime.GOOS, slug)
+	return restartCommandFor(runtime.GOOS, slug, instance.Active())
 }
 
 // restartCommandFor takes goos explicitly so a test on any host can assert
 // every platform's spelling — the same reason servicemgr.New does. The
 // Windows branch in particular shipped broken precisely because nothing on
 // the Linux CI runner could reach it.
-func restartCommandFor(goos, slug string) string {
+//
+// inst is the instance name ("" for the default one). It has to be here
+// because the unit/label these commands name is instance-scoped on both
+// Unix platforms: without it, a self-update triggered by a named instance
+// restarted the DEFAULT instance's service on Linux (a fixed unit name) and
+// aimed at a launchd label that does not exist on macOS. The default
+// instance's spelling is unchanged on every platform.
+func restartCommandFor(goos, slug, inst string) string {
+	inst = strings.TrimSpace(inst)
 	switch goos {
 	case "darwin":
+		// Built here rather than reusing servicemgr.LaunchdLabel because
+		// the empty slug means something different in the two places: an
+		// unregistered host has no label at all here, where servicemgr
+		// substitutes "unknown". Kept in step with it deliberately — see
+		// TestRestartCommandMatchesLaunchdLabel.
 		label := "com.tekflox.aw-remote-host"
 		if strings.TrimSpace(slug) != "" {
 			label += "." + strings.TrimSpace(slug)
+		}
+		if inst != "" {
+			label += "." + inst
 		}
 		quotedLabel := shellQuote(label)
 		// kickstart only bounces a job launchd already has loaded. A
@@ -345,7 +374,21 @@ func restartCommandFor(goos, slug string) string {
 		// binary up — instead of the restart being a silent no-op that
 		// leaves the OLD binary running until the rollback monitor undoes
 		// the update 75s later.
-		return "systemctl --user restart aw-remote-host || kill $PPID"
+		//
+		// The unit name is instance-scoped (servicemgr.systemdUnit): before
+		// it was, this restarted `aw-remote-host` no matter which identity
+		// asked — so on a machine serving two accounts a self-update by the
+		// named instance bounced the DEFAULT instance's link and left its
+		// own running the old binary until the rollback monitor undid the
+		// update 75s later.
+		unit := "aw-remote-host"
+		if inst != "" {
+			unit += "-" + inst
+		}
+		// Unquoted, so the default instance's command stays the exact string
+		// it has always been. Safe: instance.Validate confines the name to
+		// letters, digits, '-' and '_' before it can ever reach here.
+		return "systemctl --user restart " + unit + " || kill $PPID"
 	case "windows":
 		// Reachable as of the self-update port — serviceRestartScript feeds
 		// this to `powershell.exe -Command`, so it must be valid PowerShell

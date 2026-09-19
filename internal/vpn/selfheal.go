@@ -37,7 +37,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tekflox/aw-remote-host/internal/homedir"
+	"github.com/tekflox/aw-remote-host/internal/instance"
 )
 
 // SelfHealInterval is how often one pass runs. Deliberately ReassertInterval:
@@ -406,12 +406,14 @@ func SelfHealLoop(ctx context.Context, r Runner, report func(restored []string, 
 // and restart.log were the only durable record of that night, and neither had
 // anything to say. A self-heal whose only trace dies with the process it runs
 // in recreates that exact hole.
+// PER-MACHINE, like the dead-man switch it is the twin of: the tunnel and
+// the routing policy it reasserts belong to the host, not to an identity.
 func SelfHealLogPath() (string, error) {
-	home, err := homedir.Dir()
+	dir, err := instance.MachineDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".aw-remote-host", "vpn-selfheal.log"), nil
+	return filepath.Join(dir, "vpn-selfheal.log"), nil
 }
 
 // logSelfHeal appends one timestamped line, best effort. A logging failure is

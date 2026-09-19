@@ -14,7 +14,24 @@ import (
 
 // schtasksName is the single, fixed Scheduled Task name — same choice as
 // systemdUnitName, for the same reason (one workspace-host link per box).
+//
+// Unlike systemd, this one is NOT instance-scoped, because named instances
+// are refused on Windows outright (refuseNamedInstance). That is a product
+// decision, not an oversight: nobody has asked to serve two tenant accounts
+// from one Windows box, and the rule for this feature is that every
+// platform is explicitly supported or explicitly refused — half-working is
+// the outcome that must not ship.
 const schtasksName = "aw-remote-host"
+
+// refuseNamedInstance is the Windows half of that rule. Returned from every
+// Manager method rather than only from Install, so no code path can reach
+// schtasks with an instance it would silently ignore.
+func refuseNamedInstance(cfg Config) error {
+	if cfg.Instance == "" {
+		return nil
+	}
+	return fmt.Errorf("--instance %q is not supported on Windows: the background Scheduled Task is a single fixed task name (%s), so a second named instance would overwrite the first one's task instead of running alongside it. Serve the second account from a macOS or Linux host, or run this instance in the foreground (no --background) where no service definition is written", cfg.Instance, schtasksName)
+}
 
 // schtasksXMLTemplate is a Task Scheduler task definition, registered with
 // `schtasks /Create /XML`.
@@ -168,7 +185,10 @@ func utf16LEWithBOM(s string) []byte {
 	return buf
 }
 
-func (m *schtasksManager) Path(_ Config) (string, error) {
+func (m *schtasksManager) Path(cfg Config) (string, error) {
+	if err := refuseNamedInstance(cfg); err != nil {
+		return "", err
+	}
 	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
@@ -180,6 +200,9 @@ func (m *schtasksManager) Path(_ Config) (string, error) {
 }
 
 func (m *schtasksManager) Install(cfg Config) (string, error) {
+	if err := refuseNamedInstance(cfg); err != nil {
+		return "", err
+	}
 	path, err := m.Path(cfg)
 	if err != nil {
 		return "", err
@@ -206,16 +229,25 @@ func (m *schtasksManager) Install(cfg Config) (string, error) {
 // Start runs the task immediately. Unlike `systemctl enable --now`, this is
 // only the "now" half — the task is already enabled by Install (its
 // LogonTrigger is what brings it back after a reboot).
-func (m *schtasksManager) Start(_ Config) error {
+func (m *schtasksManager) Start(cfg Config) error {
+	if err := refuseNamedInstance(cfg); err != nil {
+		return err
+	}
 	return runCmd("schtasks", "/Run", "/TN", schtasksName)
 }
 
-func (m *schtasksManager) Stop(_ Config) error {
+func (m *schtasksManager) Stop(cfg Config) error {
+	if err := refuseNamedInstance(cfg); err != nil {
+		return err
+	}
 	_ = runCmd("schtasks", "/End", "/TN", schtasksName) // best-effort
 	return nil
 }
 
 func (m *schtasksManager) Uninstall(cfg Config) (string, error) {
+	if err := refuseNamedInstance(cfg); err != nil {
+		return "", err
+	}
 	_ = runCmd("schtasks", "/End", "/TN", schtasksName)          // best-effort
 	_ = runCmd("schtasks", "/Delete", "/TN", schtasksName, "/F") // best-effort
 	path, err := m.Path(cfg)

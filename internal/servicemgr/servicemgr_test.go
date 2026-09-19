@@ -313,3 +313,200 @@ func TestGenerateSchtasksTaskXMLRunLevel(t *testing.T) {
 		t.Error("RunLevel must stay inside Principals")
 	}
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// Instances. The tests above already pin the DEFAULT instance's rendered
+// content; everything below pins what a NAMED one changes, and — more
+// importantly — what it must not.
+// ────────────────────────────────────────────────────────────────────────
+
+// wantDefaultSystemdUnit / wantDefaultLaunchdPlist are golden copies of what
+// every host in the field already has on disk, written out in full rather
+// than assembled from the templates under test.
+//
+// A test that rebuilt them from serviceArgs() would agree with any change
+// serviceArgs() made, which is precisely the failure mode that matters here:
+// the default instance's unit is not "a rendering", it is a file already
+// installed on machines this change must not touch.
+const wantDefaultSystemdUnit = `[Unit]
+Description=aw-remote-host — Agentic Workspace BYOD workspace-host link (acme)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/u/.local/bin/aw-remote-host bootstrap-workspace --control-plane https://api.aw.tekflox.com --yes --foreground
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`
+
+func TestDefaultInstanceSystemdUnitIsByteIdentical(t *testing.T) {
+	cfg := Config{Slug: "acme", ExePath: "/home/u/.local/bin/aw-remote-host", ControlPlane: "https://api.aw.tekflox.com"}
+	if got := GenerateSystemdUnit(cfg); got != wantDefaultSystemdUnit {
+		t.Errorf("the default instance's unit content changed — every Linux BYOD host already has the old one installed.\ngot:\n%s\nwant:\n%s", got, wantDefaultSystemdUnit)
+	}
+}
+
+func TestDefaultInstanceLaunchdPlistProgramArgumentsAreByteIdentical(t *testing.T) {
+	cfg := Config{Slug: "acme", ExePath: "/usr/local/bin/aw-remote-host", ControlPlane: "https://api.aw.tekflox.com"}
+	plist, err := GenerateLaunchdPlist(cfg)
+	if err != nil {
+		t.Fatalf("GenerateLaunchdPlist: %v", err)
+	}
+	want := "\t<key>ProgramArguments</key>\n" +
+		"\t<array>\n" +
+		"\t\t<string>/usr/local/bin/aw-remote-host</string>\n" +
+		"\t\t<string>bootstrap-workspace</string>\n" +
+		"\t\t<string>--control-plane</string>\n" +
+		"\t\t<string>https://api.aw.tekflox.com</string>\n" +
+		"\t\t<string>--yes</string>\n" +
+		"\t\t<string>--foreground</string>\n" +
+		"\t</array>\n"
+	if !strings.Contains(plist, want) {
+		t.Errorf("the default instance's ProgramArguments block changed — every Mac in the field already has the old plist loaded.\ngot:\n%s\nwant substring:\n%s", plist, want)
+	}
+	if strings.Contains(plist, "--instance") {
+		t.Error("the default instance's plist must not carry --instance: a host linked before instances existed runs a binary that would reject the flag")
+	}
+}
+
+// TestNamedInstanceUnitCarriesInstanceAndNeverHome is the regression for the
+// credential leak this whole feature exists to close.
+//
+// The leak: a second identity was set up by hand by overriding $HOME. The
+// generated plist has no EnvironmentVariables key at all, so that override
+// survived only the operator's foreground shell — on the next launchd
+// respawn homedir.Dir() read the real $HOME and loaded the FIRST account's
+// credentials.json, with no error anywhere. The fix is an argument, not an
+// environment variable, and this asserts both halves.
+func TestNamedInstanceUnitCarriesInstanceAndNeverHome(t *testing.T) {
+	cfg := Config{Slug: "acme", Instance: "work", ExePath: "/usr/local/bin/aw-remote-host", ControlPlane: "https://api.aw.tekflox.com"}
+
+	plist, err := GenerateLaunchdPlist(cfg)
+	if err != nil {
+		t.Fatalf("GenerateLaunchdPlist: %v", err)
+	}
+	for _, want := range []string{"<string>--instance</string>", "<string>work</string>"} {
+		if !strings.Contains(plist, want) {
+			t.Errorf("named instance plist missing %s — the respawned job would load the default instance's credentials:\n%s", want, plist)
+		}
+	}
+	for _, forbidden := range []string{"EnvironmentVariables", "HOME"} {
+		if strings.Contains(plist, forbidden) {
+			t.Errorf("named instance plist sets %s — HOME also moves podman's storage root, the Go cache and ssh, which is what made the manual workaround unsafe:\n%s", forbidden, plist)
+		}
+	}
+	// A named instance is lean-only, so its service must run the command
+	// that structurally cannot provision.
+	if !strings.Contains(plist, "<string>link</string>") || strings.Contains(plist, "<string>bootstrap-workspace</string>") {
+		t.Errorf("a named instance's service must run 'link', not 'bootstrap-workspace':\n%s", plist)
+	}
+
+	unit := GenerateSystemdUnit(cfg)
+	if !strings.Contains(unit, "ExecStart=/usr/local/bin/aw-remote-host link --instance work --control-plane https://api.aw.tekflox.com --yes --foreground") {
+		t.Errorf("named instance ExecStart does not pass --instance:\n%s", unit)
+	}
+	if strings.Contains(unit, "Environment") {
+		t.Errorf("named instance unit sets an environment variable; the instance must travel as an argument:\n%s", unit)
+	}
+}
+
+// TestSystemdIsInstanceScopedEverywhere is the regression for the silent
+// mutual clobbering on Linux: Path/Start/Stop/Uninstall used to ignore
+// their Config entirely and act on one fixed unit name, so a second
+// `link --background` overwrote the first identity's unit file and an
+// unlink of either removed the other's service.
+func TestSystemdIsInstanceScopedEverywhere(t *testing.T) {
+	mgr := &systemdManager{}
+
+	def, err := mgr.Path(Config{Slug: "acme"})
+	if err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+	// The highest-stakes assertion in this file: renaming this orphans every
+	// existing Linux BYOD host (old unit still enabled, new name never
+	// started).
+	if !strings.HasSuffix(def, ".config/systemd/user/aw-remote-host.service") {
+		t.Fatalf("the DEFAULT instance's unit path moved: %q", def)
+	}
+
+	named, err := mgr.Path(Config{Slug: "acme", Instance: "work"})
+	if err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+	if named == def {
+		t.Fatalf("a named instance writes the SAME unit file as the default one (%q) — the second link would overwrite the first", def)
+	}
+	if !strings.HasSuffix(named, ".config/systemd/user/aw-remote-host-work.service") {
+		t.Errorf("unexpected named unit path: %q", named)
+	}
+
+	// The unit NAME is what systemctl enable/disable/stop act on, and it is
+	// the half that was ignored. Asserted directly so the systemctl-driven
+	// methods cannot regress without this failing.
+	if got := systemdUnit(Config{}); got != "aw-remote-host" {
+		t.Errorf("default unit name is %q, want aw-remote-host", got)
+	}
+	if got := systemdUnit(Config{Instance: "work"}); got != "aw-remote-host-work" {
+		t.Errorf("named unit name is %q, want aw-remote-host-work", got)
+	}
+}
+
+func TestLaunchdLabelDefaultUnchangedNamedSuffixed(t *testing.T) {
+	if got := LaunchdLabel("acme", ""); got != "com.tekflox.aw-remote-host.acme" {
+		t.Errorf("the default instance's launchd label moved: %q", got)
+	}
+	if got := LaunchdLabel("acme", "work"); got != "com.tekflox.aw-remote-host.acme.work" {
+		t.Errorf("named instance label = %q", got)
+	}
+
+	mgr := &launchdManager{}
+	def, err := mgr.Path(Config{Slug: "acme"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	named, err := mgr.Path(Config{Slug: "acme", Instance: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def == named {
+		t.Fatalf("a named instance writes the same plist as the default one: %q", def)
+	}
+	if !strings.HasSuffix(def, "com.tekflox.aw-remote-host.acme.plist") {
+		t.Errorf("the default instance's plist filename moved: %q", def)
+	}
+}
+
+// TestSchtasksRefusesANamedInstance pins the product decision that Windows
+// is explicitly refused rather than half-supported: the Scheduled Task name
+// is a single fixed string there, so a named instance would overwrite the
+// first one's task. Every method refuses, not just Install, so no path can
+// reach schtasks with an instance it would silently drop.
+func TestSchtasksRefusesANamedInstance(t *testing.T) {
+	mgr := &schtasksManager{}
+	named := Config{Slug: "acme", Instance: "work", ExePath: `C:\x.exe`, ControlPlane: "https://y"}
+
+	if _, err := mgr.Path(named); err == nil {
+		t.Error("Path accepted a named instance on Windows")
+	}
+	if _, err := mgr.Install(named); err == nil {
+		t.Error("Install accepted a named instance on Windows")
+	}
+	if err := mgr.Start(named); err == nil {
+		t.Error("Start accepted a named instance on Windows")
+	}
+	if err := mgr.Stop(named); err == nil {
+		t.Error("Stop accepted a named instance on Windows")
+	}
+	if _, err := mgr.Uninstall(named); err == nil {
+		t.Error("Uninstall accepted a named instance on Windows")
+	}
+
+	// The default instance must be entirely unaffected by that refusal.
+	if _, err := mgr.Path(Config{Slug: "acme"}); err != nil {
+		t.Errorf("the default instance must still work on Windows: %v", err)
+	}
+}

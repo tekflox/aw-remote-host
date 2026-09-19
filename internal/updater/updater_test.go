@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tekflox/aw-remote-host/internal/servicemgr"
 )
 
 func TestPrepareWritesPendingAndBackup(t *testing.T) {
@@ -80,7 +82,7 @@ func TestRestartCommandIncludesSlugForLaunchdLabels(t *testing.T) {
 // darwin restart command must chain a real fallback, mirroring the Linux
 // branch's `|| kill $PPID` precedent immediately below it in the switch.
 func TestDarwinRestartCommandHasFallbackChain(t *testing.T) {
-	cmd := restartCommandFor("darwin", "acme")
+	cmd := restartCommandFor("darwin", "acme", "")
 
 	kickstart := "launchctl kickstart -k gui/$(id -u)/'com.tekflox.aw-remote-host.acme'"
 	if !strings.Contains(cmd, kickstart) {
@@ -115,7 +117,7 @@ func TestDarwinRestartCommandHasFallbackChain(t *testing.T) {
 // the chain must tolerate it) and the script must still reach a terminal
 // action rather than the shell parsing it as one flat unconditional list.
 func TestDarwinRestartCommandGroupsBootstrapAndKillTogether(t *testing.T) {
-	cmd := restartCommandFor("darwin", "acme")
+	cmd := restartCommandFor("darwin", "acme", "")
 	// "|| (bootstrap && kill $PPID) || kill $PPID" — the middle stage must
 	// be parenthesized, or `bootstrap && kill $PPID || kill $PPID` would
 	// run the final kill whenever bootstrap succeeds too (&& binds tighter
@@ -127,7 +129,7 @@ func TestDarwinRestartCommandGroupsBootstrapAndKillTogether(t *testing.T) {
 }
 
 func TestDarwinRestartCommandOmitsSlugSuffixWhenEmpty(t *testing.T) {
-	cmd := restartCommandFor("darwin", "")
+	cmd := restartCommandFor("darwin", "", "")
 	if !strings.Contains(cmd, "'com.tekflox.aw-remote-host'") {
 		t.Fatalf("label must fall back to the bare prefix when slug is empty: %s", cmd)
 	}
@@ -180,7 +182,7 @@ func TestPowerShellQuoteEmpty(t *testing.T) {
 // whole process tree, and the detached script issuing it is a member of
 // that tree, so it would have killed itself before reaching /Run.
 func TestWindowsRestartCommandIsValidPowerShellAndDoesNotKillItself(t *testing.T) {
-	cmd := restartCommandFor("windows", "acme")
+	cmd := restartCommandFor("windows", "acme", "")
 
 	if strings.Contains(cmd, "&") {
 		t.Errorf("`&` is not a valid PowerShell statement separator: %s", cmd)
@@ -298,5 +300,54 @@ func TestServiceRestartScriptDelaysBeforeRestarting(t *testing.T) {
 	}
 	if !strings.Contains(script, restartCommand("acme")) {
 		t.Errorf("must carry this platform's restart command: %s", script)
+	}
+}
+
+// TestLinuxRestartTargetsTheCallingInstancesUnit is the narrow half of the
+// self-update exposure this feature had to close.
+//
+// The darwin branch was already slug-scoped and already carried its full
+// kickstart||bootstrap||kill fallback chain (added after the 2026-09-14
+// Mac.Home incident) — that is deliberately left alone. The Linux branch
+// restarted ONE FIXED unit name, so on a machine serving two tenant
+// identities a self-update triggered by the named instance bounced the
+// DEFAULT instance's link instead and left its own process running the old
+// binary until the rollback monitor undid the update 75s later.
+func TestLinuxRestartTargetsTheCallingInstancesUnit(t *testing.T) {
+	// The default instance's command must not have changed by one byte —
+	// this is the string every Linux BYOD host's updater emits today.
+	const wantDefault = "systemctl --user restart aw-remote-host || kill $PPID"
+	if got := restartCommandFor("linux", "acme", ""); got != wantDefault {
+		t.Errorf("default instance restart command changed:\ngot:  %s\nwant: %s", got, wantDefault)
+	}
+
+	const wantNamed = "systemctl --user restart aw-remote-host-work || kill $PPID"
+	if got := restartCommandFor("linux", "acme", "work"); got != wantNamed {
+		t.Errorf("named instance restarts the wrong unit:\ngot:  %s\nwant: %s", got, wantNamed)
+	}
+}
+
+// TestDarwinRestartLabelTracksTheInstance keeps the launchctl target in step
+// with servicemgr.LaunchdLabel. The fallback chain itself is asserted by
+// TestDarwinRestartCommandHasFallbackChain and is untouched here — the only
+// thing under test is WHICH job those three commands aim at.
+func TestDarwinRestartLabelTracksTheInstance(t *testing.T) {
+	def := restartCommandFor("darwin", "acme", "")
+	if !strings.Contains(def, "'com.tekflox.aw-remote-host.acme'") {
+		t.Errorf("the default instance's launchd target changed:\n%s", def)
+	}
+	if strings.Contains(def, ".work") {
+		t.Errorf("the default instance must not carry an instance suffix:\n%s", def)
+	}
+
+	named := restartCommandFor("darwin", "acme", "work")
+	if !strings.Contains(named, "'com.tekflox.aw-remote-host.acme.work'") {
+		t.Errorf("a named instance must kickstart its OWN launchd job, not the default one's:\n%s", named)
+	}
+	// servicemgr renders the plist under exactly this label; if the two ever
+	// disagree, kickstart silently fails and the fallback chain reboots the
+	// wrong job.
+	if want := servicemgr.LaunchdLabel("acme", "work"); !strings.Contains(named, "'"+want+"'") {
+		t.Errorf("restart label drifted from servicemgr.LaunchdLabel(%q): want %q in\n%s", "work", want, named)
 	}
 }

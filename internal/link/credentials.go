@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/tekflox/aw-remote-host/internal/homedir"
+	"github.com/tekflox/aw-remote-host/internal/instance"
 )
 
 // Credentials is the durable awlk_ host credential persisted after the
@@ -20,13 +20,27 @@ type Credentials struct {
 	HostCredential string `json:"host_credential"`
 }
 
-// DefaultCredentialsPath returns ~/.aw-remote-host/credentials.json.
-func DefaultCredentialsPath() (string, error) {
-	home, err := homedir.Dir()
+// CredentialsPathFor returns the credentials.json of instance name —
+// ~/.aw-remote-host/credentials.json for the default instance, and
+// ~/.aw-remote-host/instances/<name>/credentials.json for a named one.
+// Per-IDENTITY state: see internal/instance's package doc.
+//
+// Takes the name explicitly (rather than only reading the process-global)
+// so a test can resolve two instances in one process and assert they
+// differ — the failure this whole feature has to rule out is two accounts
+// silently sharing a credential file.
+func CredentialsPathFor(name string) (string, error) {
+	dir, err := instance.Dir(name)
 	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".aw-remote-host", "credentials.json"), nil
+	return filepath.Join(dir, "credentials.json"), nil
+}
+
+// DefaultCredentialsPath returns the credentials.json of the instance this
+// process is running as (instance.Active()).
+func DefaultCredentialsPath() (string, error) {
+	return CredentialsPathFor(instance.Active())
 }
 
 // LoadCredentials reads path, returning (nil, nil) if it doesn't exist.

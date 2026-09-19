@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tekflox/aw-remote-host/internal/homedir"
+	"github.com/tekflox/aw-remote-host/internal/instance"
 )
 
 // maxLogSize is how big client.log is allowed to grow before it rotates.
@@ -43,15 +43,51 @@ var (
 	size    int64
 )
 
-// LogPath returns ~/.aw-remote-host/client.log, the file Init writes to.
-// Exported so a command (or a doc) can tell an operator where to look
-// without hardcoding the path a second time.
-func LogPath() (string, error) {
-	home, err := homedir.Dir()
+// LogPathFor returns instance name's client.log. Per-IDENTITY state: a
+// second account's link on the same machine keeps its own operational log,
+// under ~/.aw-remote-host/instances/<name>/ — see internal/instance.
+func LogPathFor(name string) (string, error) {
+	dir, err := instance.Dir(name)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".aw-remote-host", "client.log"), nil
+	return filepath.Join(dir, "client.log"), nil
+}
+
+// LogPath returns the client.log of the instance this process is running
+// as — ~/.aw-remote-host/client.log for the default one, which is where it
+// has always been. Exported so a command (or a doc) can tell an operator
+// where to look without hardcoding the path a second time.
+func LogPath() (string, error) {
+	return LogPathFor(instance.Active())
+}
+
+// Reopen re-points the durable copy at the ACTIVE instance's own log file.
+//
+// It exists because of an ordering problem with no nicer answer: main()
+// calls Init before it knows which command is running, let alone which
+// --instance it was given, so the first open always lands on the default
+// instance's path. A named instance calls this once, immediately after
+// instance.SetActive — nothing has been written yet at that point, so
+// nothing is lost, and every later line goes to the right identity's file.
+//
+// A no-op for the default instance (the common case), where the path Init
+// already opened is the right one.
+func Reopen() {
+	mu.Lock()
+	next, err := LogPath()
+	if err != nil || next == path {
+		mu.Unlock()
+		return
+	}
+	if file != nil {
+		file.Close()
+		file = nil
+	}
+	path = ""
+	size = 0
+	mu.Unlock()
+	Init(nil)
 }
 
 // Init opens the rotating log file and sets consoleOut — normally

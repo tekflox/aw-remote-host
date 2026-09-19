@@ -239,6 +239,75 @@ workspace slug live alongside it in `~/.aw-remote-host/state.json` (also
 `0600`) — the password is stable across re-runs so a restart never locks
 itself out of the existing data volume.
 
+### Two accounts, one machine — `--instance`
+
+One physical machine can serve **two different AW accounts** at the same
+time. Each account gets its own *instance*: its own credentials, state,
+service definition and logs.
+
+```
+aw-remote-host link --token <account-B-token> --instance work --background
+```
+
+The state tree is split by **lifetime**, not by account, and that split is
+the whole design:
+
+| | lives at | one per |
+|---|---|---|
+| `credentials.json`, `state.json`, `client.log`, the service definition + its logs | `~/.aw-remote-host/instances/<name>/` | **identity** |
+| `firewall.json`, `vpn-deadman.json`, `vpn-selfheal.log`, `self-update/` | `~/.aw-remote-host/` (unchanged) | **machine** |
+
+The second row is not an oversight. There is one firewall on this host, one
+default route and therefore one VPN kill-switch, and one `aw-remote-host`
+binary — so there is one of each of those no matter how many accounts the
+box serves.
+
+**The default instance is untouched.** Omit `--instance` (or pass
+`--instance default`) and every path, the systemd unit name
+(`aw-remote-host.service`) and the launchd label
+(`com.tekflox.aw-remote-host.<slug>`) are exactly what they have always
+been. Upgrading an existing host changes nothing.
+
+Stated behaviour, not a surprise to discover later: **one binary serves
+every instance**, so a self-update triggered by one of them replaces the
+binary the others are running too, and restarts them.
+
+#### Scope
+
+- **A named instance is a lean link only.** `bootstrap-workspace` refuses
+  one, and says why: a second full workspace collides with the first on the
+  container names (`aw-remote-host-workspace`, `-postgres`, `-redis`), the
+  published port `127.0.0.1:9030` and the podman network. At most one
+  workspace per machine.
+- **macOS and Linux only.** Windows **refuses** a named instance rather than
+  half-supporting it: its background service is a single fixed Scheduled
+  Task name, so a second instance would overwrite the first one's task.
+- `--instance` is accepted by `link`, `status` and `unlink`.
+  `status` with no `--instance` reports whether the machine is serving
+  other identities.
+- `unlink --instance <name>` removes **only** that instance — its service,
+  its credentials and its directory. The other instances keep running.
+
+#### Do NOT override `$HOME` to get a second identity
+
+This is an anti-pattern, not an undocumented shortcut, and it is the
+mechanism `--instance` exists to replace:
+
+- The generated launchd plist has **no `EnvironmentVariables` key**, so a
+  hand-set `HOME` survives only the shell you typed it in. At the next
+  launchd respawn the job reads the real `$HOME` and silently re-registers
+  as the **first** account — a cross-account credential leak with no error
+  anywhere.
+- `HOME` also moves podman's storage root, the Go build cache and ssh, and
+  it isolates the per-machine state above — leaving the host with two VPN
+  dead-man switches and two self-updaters each believing they own it.
+
+A second **OS user account** is a legitimate alternative on a Linux server
+(separate HOME, service domain and podman storage, all for free). It does
+not work on macOS: LaunchAgents install into the `gui/<uid>` domain and only
+run while that user holds an active GUI login session, so the second user's
+link would stop whenever they logged out.
+
 ### Running persistently
 
 `bootstrap-workspace --background` writes and starts:

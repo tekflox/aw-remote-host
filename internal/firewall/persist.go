@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/tekflox/aw-remote-host/internal/homedir"
+	"github.com/tekflox/aw-remote-host/internal/instance"
 	"github.com/tekflox/aw-remote-host/internal/rlog"
 )
 
@@ -26,12 +26,18 @@ type persisted struct {
 }
 
 // StatePath returns ~/.aw-remote-host/firewall.json.
+//
+// PER-MACHINE, deliberately: there is one firewall on this host, however
+// many tenant identities it serves, so this path does NOT move under
+// instances/<name>/ the way credentials.json does. Two instances each
+// running their own firewall manager would be a second class of bug, not
+// isolation — see internal/instance's package doc.
 func StatePath() (string, error) {
-	home, err := homedir.Dir()
+	dir, err := instance.MachineDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".aw-remote-host", "firewall.json"), nil
+	return filepath.Join(dir, "firewall.json"), nil
 }
 
 // statePathOverride is StatePath, indirected so tests can point SelfHeal at

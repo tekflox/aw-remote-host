@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tekflox/aw-remote-host/internal/homedir"
+	"github.com/tekflox/aw-remote-host/internal/instance"
 )
 
 // The dead-man's switch.
@@ -66,12 +66,17 @@ type Deadman struct {
 }
 
 // DeadmanPath returns ~/.aw-remote-host/vpn-deadman.json.
+//
+// PER-MACHINE: one host has one default route, so it gets exactly one
+// kill-switch no matter how many tenant identities are linked from it.
+// Isolating this per instance would arm two switches that each believe
+// they own the machine's routing — see internal/instance's package doc.
 func DeadmanPath() (string, error) {
-	home, err := homedir.Dir()
+	dir, err := instance.MachineDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".aw-remote-host", "vpn-deadman.json"), nil
+	return filepath.Join(dir, "vpn-deadman.json"), nil
 }
 
 // DeadmanLogPath returns ~/.aw-remote-host/vpn-deadman.log.
@@ -81,11 +86,11 @@ func DeadmanPath() (string, error) {
 // days with no alarm. The revert writes what it did and when, so the evidence
 // outlives the process.
 func DeadmanLogPath() (string, error) {
-	home, err := homedir.Dir()
+	dir, err := instance.MachineDir()
 	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".aw-remote-host", "vpn-deadman.log"), nil
+	return filepath.Join(dir, "vpn-deadman.log"), nil
 }
 
 // ArmSpec is what a switch needs to know to undo a switch it never saw made.

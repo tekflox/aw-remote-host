@@ -21,6 +21,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/firewall"
 	"github.com/tekflox/aw-remote-host/internal/hostfacts"
 	"github.com/tekflox/aw-remote-host/internal/hostpower"
+	"github.com/tekflox/aw-remote-host/internal/instance"
 	"github.com/tekflox/aw-remote-host/internal/lanfastpath"
 	"github.com/tekflox/aw-remote-host/internal/link"
 	"github.com/tekflox/aw-remote-host/internal/ops"
@@ -75,6 +76,114 @@ func commonFlags(fs *flag.FlagSet) (token *string, plan *bool, controlPlane *str
 
 func extractDirFor(credentialsPath string) string {
 	return filepath.Join(filepath.Dir(credentialsPath), "bootstrap-scripts")
+}
+
+// instanceFlagHelp is deliberately different on the two commands that carry
+// the flag, because only one of them can act on it — see refuseNamedFull.
+const (
+	instanceFlagHelpLink = "serve a SECOND tenant account from this same machine under its own identity: its credentials, state, service definition and logs live under ~/.aw-remote-host/instances/<name>/ instead of the flat paths. Per-MACHINE state (the firewall, the VPN dead-man switch, the self-updater) stays shared, because those belong to the box and not to an account. Omit it — or pass --instance default — for this machine's original identity, whose paths, systemd unit name and launchd label are exactly what they have always been."
+	instanceFlagHelpFull = "NOT supported on this command — a named instance is a LEAN link only. Accepted here solely so that passing it produces an explanation instead of \"flag provided but not defined\". Use 'link --instance <name>'."
+)
+
+// resolveInstance validates the parsed --instance value, records it as this
+// PROCESS's identity, and re-points the durable log at that identity's own
+// file.
+//
+// The second return value says whether the flag was actually GIVEN, which is
+// not the same as whether it resolved to a name: `--instance default`
+// normalizes to the default instance while still being an explicit choice.
+// That difference is exactly what the second-link refusal hangs on — the
+// mistake it catches is an OMITTED --instance, and an operator who typed
+// "default" has already answered the question it would ask.
+// parseInstance is the PURE half — it validates and normalizes, and writes
+// nothing. Split from activateInstance so a command that is going to refuse
+// this instance can refuse it before any directory exists: activating
+// re-opens the durable log under the instance's own dir, and a refused
+// command that has already created ~/.aw-remote-host/instances/<name>/ has
+// left exactly the state it claimed not to write.
+func parseInstance(fs *flag.FlagSet, raw string) (name string, given bool, err error) {
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "instance" {
+			given = true
+		}
+	})
+	name = instance.Normalize(raw)
+	if err := instance.Validate(name); err != nil {
+		return "", given, err
+	}
+	// Windows is explicitly refused rather than half-supported: the
+	// background Scheduled Task is a single fixed name there, so a second
+	// named instance would overwrite the first one's task. Refused for the
+	// foreground case too, so the answer does not change depending on which
+	// other flags were passed.
+	if name != "" && runtime.GOOS == "windows" {
+		return "", given, fmt.Errorf("--instance is not supported on Windows: the background Scheduled Task is a single fixed task name, so a second named instance would overwrite the first one's task rather than run alongside it. Serving two tenant accounts from one machine is supported on macOS and Linux")
+	}
+	return name, given, nil
+}
+
+// activateInstance records name as this PROCESS's identity and re-points the
+// durable log at that identity's own file.
+//
+// Must run before anything resolves a per-identity path. Every helper that
+// reads instance.Active() — link.DefaultCredentialsPath, state.DefaultPath,
+// rlog.LogPath, and everything in internal/vpn and internal/ops that calls
+// them — resolves the DEFAULT instance until this has run.
+func activateInstance(name string) {
+	instance.SetActive(name)
+	rlog.Reopen()
+}
+
+// resolveInstance is parse-then-activate, for the commands that have
+// nothing to refuse first.
+func resolveInstance(fs *flag.FlagSet, raw string) (string, bool, error) {
+	name, given, err := parseInstance(fs, raw)
+	if err != nil {
+		return "", given, err
+	}
+	activateInstance(name)
+	return name, given, nil
+}
+
+// refuseNamedFull is the first of this feature's two fail-loud refusals: a
+// second FULL (--with-workspace) instance, refused before any state is
+// written and before any podman command runs.
+//
+// Everything a full provision creates is a fixed name — the containers
+// aw-remote-host-workspace / -postgres / -redis, the published port
+// 127.0.0.1:9030, the podman network aw-remote-host (bootstrap/*/install.sh)
+// — so a second one does not "mostly work", it takes the first workspace's
+// containers away from it. Parameterising all of that is deferred until
+// somebody actually asks for two workspaces on one box.
+func refuseNamedFull(name string) error {
+	return fmt.Errorf(`bootstrap-workspace cannot run as instance %q: a second FULL workspace on one machine collides with the first on every name it needs — the containers aw-remote-host-workspace, aw-remote-host-postgres and aw-remote-host-redis, the published port 127.0.0.1:9030, and the podman network aw-remote-host are all fixed, not per-instance. Refused here rather than half way through 'podman run'.
+
+A second tenant identity on this machine IS supported, as a lean link (no local runtime):
+
+    aw-remote-host link --token <token> --instance %s --background`, name, name)
+}
+
+// refuseSecondLinkWithoutInstance is the second refusal, and the more
+// important one: this is the ONLY place a user discovers that instances
+// exist. The console's "Regenerate link command" does not emit --instance,
+// so an operator linking a second account pastes a command with no instance
+// in it onto a machine that already has one.
+//
+// Without this, that paste does not fail — it silently succeeds as the WRONG
+// account. link.Client.Run prefers a stored host credential over the --token
+// it was given (see internal/link/link.go), so the second account's token is
+// ignored and the machine stays registered as the first one, with no error
+// anywhere.
+func refuseSecondLinkWithoutInstance(cmdName, credPath string) error {
+	return fmt.Errorf(`this machine is already linked (credentials at %s), so a --token for a DIFFERENT account would be silently ignored: an existing host credential always wins over a freshly supplied bootstrap token, and this host would stay registered as the account it is linked to now.
+
+To serve a SECOND account from this machine, give it its own instance:
+
+    aw-remote-host link --token <token> --instance <name> --background
+
+To re-link THIS machine's existing identity with a fresh token, say so explicitly:
+
+    aw-remote-host %s --token <token> --instance default`, credPath, cmdName)
 }
 
 func reportStatuses(statuses []bootstrap.ModuleStatus) {
@@ -206,6 +315,11 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	background := fs.Bool("background", false, "install and start a background service (launchd on macOS, systemd on Linux), then detach")
 	detach := fs.Bool("detach", false, "alias for --background")
 	elevated := fs.Bool("elevated", false, "Windows only: register the background task to run with administrative rights (RunLevel=HighestAvailable). Needs an elevated prompt to register — without it the link runs as a standard user, which is enough for exec/file/shell but cannot restart a Windows service or write under C:\\Program Files. Ignored on macOS/Linux.")
+	instanceHelp := instanceFlagHelpLink
+	if allowProvision {
+		instanceHelp = instanceFlagHelpFull
+	}
+	instanceRaw := fs.String("instance", "", instanceHelp)
 	var withWorkspace, full, force *bool
 	if allowProvision {
 		withWorkspace = fs.Bool("with-workspace", false, "also install/start the full local runtime (podman, postgres+pgvector, redis, the aw-workspace container) — default is a LEAN link: register this machine and hold /link (enables exec_* + control-plane-driven \"bootstrap\") without provisioning anything locally. Re-run with this flag later (no --token needed once linked) to provision, or trigger it remotely via the control plane's own \"bootstrap\" verb (see README) — no need to re-run by hand.")
@@ -218,6 +332,22 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+
+	// Resolved first, before ANY path is computed: every per-identity path
+	// this function goes on to use reads instance.Active(), so a later
+	// resolution would silently touch the default instance's files.
+	instanceName, instanceGiven, err := parseInstance(fs, *instanceRaw)
+	if err != nil {
+		return err
+	}
+	// Refusal 1 — a second FULL instance. Deliberately BEFORE
+	// activateInstance, so this refuses without having created the instance
+	// directory it is refusing. allowProvision is exactly "this is
+	// bootstrap-workspace", the only command that can provision.
+	if allowProvision && instanceName != "" {
+		return refuseNamedFull(instanceName)
+	}
+	activateInstance(instanceName)
 
 	// Parse before anything else touches the disk: a typo'd grant name must
 	// abort here, not halfway through provisioning.
@@ -319,6 +449,11 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	alreadyLinked := existingCreds != nil && existingCreds.HostCredential != ""
 	if *token == "" && !alreadyLinked {
 		return fmt.Errorf("--token is required for first-time linking (or pass --plan to preview without one)")
+	}
+	// Refusal 2 — see refuseSecondLinkWithoutInstance. Still before anything
+	// is written: the only disk read so far is credentials.json.
+	if !instanceGiven && *token != "" && alreadyLinked {
+		return refuseSecondLinkWithoutInstance(cmdName, credPath)
 	}
 
 	if !*yes {
@@ -638,6 +773,10 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 		svcCfg := servicemgr.Config{
 			Slug: reg.slug, ExePath: resolveExePath(),
 			ControlPlane: *controlPlane, Elevated: *elevated,
+			// What makes the respawned service load THIS identity's
+			// credentials rather than the first one's — and the reason the
+			// generated unit sets no HOME. See servicemgr.Config.Instance.
+			Instance: instanceName,
 		}
 		if err := installAndStartService(svcCfg); err != nil {
 			return err
@@ -754,16 +893,70 @@ func reportHostPowerStatus(requested []string) {
 	}
 }
 
+// reportInstances tells an operator how many tenant identities this MACHINE
+// is serving, and which one they are currently looking at.
+//
+// Without it the feature is invisible: nothing else in `status`, and nothing
+// in the console, distinguishes a machine serving one account from a machine
+// serving two — so the next person to touch that box has no way to find out
+// except by listing ~/.aw-remote-host/instances by hand. The line for the
+// default instance is deliberately printed only when there IS something to
+// report, so the overwhelmingly common single-identity host's output is
+// unchanged.
+func reportInstances(current string) {
+	all, err := instance.List()
+	if err != nil {
+		return
+	}
+	others := make([]string, 0, len(all))
+	for _, n := range all {
+		if n != current {
+			others = append(others, n)
+		}
+	}
+	if current == "" {
+		if len(others) == 0 {
+			return // the single-identity host: output unchanged
+		}
+		rlog.Printf("instance: default — this machine also serves %d other tenant %s: %s\n",
+			len(others), plural(len(others), "identity", "identities"), strings.Join(others, ", "))
+		rlog.Println("instance: everything below is the DEFAULT instance only — re-run with --instance <name> to see one of the others.")
+		return
+	}
+	rlog.Printf("instance: %s (this machine also has: default%s)\n",
+		current, prefixed(", ", strings.Join(others, ", ")))
+}
+
+func prefixed(sep, s string) string {
+	if s == "" {
+		return ""
+	}
+	return sep + s
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
 func runStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	_, plan, controlPlane := commonFlags(fs)
+	instanceRaw := fs.String("instance", "", instanceFlagHelpLink)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	instanceName, _, err := resolveInstance(fs, *instanceRaw)
+	if err != nil {
 		return err
 	}
 	if *plan {
 		rlog.Printf("[plan] would query link + module status from %s\n", *controlPlane)
 		return nil
 	}
+	reportInstances(instanceName)
 
 	credPath, err := link.DefaultCredentialsPath()
 	if err != nil {
@@ -796,7 +989,7 @@ func runStatus(args []string) error {
 	if mgr, mgrErr := servicemgr.Default(); mgrErr != nil {
 		rlog.Printf("service: no supported service manager (%v)\n", mgrErr)
 	} else {
-		svcPath, pathErr := mgr.Path(servicemgr.Config{Slug: st.WorkspaceSlug})
+		svcPath, pathErr := mgr.Path(servicemgr.Config{Slug: st.WorkspaceSlug, Instance: instanceName})
 		if pathErr != nil {
 			rlog.Printf("service (%s): could not resolve path: %v\n", mgr.Name(), pathErr)
 		} else if _, statErr := os.Stat(svcPath); statErr == nil {
@@ -845,11 +1038,23 @@ func runUnlink(args []string) error {
 	fs := flag.NewFlagSet("unlink", flag.ContinueOnError)
 	_, plan, controlPlane := commonFlags(fs)
 	stopContainers := fs.Bool("stop-containers", false, "also stop the podman containers this host started")
+	instanceRaw := fs.String("instance", "", instanceFlagHelpLink)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	instanceName, _, err := resolveInstance(fs, *instanceRaw)
+	if err != nil {
+		return err
+	}
 	if *plan {
-		rlog.Printf("[plan] would remove ~/.aw-remote-host/credentials.json and unlink from %s\n", *controlPlane)
+		credPath, credErr := link.DefaultCredentialsPath()
+		if credErr != nil {
+			return credErr
+		}
+		if instanceName != "" {
+			rlog.Printf("[plan] would unlink instance %q ONLY — this machine's other instances, and its shared firewall/VPN/self-update state, are untouched\n", instanceName)
+		}
+		rlog.Printf("[plan] would remove %s and unlink from %s\n", credPath, *controlPlane)
 		rlog.Println("[plan] would also POST /api/link/detach so the control plane revokes this host's credential and stops listing it")
 		rlog.Println("[plan] would also stop and uninstall the background service, if installed")
 		if *stopContainers {
@@ -861,7 +1066,11 @@ func runUnlink(args []string) error {
 	if statePath, err := state.DefaultPath(); err == nil {
 		if st, stErr := state.Load(statePath); stErr == nil && st != nil {
 			if mgr, mgrErr := servicemgr.Default(); mgrErr == nil {
-				svcCfg := servicemgr.Config{Slug: st.WorkspaceSlug}
+				// Instance-scoped, and that is the whole of the Linux fix:
+				// systemd's Path/Start/Stop/Uninstall used to ignore this
+				// Config and act on one fixed unit name, so unlinking either
+				// identity stopped, disabled and deleted the other's service.
+				svcCfg := servicemgr.Config{Slug: st.WorkspaceSlug, Instance: instanceName}
 				if svcPath, pathErr := mgr.Path(svcCfg); pathErr == nil {
 					if _, statErr := os.Stat(svcPath); statErr == nil {
 						if path, err := mgr.Uninstall(svcCfg); err != nil {
@@ -913,6 +1122,24 @@ func runUnlink(args []string) error {
 		return err
 	}
 	rlog.Println("unlink: removed local credentials")
+
+	// A named instance owns its whole directory, so removing it is the
+	// honest end state — leaving an empty instances/<name>/ behind would
+	// keep `status` reporting an identity this machine no longer serves,
+	// which is the one thing that report exists to get right. The DEFAULT
+	// instance's directory is never removed: it is ~/.aw-remote-host itself,
+	// which holds this machine's firewall state, its VPN dead-man switch and
+	// its self-update marker — none of which belong to the identity being
+	// unlinked.
+	if instanceName != "" {
+		if dir, dirErr := instance.Dir(instanceName); dirErr == nil {
+			if rmErr := os.RemoveAll(dir); rmErr != nil {
+				rlog.Printf("unlink: could not remove instance dir %s: %v\n", dir, rmErr)
+			} else {
+				rlog.Printf("unlink: removed instance %q (%s) — this machine's other instances are untouched\n", instanceName, dir)
+			}
+		}
+	}
 	return nil
 }
 

@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/tekflox/aw-remote-host/internal/homedir"
+	"github.com/tekflox/aw-remote-host/internal/instance"
 )
 
 // State is the on-disk shape of ~/.aw-remote-host/state.json.
@@ -234,13 +234,22 @@ type ExternalRouteState struct {
 	DNSPriority int `json:"dns_priority,omitempty"`
 }
 
-// DefaultPath returns ~/.aw-remote-host/state.json.
-func DefaultPath() (string, error) {
-	home, err := homedir.Dir()
+// PathFor returns the state.json of instance name —
+// ~/.aw-remote-host/state.json for the default instance, and
+// ~/.aw-remote-host/instances/<name>/state.json for a named one.
+// Per-IDENTITY state: see internal/instance's package doc.
+func PathFor(name string) (string, error) {
+	dir, err := instance.Dir(name)
 	if err != nil {
-		return "", fmt.Errorf("resolve home dir: %w", err)
+		return "", err
 	}
-	return filepath.Join(home, ".aw-remote-host", "state.json"), nil
+	return filepath.Join(dir, "state.json"), nil
+}
+
+// DefaultPath returns the state.json of the instance this process is
+// running as (instance.Active()).
+func DefaultPath() (string, error) {
+	return PathFor(instance.Active())
 }
 
 // Load reads path, returning a zero-value State (not an error) if it

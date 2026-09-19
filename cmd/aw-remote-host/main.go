@@ -126,6 +126,25 @@ Flags (link, bootstrap-workspace, status, unlink):
                     Linux — then detach; the service itself runs with
                     --foreground.
   --stop-containers (unlink) also stop the podman containers this host started
+  --instance <name> (link, status, unlink) serve a SECOND tenant account from
+                    this same machine. That account's credentials, state,
+                    service definition and logs live under
+                    ~/.aw-remote-host/instances/<name>/; this machine's own
+                    state — the firewall, the VPN dead-man switch, the
+                    self-updater — stays shared, because it belongs to the box
+                    and not to an account.
+                    Omit it (or pass --instance default) for this machine's
+                    original identity: its paths, its systemd unit name and its
+                    launchd label are unchanged.
+                    A named instance is a LEAN link only — bootstrap-workspace
+                    refuses one, because a second full workspace would collide
+                    with the first on container names, the published port and
+                    the podman network. macOS and Linux only; Windows refuses a
+                    named instance rather than half-supporting it.
+                    NEVER override $HOME to get a second identity: the generated
+                    launchd plist has no EnvironmentVariables key, so the
+                    override dies at the next respawn and the service silently
+                    re-registers as the FIRST account.
 
 Flags (vpn):
   --login-server    the tenant's headscale, e.g. https://headscale.aw.tekflox.com

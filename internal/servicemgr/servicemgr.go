@@ -17,13 +17,39 @@ import (
 )
 
 // Config carries what a Manager needs to render its service definition.
-// Slug scopes the macOS launchd label/plist filename (a machine could in
-// principle run more than one workspace-host link); it's informational on
-// the systemd side, which only ever manages a single fixed unit name.
+// Slug scopes the macOS launchd label/plist filename; Instance scopes the
+// systemd unit name, the launchd label and the Scheduled Task name, and is
+// what a machine serving more than one tenant identity is keyed on.
 type Config struct {
 	Slug         string // workspace slug, known once /link has registered
 	ExePath      string // absolute path to the aw-remote-host binary
 	ControlPlane string
+	// Instance names the tenant identity this service definition belongs
+	// to — "" for the default (unnamed) instance, which every host linked
+	// before instances existed is.
+	//
+	// It does two things, and the second is the point of the first:
+	//
+	//  1. It scopes the unit/task name and the definition's path, so a
+	//     second identity's `link --background` cannot overwrite the
+	//     first's unit — which is what the systemd branch did, silently,
+	//     for as long as it ignored this Config.
+	//  2. It is passed to the binary as `--instance <name>` in
+	//     ProgramArguments/ExecStart. That, and NOT a HOME override, is how
+	//     the respawned service finds its own credentials: the generated
+	//     launchd plist has no EnvironmentVariables key at all, so a
+	//     hand-set HOME survived only the operator's foreground shell and
+	//     the next launchd respawn silently loaded the FIRST account's
+	//     credentials.json. HOME would also move podman's storage root, the
+	//     Go build cache and ssh, which is what made that workaround unsafe
+	//     rather than merely fragile.
+	//
+	// The default instance's rendered definition, unit name and launchd
+	// label MUST stay byte-identical to what pre-instance releases wrote:
+	// every BYOD host in the field is an unnamed instance, and a renamed
+	// unit orphans them all on upgrade (old unit still enabled, new name
+	// never started).
+	Instance string
 	// Elevated asks the OS to run the link with administrative rights.
 	//
 	// Windows only today. The default is deliberately off: everything the
@@ -64,6 +90,27 @@ type Manager interface {
 	// Uninstall stops the service (if running) and removes its
 	// definition file. Returns the path removed.
 	Uninstall(cfg Config) (string, error)
+}
+
+// serviceArgs returns the argv (everything after the binary path) that the
+// generated service definition runs, shared by the systemd and launchd
+// renderers so the two can never drift.
+//
+// The DEFAULT instance runs `bootstrap-workspace --control-plane <cp> --yes
+// --foreground` — byte-for-byte the spelling already on disk in every BYOD
+// host's unit file. Do not "tidy" it.
+//
+// A NAMED instance runs `link` instead, and that substitution is load-
+// bearing rather than cosmetic: a second identity on a machine is lean-only
+// (two full workspaces collide on container names, the published port and
+// the podman network — see the link command's refusal), and `link` is the
+// command that structurally cannot provision. It also carries --instance,
+// which is what makes the respawned service load ITS OWN credentials.
+func serviceArgs(cfg Config) []string {
+	if cfg.Instance == "" {
+		return []string{"bootstrap-workspace", "--control-plane", cfg.ControlPlane, "--yes", "--foreground"}
+	}
+	return []string{"link", "--instance", cfg.Instance, "--control-plane", cfg.ControlPlane, "--yes", "--foreground"}
 }
 
 // New returns the Manager for goos, or an error if goos isn't supported.

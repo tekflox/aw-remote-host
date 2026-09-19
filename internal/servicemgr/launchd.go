@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/tekflox/aw-remote-host/internal/homedir"
 )
@@ -16,13 +17,7 @@ const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 	<string>%s</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>%s</string>
-		<string>bootstrap-workspace</string>
-		<string>--control-plane</string>
-		<string>%s</string>
-		<string>--yes</string>
-		<string>--foreground</string>
-	</array>
+%s	</array>
 	<key>WorkingDirectory</key>
 	<string>%s</string>
 	<key>RunAtLoad</key>
@@ -48,35 +43,66 @@ func launchdSlugOrUnknown(slug string) string {
 	return slug
 }
 
-// launchdLabel is the LaunchAgent Label AND the plist filename stem —
+// LaunchdLabel is the LaunchAgent Label AND the plist filename stem —
 // scoped by workspace slug (unlike the systemd unit) since a Mac could in
-// principle bootstrap more than one workspace-host link.
-func launchdLabel(slug string) string {
-	return "com.tekflox.aw-remote-host." + launchdSlugOrUnknown(slug)
+// principle bootstrap more than one workspace-host link, and additionally
+// by instance name when there is one.
+//
+// The instance suffix is only appended for a NAMED instance, so the default
+// instance's label — and therefore its plist filename, and the launchctl
+// target the self-updater kickstarts — is byte-identical to what every Mac
+// in the field already has loaded.
+//
+// Exported because internal/updater has to construct exactly this string to
+// restart the right job; it used to hand-roll it from the slug alone, which
+// was correct only while one Mac meant one identity.
+func LaunchdLabel(slug, inst string) string {
+	label := "com.tekflox.aw-remote-host." + launchdSlugOrUnknown(slug)
+	if inst != "" {
+		label += "." + inst
+	}
+	return label
 }
+
+func launchdLabel(cfg Config) string { return LaunchdLabel(cfg.Slug, cfg.Instance) }
 
 // GenerateLaunchdPlist renders the LaunchAgent plist content — split out
 // from Install so tests can assert on it without touching the filesystem
 // or shelling out to launchctl.
+//
+// Note what is NOT in here: an EnvironmentVariables key setting HOME. The
+// absence used to be the bug — with no way to carry an overridden HOME,
+// a hand-rolled second identity silently reverted to the FIRST account's
+// credentials.json on every launchd respawn. The fix is the --instance
+// argument serviceArgs puts in ProgramArguments, not an env override.
 func GenerateLaunchdPlist(cfg Config) (string, error) {
-	logPath, err := launchdLogPath(cfg.Slug)
+	logPath, err := launchdLogPath(cfg)
 	if err != nil {
 		return "", err
+	}
+	var args strings.Builder
+	fmt.Fprintf(&args, "\t\t<string>%s</string>\n", cfg.ExePath)
+	for _, a := range serviceArgs(cfg) {
+		fmt.Fprintf(&args, "\t\t<string>%s</string>\n", a)
 	}
 	// WorkingDirectory guards against launchd invoking a relative ExePath
 	// (or the binary resolving relative paths) from an unexpected cwd —
 	// launchd starts services with cwd=/ , which used to make a relative
 	// binary path fail to launch (exit 78).
 	workDir := filepath.Dir(cfg.ExePath)
-	return fmt.Sprintf(launchdPlistTemplate, launchdLabel(cfg.Slug), cfg.ExePath, cfg.ControlPlane, workDir, logPath, logPath), nil
+	return fmt.Sprintf(launchdPlistTemplate, launchdLabel(cfg), args.String(), workDir, logPath, logPath), nil
 }
 
-func launchdLogPath(slug string) (string, error) {
+func launchdLogPath(cfg Config) (string, error) {
 	home, err := homedir.Dir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
-	return filepath.Join(home, "Library", "Logs", "aw-remote-host."+launchdSlugOrUnknown(slug)+".log"), nil
+	name := "aw-remote-host." + launchdSlugOrUnknown(cfg.Slug)
+	if cfg.Instance != "" {
+		name += "." + cfg.Instance
+	}
+	return filepath.Join(home, "Library", "Logs", name+".log"), nil
 }
 
 func (m *launchdManager) Path(cfg Config) (string, error) {
@@ -84,7 +110,7 @@ func (m *launchdManager) Path(cfg Config) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
-	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel(cfg.Slug)+".plist"), nil
+	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel(cfg)+".plist"), nil
 }
 
 func (m *launchdManager) Install(cfg Config) (string, error) {
@@ -99,7 +125,7 @@ func (m *launchdManager) Install(cfg Config) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
 	}
-	logPath, err := launchdLogPath(cfg.Slug)
+	logPath, err := launchdLogPath(cfg)
 	if err != nil {
 		return "", err
 	}
@@ -141,7 +167,7 @@ func (m *launchdManager) Stop(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	target := guiDomain() + "/" + launchdLabel(cfg.Slug)
+	target := guiDomain() + "/" + launchdLabel(cfg)
 	if err := runCmd("launchctl", "bootout", target); err != nil {
 		_ = runCmd("launchctl", "unload", path) // best-effort legacy fallback
 	}
