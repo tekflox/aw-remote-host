@@ -72,6 +72,16 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/aw-remote-host" <<'FAKE'
 #!/usr/bin/env bash
 set -u
+# Records the --token value it was invoked with, so a test can assert
+# entrypoint.sh's TOKEN_ARG decision without needing a real control plane.
+if [ -n "${FAKE_ARGS_FILE:-}" ]; then
+  token=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--token" ]; then token="${2:-}"; fi
+    shift
+  done
+  printf 'token=%s\n' "$token" >> "$FAKE_ARGS_FILE"
+fi
 trap 'echo term >> "${FAKE_EVENTS_FILE:-/dev/null}"; exit 0' TERM
 : > "${AW_REMOTE_HOST_HEARTBEAT_FILE:-/dev/null}" 2>/dev/null
 while true; do
@@ -91,15 +101,21 @@ run_scenario() {
   mkdir -p "$RUN_DIR" "$SCEN/home/.aw-remote-host"
   # A non-empty credentials.json marks the host as already-linked, so the
   # entrypoint doesn't refuse to start for lack of AW_REMOTE_HOST_TOKEN.
-  echo '{}' > "$SCEN/home/.aw-remote-host/credentials.json"
+  # Skippable (CREDS_PRESENT=0) for a scenario that wants a fresh-link host.
+  if [ "${CREDS_PRESENT:-1}" = "1" ]; then
+    echo '{}' > "$SCEN/home/.aw-remote-host/credentials.json"
+  fi
   ENTRY_COPY="$SCEN/entrypoint.sh"
   sed -e "s#/run/aw-remote-host#$RUN_DIR#g" \
       -e "s#/var/run/tailscale#$SCEN/tailscale#g" \
       "$ENTRY_SRC" > "$ENTRY_COPY"
   chmod +x "$ENTRY_COPY"
   : > "$SCEN/events"
+  : > "$SCEN/args"
   HOME="$SCEN/home" \
   FAKE_EVENTS_FILE="$SCEN/events" \
+  FAKE_ARGS_FILE="$SCEN/args" \
+  AW_REMOTE_HOST_TOKEN="${SCENARIO_TOKEN:-}" \
   AW_REMOTE_HOST_HEARTBEAT_STALE_SECONDS="${STALE:-3}" \
   AW_REMOTE_HOST_HEARTBEAT_CHECK_INTERVAL="${CHECK_INTERVAL:-1}" \
   FAKE_HEARTBEAT_INTERVAL="${FAKE_HB_INTERVAL:-1}" \
@@ -188,6 +204,34 @@ check "scenario3: never recycled — same child pid the whole time" "$CHILD_REAL
 check "scenario3: watcher never logged a wedge" "0" \
   "$(grep -c 'looks wedged rather than merely idle' "$SCEN/stderr.log" 2>/dev/null)"
 stop_scenario
+
+# === scenario 4: already-linked host dials with an EMPTY token, never the
+# stale AW_REMOTE_HOST_TOKEN still sitting in its env ========================
+# Regression for the 2026-09-20 crispal incident: a container recreate
+# replays the original AW_REMOTE_HOST_TOKEN (a one-time bootstrap token,
+# long since redeemed) into the replacement's env verbatim. Passing that
+# non-empty stale value to an already-linked host trips
+# refuseSecondLinkWithoutInstance in the Go binary, which returns before
+# ever dialing /link — a silent, permanent crash-loop.
+CREDS_PRESENT=1 SCENARIO_TOKEN="awbs_stale_already_consumed"
+run_scenario scenario4
+CHILD_REAL_PID="$(wait_for_child_pid)"
+check "scenario4: child started" "1" \
+  "$([ -n "$CHILD_REAL_PID" ] && kill -0 "$CHILD_REAL_PID" 2>/dev/null && echo 1 || echo 0)"
+check "scenario4: already-linked child was dialed with an empty --token" "token=" \
+  "$(head -1 "$SCEN/args" 2>/dev/null)"
+stop_scenario
+
+# === scenario 5: a fresh (never-linked) host still gets the real token =====
+CREDS_PRESENT=0 SCENARIO_TOKEN="awbs_fresh_link_token"
+run_scenario scenario5
+CHILD_REAL_PID="$(wait_for_child_pid)"
+check "scenario5: child started" "1" \
+  "$([ -n "$CHILD_REAL_PID" ] && kill -0 "$CHILD_REAL_PID" 2>/dev/null && echo 1 || echo 0)"
+check "scenario5: never-linked child was dialed with the real token" "token=awbs_fresh_link_token" \
+  "$(head -1 "$SCEN/args" 2>/dev/null)"
+stop_scenario
+CREDS_PRESENT=1 SCENARIO_TOKEN=""
 
 echo
 echo "$pass passed, $fail failed"

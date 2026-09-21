@@ -49,13 +49,16 @@ mkdir -p "$STATUS_DIR"
 # reliability:deploy-env-overwrite-drops-manual-vars) even though nothing
 # about this host's link had actually changed.
 CREDENTIALS_PATH="$HOME/.aw-remote-host/credentials.json"
-if [ -s "$CREDENTIALS_PATH" ]; then
-  ALREADY_LINKED=1
-else
-  ALREADY_LINKED=0
-fi
+# A function, not a one-shot variable: the restart loop below can run this
+# child more than once within a single container boot (a first-ever link
+# that then crashes before the loop exits, not just the common case of one
+# link per boot), and credentials.json can go from absent to present
+# between those iterations. Checking fresh each time is what makes the
+# TOKEN_ARG decision in the loop correct on every iteration, not just the
+# first.
+already_linked() { [ -s "$CREDENTIALS_PATH" ]; }
 
-if [ -z "${AW_REMOTE_HOST_TOKEN:-}" ] && [ "$ALREADY_LINKED" = 0 ]; then
+if [ -z "${AW_REMOTE_HOST_TOKEN:-}" ] && ! already_linked; then
   echo "status=missing_token detail=no_stored_credentials" > "$STATUS_FILE"
   echo "aw-remote-host: AW_REMOTE_HOST_TOKEN is not set and this host has no stored credentials at $CREDENTIALS_PATH — set AW_REMOTE_HOST_TOKEN in .env (token from aw-console) and redeploy. Exiting." >&2
   exit 1
@@ -201,8 +204,31 @@ while true; do
   echo "status=running" > "$STATUS_FILE"
   : > "$HEARTBEAT_FILE"
   START_TS=$(date +%s)
+  # An already-linked host must dial with an EMPTY --token, not whatever
+  # AW_REMOTE_HOST_TOKEN still holds. That env var is baked into this
+  # container's Config at creation time and never cleared once the
+  # one-time bootstrap token it carried has been redeemed — a container
+  # recreate (control-plane-driven image update) replays it verbatim into
+  # the replacement. Passing it here unconditionally used to hand the Go
+  # binary a stale, already-consumed token on every single boot of an
+  # already-linked host: `alreadyLinked && *token != "" && !instanceGiven`
+  # trips refuseSecondLinkWithoutInstance (cmd/aw-remote-host/commands.go),
+  # which returns an error before ever dialing /link. The entrypoint then
+  # restarts the child every ~10s into the same refusal — a silent,
+  # permanent crash-loop that never once attempts a connection, which is
+  # indistinguishable from outside the container (status=retrying,
+  # `podman ps` still says "Up"). Confirmed live on the crispal hosted
+  # workspace 2026-09-20: a control-plane recreate never saw a single
+  # /link registration in 300s of aw-backend logs, root-caused to exactly
+  # this. Already-stored credentials.json is what an already-linked host
+  # should actually reconnect with (see the comment above already_linked).
+  if already_linked; then
+    TOKEN_ARG=""
+  else
+    TOKEN_ARG="${AW_REMOTE_HOST_TOKEN:-}"
+  fi
   aw-remote-host bootstrap-workspace \
-    --token "${AW_REMOTE_HOST_TOKEN:-}" \
+    --token "$TOKEN_ARG" \
     --control-plane "$CONTROL_PLANE" \
     --yes \
     --foreground &
