@@ -55,36 +55,59 @@
 # host permanently broken instead of repairing it.
 PODMAN_RUNROOT="${PODMAN_RUNROOT:-/run/containers/storage}"
 
-# _podman_graphroot_driver_for <home_dir>
+# PODMAN_MOUNT_PROGRAM is what gets handed to podman as [storage.options]
+# mount_program whenever _podman_mount_program_for below decides one is
+# needed. fuse-overlayfs is podman's own documented answer to nested
+# overlay-on-overlay — see that function's comment for the two incidents
+# this line exists to close.
+PODMAN_MOUNT_PROGRAM="${PODMAN_MOUNT_PROGRAM:-/usr/bin/fuse-overlayfs}"
+
+# _podman_mount_program_for <home_dir>
 #
-# Picks the storage driver configure_podman_graphroot should write for a
-# graphroot rooted under <home_dir>. Podman's native "overlay" driver cannot
-# run on top of a filesystem that is ITSELF already overlayfs without a
-# mount_program (fuse-overlayfs) — confirmed live via
-# bug:aw-automation-byod-smoke-workspace-provisioning-timeout, GHA run
-# 35860295745: "'overlay' is not supported over overlayfs, a mount_program
-# is required". aw-automation's byod/Dockerfile hits exactly this — its
-# `docker:27-dind` test container's own root filesystem is overlayfs before
-# podman ever starts, which is why that Dockerfile pre-configures
-# driver = "vfs" for itself. On a normal bare-metal/VM host, <home_dir> sits
-# on a real disk (ext4 etc.) and native overlay is correct and faster — so
-# this detects the exception instead of assuming it, or assuming the
-# opposite (this function used to hardcode "overlay" unconditionally, which
-# is the bug: it clobbered the byod/Dockerfile's own "vfs" the moment this
-# repo's install.sh ran as root inside that container).
+# Decides whether configure_podman_graphroot needs to hand podman a
+# mount_program for a graphroot rooted under <home_dir>. Podman's native
+# "overlay" driver refuses to mount on top of a filesystem that is ITSELF
+# already overlayfs — confirmed live via
+# bug:aw-automation-byod-smoke-workspace-provisioning-timeout (GHA run
+# 35860295745): "'overlay' is not supported over overlayfs, a mount_program
+# is required". That's exactly aw-remote-host's own docker-compose simulator,
+# and any bare-metal host that ends up recreating aw-remote-host inside
+# ANOTHER container.
+#
+# This function's first version (861f4aa) detected the case and had
+# configure_podman_graphroot fall back to the vfs driver entirely instead of
+# overlay — that clears the hard error, but vfs has no copy-on-write and
+# fully duplicates every layer per image AND per container. Confirmed live
+# 2026-09-26 (incident:aw-automation-byod-vfs-bloat), one bootstrap after
+# 861f4aa's own fix landed: 44G on disk for 4.4G of actual image content, on
+# a bare-metal host down to 8.9G free because of it. fuse-overlayfs is
+# podman's own documented answer to the exact error message above — real
+# copy-on-write overlay semantics without needing the kernel to support
+# overlay-on-overlay, so the driver can stay "overlay" everywhere and only
+# the mount_program changes. Verified: built aw-remote-host's own production
+# Dockerfile, ran it privileged, confirmed `podman info` reports
+# graphDriverName: overlay with fuse-overlayfs wired in, and podman pull+run
+# both succeed — same result reproduced independently inside aw-automation's
+# own byod/Dockerfile container (docker:27-dind, the exact environment
+# GHA run 35860295745 failed in).
+#
+# mount_program is only handed to podman when it's actually needed — setting
+# it unconditionally would force every ordinary bare-metal/VM host (a real
+# disk, no nesting) onto FUSE overlay too, trading away the faster native
+# kernel driver for nothing.
 #
 # findmnt not resolving (missing, or <home_dir> not yet mounted anywhere
-# distinguishable) falls back to "overlay" — the pre-existing, safe-for-a-
-# real-disk default.
-_podman_graphroot_driver_for() {
+# distinguishable) means "assume a normal disk" — no mount_program, same as
+# the pre-existing default before nesting was ever a concern here.
+_podman_mount_program_for() {
   local home_dir="$1" fstype
   fstype="$(findmnt -no FSTYPE -T "$home_dir" 2>/dev/null || true)"
   case "$fstype" in
     overlay | overlayfs | fuse.fuse-overlayfs)
-      echo "vfs"
+      echo "$PODMAN_MOUNT_PROGRAM"
       ;;
     *)
-      echo "overlay"
+      echo ""
       ;;
   esac
 }
@@ -92,20 +115,33 @@ _podman_graphroot_driver_for() {
 configure_podman_graphroot() {
   local conf_file="$1" home_dir="$2"
   local storage_root="$home_dir/.local/share/containers/storage"
-  local driver
+  local mount_program desired
   mkdir -p "$storage_root" "$(dirname "$conf_file")"
-  driver="$(_podman_graphroot_driver_for "$home_dir")"
-  if [ -f "$conf_file" ] \
-    && grep -q "driver = \"$driver\"" "$conf_file" 2>/dev/null \
-    && grep -q "graphroot = \"$storage_root\"" "$conf_file" 2>/dev/null \
-    && grep -q "runroot = \"$PODMAN_RUNROOT\"" "$conf_file" 2>/dev/null; then
+  mount_program="$(_podman_mount_program_for "$home_dir")"
+
+  desired="[storage]
+driver = \"overlay\"
+runroot = \"$PODMAN_RUNROOT\"
+graphroot = \"$storage_root\""
+  if [ -n "$mount_program" ]; then
+    desired="$desired
+
+[storage.options]
+mount_program = \"$mount_program\""
+  fi
+
+  # Full-content comparison rather than a chain of greps: it repairs ANY
+  # drift from what this function would write right now — a stale driver, a
+  # missing/wrong mount_program, leftover options from an older version —
+  # instead of only the specific fields an earlier version happened to
+  # check for. That's the exact gap that let 861f4aa's own conf (correct
+  # graphroot+runroot, no mount_program) go unrepaired: a guard checking
+  # only those two fields would have returned early and left that host
+  # silently on vfs forever.
+  if [ -f "$conf_file" ] && [ "$(cat "$conf_file")" = "$desired" ]; then
     return 0
   fi
-  cat > "$conf_file" <<EOF
-[storage]
-driver = "$driver"
-runroot = "$PODMAN_RUNROOT"
-graphroot = "$storage_root"
-EOF
-  echo "podman: graphroot set to $storage_root (survives this container being recreated; the package default /var/lib/containers/storage does not), runroot at $PODMAN_RUNROOT, driver $driver"
+
+  printf '%s\n' "$desired" > "$conf_file"
+  echo "podman: graphroot set to $storage_root (survives this container being recreated; the package default /var/lib/containers/storage does not), runroot at $PODMAN_RUNROOT${mount_program:+, mount_program=$mount_program (native overlay-on-overlay would otherwise hard-fail — see incident:aw-automation-byod-vfs-bloat-2026-09-26)}"
 }

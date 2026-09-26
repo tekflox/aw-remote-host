@@ -13,7 +13,7 @@ trap 'rm -rf "$TMP"' EXIT
 # A stub findmnt lets tests pick the underlying filesystem type deterministically
 # instead of depending on whatever $TMP happens to sit on in whatever environment
 # runs this suite (e.g. a GHA runner whose own /tmp is already overlayfs would
-# otherwise silently flip every "normal disk" test below onto the vfs path).
+# otherwise silently flip every "normal disk" test below onto the nested path).
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/findmnt" <<'STUB'
 #!/bin/sh
@@ -46,6 +46,10 @@ expect "writes the conf file" "1" "$([ -f "$CONF" ] && echo 1 || echo 0)"
 expect "graphroot points under \$HOME, not /var/lib/containers" \
   "graphroot = \"$EXPECTED_ROOT\"" "$(grep 'graphroot' "$CONF")"
 expect "creates the storage dir itself" "1" "$([ -d "$EXPECTED_ROOT" ] && echo 1 || echo 0)"
+expect "driver stays overlay on a normal disk" \
+  "driver = \"overlay\"" "$(grep 'driver' "$CONF")"
+expect "no mount_program on a normal disk — native overlay is faster and works fine" \
+  "0" "$(grep -c 'mount_program' "$CONF")"
 
 # A different, pre-existing conf (simulating the podman package's own
 # default) must be REPLACED, not merged around — a leftover
@@ -105,27 +109,31 @@ expect "repair keeps the graphroot it already had" \
   "graphroot = \"$EXPECTED_ROOT\"" "$(grep 'graphroot' "$CONF")"
 
 # The regression this test exists for: a graphroot rooted on a filesystem
-# that is ITSELF already overlayfs (the aw-automation BYOD test container's
-# situation — see bootstrap/lib/podman_storage.sh) must NOT get the native
-# "overlay" driver, which fails hard with "'overlay' is not supported over
-# overlayfs, a mount_program is required" (bug:aw-automation-byod-smoke-
-# workspace-provisioning-timeout, GHA run 35860295745).
+# that is ITSELF already overlayfs (aw-remote-host's own docker-compose
+# simulator's situation — see bootstrap/lib/podman_storage.sh) must get a
+# mount_program, not the plain native "overlay" driver, which fails hard
+# with "'overlay' is not supported over overlayfs, a mount_program is
+# required" (bug:aw-automation-byod-smoke-workspace-provisioning-timeout,
+# GHA run 35860295745).
 OVERLAY_CONF="$TMP/etc/containers/storage-overlayfs.conf"
 OVERLAY_HOME="$TMP/home/nested"
 export FAKE_FSTYPE=overlay
 configure_podman_graphroot "$OVERLAY_CONF" "$OVERLAY_HOME" >/dev/null
-expect "graphroot over overlayfs gets the vfs driver, not overlay" \
-  "driver = \"vfs\"" "$(grep 'driver' "$OVERLAY_CONF")"
+expect "graphroot over overlayfs still uses the overlay driver" \
+  "driver = \"overlay\"" "$(grep 'driver' "$OVERLAY_CONF")"
+expect "graphroot over overlayfs gets a mount_program instead of falling back to vfs" \
+  "mount_program = \"$PODMAN_MOUNT_PROGRAM\"" "$(grep 'mount_program' "$OVERLAY_CONF")"
 
-# Idempotent in the overlayfs case too.
+# Idempotent in the nested-overlayfs case too.
 BEFORE_OVERLAY="$(cat "$OVERLAY_CONF")"
 configure_podman_graphroot "$OVERLAY_CONF" "$OVERLAY_HOME" >/dev/null
 expect "overlayfs case is idempotent" "$BEFORE_OVERLAY" "$(cat "$OVERLAY_CONF")"
 
-# A conf previously (wrongly) written with driver=overlay on a host that is
-# actually overlayfs must be REPAIRED to vfs, not left broken — this is
-# exactly the state a host bootstrapped by the buggy version of this
-# function is in today.
+# A conf previously written with driver=overlay and no mount_program on a
+# host that is actually overlayfs (exactly what 861f4aa's own fixed version
+# produced before the vfs fallback — and what a host bootstrapped between
+# these two versions has right now) must be REPAIRED, not left on vfs and
+# not left silently missing mount_program.
 cat > "$OVERLAY_CONF" <<EOF
 [storage]
 driver = "overlay"
@@ -133,7 +141,21 @@ runroot = "$PODMAN_RUNROOT"
 graphroot = "$OVERLAY_HOME/.local/share/containers/storage"
 EOF
 configure_podman_graphroot "$OVERLAY_CONF" "$OVERLAY_HOME" >/dev/null
-expect "repairs a wrongly-overlay conf on an overlayfs host to vfs" \
-  "driver = \"vfs\"" "$(grep 'driver' "$OVERLAY_CONF")"
+expect "repairs a pre-mount_program conf on an overlayfs host" \
+  "mount_program = \"$PODMAN_MOUNT_PROGRAM\"" "$(grep 'mount_program' "$OVERLAY_CONF")"
+
+# ...and the vfs-fallback conf 861f4aa's first version would have written
+# must also be repaired forward to overlay+mount_program, not left on vfs.
+cat > "$OVERLAY_CONF" <<EOF
+[storage]
+driver = "vfs"
+runroot = "$PODMAN_RUNROOT"
+graphroot = "$OVERLAY_HOME/.local/share/containers/storage"
+EOF
+configure_podman_graphroot "$OVERLAY_CONF" "$OVERLAY_HOME" >/dev/null
+expect "repairs a vfs-fallback conf on an overlayfs host back to overlay" \
+  "driver = \"overlay\"" "$(grep 'driver' "$OVERLAY_CONF")"
+expect "...with a mount_program, not bare overlay" \
+  "mount_program = \"$PODMAN_MOUNT_PROGRAM\"" "$(grep 'mount_program' "$OVERLAY_CONF")"
 
 exit "$fail"

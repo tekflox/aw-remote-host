@@ -123,7 +123,38 @@ install_podman_linux() {
   fi
 }
 
+# ensure_fuse_overlayfs_linux installs fuse-overlayfs unconditionally — root
+# or rootless, whether or not podman itself needed installing (a host with
+# podman already present from some other path never runs install_podman_linux
+# at all, so this can't be folded into that function). Without it on PATH,
+# podman's overlay driver silently drops to vfs the moment native
+# overlay-on-overlay isn't available, which has no copy-on-write and fully
+# duplicates every layer per image/container. Confirmed live 2026-09-26
+# (incident:aw-automation-byod-vfs-bloat): 44G on disk for 4.4G of real
+# images. Rootless podman already prefers fuse-overlayfs over vfs by default
+# once it's installed — nothing else to configure there. Rootful gets an
+# explicit mount_program in configure_podman_graphroot below, since silent
+# fallback is exactly what bit us and a config that only *hopes* podman finds
+# the binary isn't the fix.
+ensure_fuse_overlayfs_linux() {
+  if command -v fuse-overlayfs >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y fuse-overlayfs
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y fuse-overlayfs
+  elif command -v pacman >/dev/null 2>&1; then
+    sudo pacman -Sy --noconfirm fuse-overlayfs
+  else
+    echo "fuse-overlayfs: no supported package manager found — podman may silently fall back to the much less space-efficient vfs storage driver" >&2
+    return 1
+  fi
+}
+
 ensure_cmd podman install_podman_linux
+ensure_fuse_overlayfs_linux || true
 # ensure_cmd no-ops the moment podman is on PATH at ANY version, so on a host
 # that already has an older podman it cannot be what moves it to the floor.
 # This can: it upgrades only when the package manager actually offers
