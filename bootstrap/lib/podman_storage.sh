@@ -55,20 +55,57 @@
 # host permanently broken instead of repairing it.
 PODMAN_RUNROOT="${PODMAN_RUNROOT:-/run/containers/storage}"
 
+# _podman_graphroot_driver_for <home_dir>
+#
+# Picks the storage driver configure_podman_graphroot should write for a
+# graphroot rooted under <home_dir>. Podman's native "overlay" driver cannot
+# run on top of a filesystem that is ITSELF already overlayfs without a
+# mount_program (fuse-overlayfs) — confirmed live via
+# bug:aw-automation-byod-smoke-workspace-provisioning-timeout, GHA run
+# 35860295745: "'overlay' is not supported over overlayfs, a mount_program
+# is required". aw-automation's byod/Dockerfile hits exactly this — its
+# `docker:27-dind` test container's own root filesystem is overlayfs before
+# podman ever starts, which is why that Dockerfile pre-configures
+# driver = "vfs" for itself. On a normal bare-metal/VM host, <home_dir> sits
+# on a real disk (ext4 etc.) and native overlay is correct and faster — so
+# this detects the exception instead of assuming it, or assuming the
+# opposite (this function used to hardcode "overlay" unconditionally, which
+# is the bug: it clobbered the byod/Dockerfile's own "vfs" the moment this
+# repo's install.sh ran as root inside that container).
+#
+# findmnt not resolving (missing, or <home_dir> not yet mounted anywhere
+# distinguishable) falls back to "overlay" — the pre-existing, safe-for-a-
+# real-disk default.
+_podman_graphroot_driver_for() {
+  local home_dir="$1" fstype
+  fstype="$(findmnt -no FSTYPE -T "$home_dir" 2>/dev/null || true)"
+  case "$fstype" in
+    overlay | overlayfs | fuse.fuse-overlayfs)
+      echo "vfs"
+      ;;
+    *)
+      echo "overlay"
+      ;;
+  esac
+}
+
 configure_podman_graphroot() {
   local conf_file="$1" home_dir="$2"
   local storage_root="$home_dir/.local/share/containers/storage"
+  local driver
   mkdir -p "$storage_root" "$(dirname "$conf_file")"
+  driver="$(_podman_graphroot_driver_for "$home_dir")"
   if [ -f "$conf_file" ] \
+    && grep -q "driver = \"$driver\"" "$conf_file" 2>/dev/null \
     && grep -q "graphroot = \"$storage_root\"" "$conf_file" 2>/dev/null \
     && grep -q "runroot = \"$PODMAN_RUNROOT\"" "$conf_file" 2>/dev/null; then
     return 0
   fi
   cat > "$conf_file" <<EOF
 [storage]
-driver = "overlay"
+driver = "$driver"
 runroot = "$PODMAN_RUNROOT"
 graphroot = "$storage_root"
 EOF
-  echo "podman: graphroot set to $storage_root (survives this container being recreated; the package default /var/lib/containers/storage does not), runroot at $PODMAN_RUNROOT"
+  echo "podman: graphroot set to $storage_root (survives this container being recreated; the package default /var/lib/containers/storage does not), runroot at $PODMAN_RUNROOT, driver $driver"
 }

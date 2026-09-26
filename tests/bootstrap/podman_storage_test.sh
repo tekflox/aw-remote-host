@@ -10,6 +10,19 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# A stub findmnt lets tests pick the underlying filesystem type deterministically
+# instead of depending on whatever $TMP happens to sit on in whatever environment
+# runs this suite (e.g. a GHA runner whose own /tmp is already overlayfs would
+# otherwise silently flip every "normal disk" test below onto the vfs path).
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/findmnt" <<'STUB'
+#!/bin/sh
+echo "${FAKE_FSTYPE:-ext4}"
+STUB
+chmod +x "$TMP/bin/findmnt"
+export PATH="$TMP/bin:$PATH"
+export FAKE_FSTYPE=ext4
+
 # shellcheck source=../../bootstrap/lib/podman_storage.sh
 source "$REPO_DIR/bootstrap/lib/podman_storage.sh"
 
@@ -90,5 +103,37 @@ expect "repairs a graphroot-only conf left by the previous version" \
   "runroot = \"/run/containers/storage\"" "$(grep 'runroot' "$CONF")"
 expect "repair keeps the graphroot it already had" \
   "graphroot = \"$EXPECTED_ROOT\"" "$(grep 'graphroot' "$CONF")"
+
+# The regression this test exists for: a graphroot rooted on a filesystem
+# that is ITSELF already overlayfs (the aw-automation BYOD test container's
+# situation — see bootstrap/lib/podman_storage.sh) must NOT get the native
+# "overlay" driver, which fails hard with "'overlay' is not supported over
+# overlayfs, a mount_program is required" (bug:aw-automation-byod-smoke-
+# workspace-provisioning-timeout, GHA run 35860295745).
+OVERLAY_CONF="$TMP/etc/containers/storage-overlayfs.conf"
+OVERLAY_HOME="$TMP/home/nested"
+export FAKE_FSTYPE=overlay
+configure_podman_graphroot "$OVERLAY_CONF" "$OVERLAY_HOME" >/dev/null
+expect "graphroot over overlayfs gets the vfs driver, not overlay" \
+  "driver = \"vfs\"" "$(grep 'driver' "$OVERLAY_CONF")"
+
+# Idempotent in the overlayfs case too.
+BEFORE_OVERLAY="$(cat "$OVERLAY_CONF")"
+configure_podman_graphroot "$OVERLAY_CONF" "$OVERLAY_HOME" >/dev/null
+expect "overlayfs case is idempotent" "$BEFORE_OVERLAY" "$(cat "$OVERLAY_CONF")"
+
+# A conf previously (wrongly) written with driver=overlay on a host that is
+# actually overlayfs must be REPAIRED to vfs, not left broken — this is
+# exactly the state a host bootstrapped by the buggy version of this
+# function is in today.
+cat > "$OVERLAY_CONF" <<EOF
+[storage]
+driver = "overlay"
+runroot = "$PODMAN_RUNROOT"
+graphroot = "$OVERLAY_HOME/.local/share/containers/storage"
+EOF
+configure_podman_graphroot "$OVERLAY_CONF" "$OVERLAY_HOME" >/dev/null
+expect "repairs a wrongly-overlay conf on an overlayfs host to vfs" \
+  "driver = \"vfs\"" "$(grep 'driver' "$OVERLAY_CONF")"
 
 exit "$fail"
