@@ -34,6 +34,9 @@
 //     actually succeeded — distinct from having merely sent the ws_open
 //     frame, so the control plane can gate accepting the browser's own
 //     WebSocket on a real confirmation instead of a fire-and-forget send.
+//     Gated on the "ws_open_ok" entry of the register frame's caps list, see
+//     Caps — an agent that does not advertise it gets the legacy
+//     fire-and-forget accept and this frame is never waited on.
 //   - either direction:      {"op":"ws_msg","id","data","dir":"text"|"binary"} (data b64)
 //   - either direction:      {"op":"ws_close","id","reason"?} — host -> control-plane
 //     also covers a failed local dial (in place of ws_open_ok)
@@ -267,6 +270,33 @@ func (c *Client) dial(ctx context.Context, token string) (*websocket.Conn, error
 	return conn, nil
 }
 
+// Caps is the set of OPTIONAL /link protocol features this binary speaks,
+// advertised in every register frame (see registerFrame) so the control plane
+// can negotiate instead of assume.
+//
+// The control plane deploys centrally and instantly; this binary lives on the
+// user's own machine and updates on the user's schedule, so any new
+// host -> control-plane frame the control plane starts WAITING for would turn
+// every un-upgraded host into a total outage rather than a degraded one. That
+// is not hypothetical: the unconditional ws_open_ok wait shipped on
+// 2026-09-27 hung every browser WebSocket for 30s on two live v0.1.12x/v0.1.95
+// hosts until they were updated by hand. So the rule (aw-workspace
+// docs/standards/app-backend-websocket-messaging.md §2.6.2) is that the
+// control plane may only gate on a frame named here, and must keep its legacy
+// path for a host that does not name it.
+//
+// A capability list rather than a cli_version comparison on purpose: this
+// repo has a documented history of the reported version not matching the code
+// that is running (guardHostNotAheadOfImage compared a baked tag string to a
+// git SHA; a self-updated binary can report a version its running process
+// predates). A cap is advertised by the process that actually holds the
+// socket, so it cannot be stale in the way a version string can.
+//
+// Append-only, and never remove an entry without removing the behaviour.
+var Caps = []string{
+	"ws_open_ok",
+}
+
 func (c *Client) registerFrame() map[string]any {
 	frame := map[string]any{
 		"op":          "register",
@@ -275,6 +305,9 @@ func (c *Client) registerFrame() map[string]any {
 		"os":          c.Info.OS,
 		"arch":        c.Info.Arch,
 		"cli_version": c.Info.CLIVersion,
+		// Copied, not shared: the frame is handed to callers and tests, and
+		// the package-level Caps must not be mutable through one of them.
+		"caps": append([]string(nil), Caps...),
 	}
 	if c.Info.BootstrapReport != nil {
 		frame["bootstrap_report"] = c.Info.BootstrapReport

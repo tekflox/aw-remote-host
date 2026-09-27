@@ -556,8 +556,8 @@ func (f *fakeTunnelProxy) OpenWS(ctx context.Context, id, path string, headers m
 }
 
 func (f *fakeTunnelProxy) WSMessage(id string, data []byte, isText bool) error { return nil }
-func (f *fakeTunnelProxy) CloseWS(id string) error                            { return nil }
-func (f *fakeTunnelProxy) CloseAllWS()                                        {}
+func (f *fakeTunnelProxy) CloseWS(id string) error                             { return nil }
+func (f *fakeTunnelProxy) CloseAllWS()                                         {}
 
 // TestRunSendsWSOpenOkOnSuccessfulDial is the control-plane-visible half of
 // the premature-accept fix: a successful local dial must produce a REAL
@@ -681,6 +681,103 @@ func TestRegisterFrameSendsEmptyHostPowerNotOmitted(t *testing.T) {
 		}
 		if v != "" {
 			t.Fatalf("%s = %v", key, v)
+		}
+	}
+}
+
+// The control plane gates the ws_open_ok accept on this list, so an agent
+// that stops advertising it silently loses the fix (aw-workspace
+// docs/standards/app-backend-websocket-messaging.md §2.6.2). v0.1.125 sent the
+// frame but advertised nothing, which under a caps-only gate reads as a legacy
+// host — this test is what stops that shipping twice.
+func TestRegisterFrameAdvertisesWSOpenOkCapability(t *testing.T) {
+	c := &Client{ControlPlane: "https://example.test"}
+	frame := c.registerFrame()
+	raw, ok := frame["caps"]
+	if !ok {
+		t.Fatalf("register frame must carry caps, got keys %v", frame)
+	}
+	caps, ok := raw.([]string)
+	if !ok {
+		t.Fatalf("caps must be a []string so it marshals as a JSON array, got %T", raw)
+	}
+	found := false
+	for _, c := range caps {
+		if c == "ws_open_ok" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("caps must advertise ws_open_ok, got %v", caps)
+	}
+}
+
+// The frame is handed out to callers and to the /link writer; a shared backing
+// array would let one of them mutate the package-level Caps for every
+// subsequent reconnect.
+func TestRegisterFrameCapsAreACopy(t *testing.T) {
+	c := &Client{ControlPlane: "https://example.test"}
+	caps := c.registerFrame()["caps"].([]string)
+	caps[0] = "mutated"
+	again := c.registerFrame()["caps"].([]string)
+	if again[0] == "mutated" {
+		t.Fatalf("registerFrame leaked the package-level Caps slice: %v", again)
+	}
+	if Caps[0] == "mutated" {
+		t.Fatalf("Caps itself was mutated: %v", Caps)
+	}
+}
+
+// Every register lands on the backend's _connected write, including reconnects
+// — a self-update reconnects rather than re-bootstraps, so a caps list only
+// present on the first register would leave an updated agent looking legacy
+// until its next full bootstrap.
+func TestRegisterFrameCarriesCapsOnReconnectToo(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.acceptTokens["awlk_minted"] = "" // reconnect: no new credential minted
+	srv.forceCloseAfter = 1              // drop the first connection right after registering
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+	c.MinBackoff = 5 * time.Millisecond
+	c.MaxBackoff = 20 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var registeredCount int32
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnRegistered: func(reply *RegisteredReply) {
+				if atomic.AddInt32(&registeredCount, 1) >= 2 {
+					cancel()
+				}
+			},
+		})
+	}()
+	<-done
+
+	srv.mu.Lock()
+	frames := append([]map[string]any(nil), srv.registerFrames...)
+	srv.mu.Unlock()
+	if len(frames) < 2 {
+		t.Fatalf("wanted at least 2 register frames (initial + reconnect), got %d", len(frames))
+	}
+	// Round-tripped through JSON, so []string arrives as []any.
+	for i, f := range frames {
+		caps, _ := f["caps"].([]any)
+		found := false
+		for _, c := range caps {
+			if s, _ := c.(string); s == "ws_open_ok" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("register frame %d carried no ws_open_ok cap: %+v", i, f)
 		}
 	}
 }
