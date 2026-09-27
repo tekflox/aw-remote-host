@@ -339,7 +339,16 @@ func normalizePath(path string) string {
 // a read loop that relays every inbound frame back via sendMsg. Runs the
 // dial synchronously (fast — loopback) but the read loop in its own
 // goroutine, same as ServeHTTP's caller contract.
-func (h *Handler) OpenWS(ctx context.Context, id, path string, headers map[string]string, sendMsg func(id string, data []byte, isText bool)) error {
+//
+// onOpen (may be nil) runs synchronously right after the dial succeeds and
+// BEFORE the read-loop goroutine is started — the caller's only guarantee
+// that whatever onOpen does (link.go's handleWSOpen writes the ws_open_ok
+// frame there) reaches the wire before the first ws_msg possibly could. A
+// callback fired from inside the goroutine instead would race it: Go makes
+// no promise about when a newly spawned goroutine gets scheduled relative to
+// its parent, so an ack written from there could arrive after a message it
+// was supposed to precede.
+func (h *Handler) OpenWS(ctx context.Context, id, path string, headers map[string]string, onOpen func(), sendMsg func(id string, data []byte, isText bool)) error {
 	target := strings.TrimRight(h.target(), "/") + normalizePath(path)
 	wsURL := strings.Replace(target, "http://", "ws://", 1)
 	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
@@ -377,6 +386,10 @@ func (h *Handler) OpenWS(ctx context.Context, id, path string, headers map[strin
 	}
 	h.wsConns[id] = conn
 	h.mu.Unlock()
+
+	if onOpen != nil {
+		onOpen()
+	}
 
 	go func() {
 		for {

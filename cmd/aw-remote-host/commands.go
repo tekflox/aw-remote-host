@@ -1170,8 +1170,8 @@ func (p *linkProxy) ServeHTTP(ctx context.Context, id, method, path string,
 }
 
 func (p *linkProxy) OpenWS(ctx context.Context, id, path string, headers map[string]string,
-	sendMsg func(id string, data []byte, isText bool)) error {
-	return p.web.OpenWS(ctx, id, path, headers, sendMsg)
+	onOpen func(), sendMsg func(id string, data []byte, isText bool)) error {
+	return p.web.OpenWS(ctx, id, path, headers, onOpen, sendMsg)
 }
 
 func (p *linkProxy) WSMessage(id string, data []byte, isText bool) error {

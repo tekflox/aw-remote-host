@@ -30,8 +30,13 @@
 //   - host -> control-plane: {"op":"http_resp_head","id","status","headers"}, then
 //     zero or more {"op":"http_resp_chunk","id","data"} (b64), then {"op":"http_resp_end","id"}
 //   - control-plane -> host: {"op":"ws_open","id","path","headers"}
+//   - host -> control-plane: {"op":"ws_open_ok","id"} once the local dial has
+//     actually succeeded — distinct from having merely sent the ws_open
+//     frame, so the control plane can gate accepting the browser's own
+//     WebSocket on a real confirmation instead of a fire-and-forget send.
 //   - either direction:      {"op":"ws_msg","id","data","dir":"text"|"binary"} (data b64)
-//   - either direction:      {"op":"ws_close","id","reason"?}
+//   - either direction:      {"op":"ws_close","id","reason"?} — host -> control-plane
+//     also covers a failed local dial (in place of ws_open_ok)
 //
 // pump() dispatches these to whatever TunnelProxy RunCallbacks.OnTunnelProxy
 // builds for the live connection, same "one instance per connection, torn
@@ -455,7 +460,7 @@ type TunnelProxy interface {
 		chunk func(id string, data []byte),
 		end func(id string),
 	)
-	OpenWS(ctx context.Context, id, path string, headers map[string]string, sendMsg func(id string, data []byte, isText bool)) error
+	OpenWS(ctx context.Context, id, path string, headers map[string]string, onOpen func(), sendMsg func(id string, data []byte, isText bool)) error
 	WSMessage(id string, data []byte, isText bool) error
 	CloseWS(id string) error
 	CloseAllWS()
@@ -854,7 +859,9 @@ func handleHTTPReq(ctx context.Context, fw *frameWriter, msg map[string]any, pro
 // handleWSOpen dials the local workspace server's WS endpoint in its own
 // goroutine (dial can block briefly) — a dial failure is reported as a
 // ws_close with a reason rather than silently dropping the session,
-// mirroring handlePTYOpen.
+// mirroring handlePTYOpen. A successful dial is reported too, via
+// ws_open_ok, so the control plane has a real positive signal distinct from
+// "I sent the ws_open request" — mirrors handleTCPOpen's tcp_open_ok.
 func handleWSOpen(ctx context.Context, fw *frameWriter, msg map[string]any, proxy TunnelProxy) {
 	id, _ := msg["id"].(string)
 	path, _ := msg["path"].(string)
@@ -866,15 +873,19 @@ func handleWSOpen(ctx context.Context, fw *frameWriter, msg map[string]any, prox
 	}
 
 	go func() {
-		err := proxy.OpenWS(ctx, id, path, headers, func(id string, data []byte, isText bool) {
-			dir := "binary"
-			if isText {
-				dir = "text"
-			}
-			_ = fw.WriteJSON(map[string]any{
-				"op": "ws_msg", "id": id, "data": base64.StdEncoding.EncodeToString(data), "dir": dir,
+		err := proxy.OpenWS(ctx, id, path, headers,
+			func() {
+				_ = fw.WriteJSON(map[string]any{"op": "ws_open_ok", "id": id})
+			},
+			func(id string, data []byte, isText bool) {
+				dir := "binary"
+				if isText {
+					dir = "text"
+				}
+				_ = fw.WriteJSON(map[string]any{
+					"op": "ws_msg", "id": id, "data": base64.StdEncoding.EncodeToString(data), "dir": dir,
+				})
 			})
-		})
 		if err != nil {
 			_ = fw.WriteJSON(map[string]any{"op": "ws_close", "id": id, "reason": err.Error()})
 		}

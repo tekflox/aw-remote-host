@@ -521,6 +521,141 @@ func TestPTYOpenForwardsTarget(t *testing.T) {
 	}
 }
 
+// fakeTunnelProxy implements TunnelProxy for testing the Phase 4 ws_* frame
+// dispatch — fakeShellManager's sibling for the PTY channel.
+type fakeTunnelProxy struct {
+	mu      sync.Mutex
+	opened  []string
+	openErr map[string]error // id -> error OpenWS should return for that id
+}
+
+func newFakeTunnelProxy() *fakeTunnelProxy {
+	return &fakeTunnelProxy{openErr: map[string]error{}}
+}
+
+func (f *fakeTunnelProxy) ServeHTTP(ctx context.Context, id, method, path string, headers map[string]string,
+	body []byte, head func(id string, status int, headers map[string]string),
+	chunk func(id string, data []byte), end func(id string)) {
+}
+
+func (f *fakeTunnelProxy) OpenWS(ctx context.Context, id, path string, headers map[string]string,
+	onOpen func(), sendMsg func(id string, data []byte, isText bool)) error {
+	f.mu.Lock()
+	err := f.openErr[id]
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.opened = append(f.opened, id)
+	f.mu.Unlock()
+	if onOpen != nil {
+		onOpen()
+	}
+	return nil
+}
+
+func (f *fakeTunnelProxy) WSMessage(id string, data []byte, isText bool) error { return nil }
+func (f *fakeTunnelProxy) CloseWS(id string) error                            { return nil }
+func (f *fakeTunnelProxy) CloseAllWS()                                        {}
+
+// TestRunSendsWSOpenOkOnSuccessfulDial is the control-plane-visible half of
+// the premature-accept fix: a successful local dial must produce a REAL
+// ws_open_ok frame (not just "the ws_open request was sent"), and must never
+// also produce a ws_close for the same session.
+func TestRunSendsWSOpenOkOnSuccessfulDial(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.framesToSend = []map[string]any{
+		{"op": "ws_open", "id": "s1", "path": "/api/apps/presentations/ws", "headers": map[string]any{}},
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	proxy := newFakeTunnelProxy()
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnTunnelProxy: func() TunnelProxy { return proxy },
+		})
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	found := false
+	for _, f := range srv.receivedFrames {
+		if f["op"] == "ws_open_ok" && f["id"] == "s1" {
+			found = true
+		}
+		if f["op"] == "ws_close" && f["id"] == "s1" {
+			t.Errorf("unexpected ws_close for a dial that succeeded: %+v", f)
+		}
+	}
+	if !found {
+		t.Errorf("expected a ws_open_ok frame for s1, got %+v", srv.receivedFrames)
+	}
+}
+
+// TestRunSendsWSCloseWithReasonOnFailedDial is the failure counterpart: a
+// failed local dial must produce a ws_close carrying the REAL error, never a
+// ws_open_ok — the control plane's gate depends on exactly one of the two
+// ever arriving for a given session id.
+func TestRunSendsWSCloseWithReasonOnFailedDial(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.framesToSend = []map[string]any{
+		{"op": "ws_open", "id": "s1", "path": "/api/apps/presentations/ws", "headers": map[string]any{}},
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	proxy := newFakeTunnelProxy()
+	proxy.openErr["s1"] = errors.New("dial local workspace ws: connection refused")
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnTunnelProxy: func() TunnelProxy { return proxy },
+		})
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	found := false
+	for _, f := range srv.receivedFrames {
+		if f["op"] == "ws_open_ok" && f["id"] == "s1" {
+			t.Errorf("unexpected ws_open_ok for a dial that failed: %+v", f)
+		}
+		if f["op"] == "ws_close" && f["id"] == "s1" {
+			reason, _ := f["reason"].(string)
+			if reason == "" || !strings.Contains(reason, "connection refused") {
+				t.Errorf("ws_close reason = %q, want it to carry the real dial failure", reason)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a ws_close-with-reason frame for s1, got %+v", srv.receivedFrames)
+	}
+}
+
 // The badge in aw-console reads both, and needs them on every register —
 // including a reconnect, and including when empty. An empty string is a real
 // state here (the host revoked its grants), not a missing field.

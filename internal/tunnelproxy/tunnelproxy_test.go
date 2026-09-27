@@ -274,6 +274,82 @@ func TestDialContextStopsOnContextCancellation(t *testing.T) {
 	}
 }
 
+// TestOpenWSCallsOnOpenBeforeFirstMessage pins the ordering guarantee
+// link.go's handleWSOpen depends on to send ws_open_ok before any ws_msg:
+// onOpen must run before the read-loop goroutine can deliver its first
+// message, even when the upstream fires one immediately.
+func TestOpenWSCallsOnOpenBeforeFirstMessage(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("first"))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	h := &Handler{Target: srv.URL}
+
+	var mu sync.Mutex
+	var order []string
+	done := make(chan struct{})
+
+	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil,
+		func() {
+			mu.Lock()
+			order = append(order, "open")
+			mu.Unlock()
+		},
+		func(id string, data []byte, isText bool) {
+			mu.Lock()
+			order = append(order, "msg:"+string(data))
+			mu.Unlock()
+			close(done)
+		},
+	)
+	if err != nil {
+		t.Fatalf("OpenWS: %v", err)
+	}
+	defer h.CloseAllWS()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first message")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != "open" || order[1] != "msg:first" {
+		t.Fatalf("order = %v, want [open msg:first] — onOpen must fire before any message", order)
+	}
+}
+
+// TestOpenWSDoesNotCallOnOpenOnFailedDial — a failed dial must never report
+// a false-positive open; the caller (link.go's handleWSOpen) relies on
+// exactly one of onOpen or a non-nil error, never both.
+func TestOpenWSDoesNotCallOnOpenOnFailedDial(t *testing.T) {
+	h := &Handler{Target: "http://127.0.0.1:1"} // nothing listens here
+	called := false
+	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil,
+		func() { called = true },
+		func(id string, data []byte, isText bool) {},
+	)
+	if err == nil {
+		t.Fatal("expected a dial error")
+	}
+	if called {
+		t.Fatal("onOpen must not fire when the dial failed")
+	}
+}
+
 // TestOpenWSRetriesATransientDialFailure — OpenWS crosses the identical hop,
 // and at the dial layer it gets the same retry for free. Retrying here is
 // unconditionally safe: NetDialContext returns before the HTTP upgrade is
@@ -302,7 +378,7 @@ func TestOpenWSRetriesATransientDialFailure(t *testing.T) {
 	done := make(chan struct{})
 	var mu sync.Mutex
 	var received []string
-	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil, func(id string, data []byte, isText bool) {
+	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil, nil, func(id string, data []byte, isText bool) {
 		mu.Lock()
 		received = append(received, string(data))
 		mu.Unlock()
@@ -484,7 +560,7 @@ func TestOpenWSBridgesMessagesBothWays(t *testing.T) {
 	var received []string
 	done := make(chan struct{})
 
-	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil, func(id string, data []byte, isText bool) {
+	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil, nil, func(id string, data []byte, isText bool) {
 		mu.Lock()
 		received = append(received, string(data))
 		mu.Unlock()
@@ -549,7 +625,7 @@ func TestOpenWSStripsReservedHandshakeHeaders(t *testing.T) {
 		"Cookie":                   "aw_id_jwt=abc", // a NON-reserved header must still pass through
 	}
 	done := make(chan struct{})
-	err := h.OpenWS(context.Background(), "sess-x", "/ws", reserved, func(id string, data []byte, isText bool) {
+	err := h.OpenWS(context.Background(), "sess-x", "/ws", reserved, nil, func(id string, data []byte, isText bool) {
 		close(done)
 	})
 	if err != nil {
