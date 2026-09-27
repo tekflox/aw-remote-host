@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -20,6 +21,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/tekflox/aw-remote-host/internal/rlog"
 )
 
 // DefaultTarget is the local aw-workspace HTTP server this host bootstrapped
@@ -31,6 +34,37 @@ const DefaultTarget = "http://127.0.0.1:9030"
 // WebSocket/base64 overhead limits without adding real latency.
 const chunkSize = 32 * 1024
 
+// The dial-retry envelope. 127.0.0.1:9030 is not really loopback on a BYOD
+// Mac: the workspace container lives inside the podman-machine VM, so this
+// address is that VM's gvproxy port-forward, and gvproxy drops the odd
+// connection-setup packet. A single dropped SYN used to surface as a hard
+// 502 "upstream unreachable" on the very first occurrence — an app install
+// failing in the browser while the local server was never down at all.
+//
+// Retry lives HERE, at the dial, and nowhere else in this package. A failed
+// net.Dial means no connection exists, therefore no request bytes were
+// written, therefore replaying is provably free of side effects. Retrying
+// one layer up — around client.Do — would also catch "request was fully
+// written and the server processed it, then the connection broke before the
+// response headers came back", and re-issuing that POST would double-install
+// the app. The dial layer gets that proof structurally instead of by comment.
+//
+// The envelope is deliberately sub-second, NOT internal/link's 1s→60s
+// reconnect scale: aw-backend's relay gives this whole exchange 30s total
+// (HTTP_TIMEOUT_S in src/api/routes/workspace_tunnel_proxy.py:195, a hard
+// deadline from send_http_req to the head frame's arrival), and blowing it
+// serves the browser an offline page — strictly worse than the 502. Worst
+// case added here is 3×2s + 50ms + 100ms ≈ 6.15s, leaving ~24s for the real
+// request; the common connection-refused case returns in microseconds, so
+// the realistic cost is the 150ms of sleep.
+const (
+	dialAttempts       = 3 // 1 original + 2 retries
+	dialTimeout        = 2 * time.Second
+	dialBackoffMin     = 50 * time.Millisecond
+	dialBackoffMax     = 200 * time.Millisecond
+	wsHandshakeTimeout = 10 * time.Second
+)
+
 // Handler forwards http_req/ws_open frames to Target — one instance is
 // scoped to a single live /link connection (mirrors shell.Manager), so its
 // ws connection map is torn down wholesale on disconnect via CloseAll.
@@ -38,15 +72,41 @@ type Handler struct {
 	Target string // base URL of the local workspace HTTP server; DefaultTarget if empty
 	Client *http.Client
 
+	// Test seams for the dial-retry envelope above — zero means the const,
+	// same idiom as link.Client's MinBackoff/MaxBackoff. Tests shrink these
+	// so they don't eat real backoff; production never sets them.
+	DialAttempts   int
+	DialTimeout    time.Duration
+	DialBackoffMin time.Duration
+	DialBackoffMax time.Duration
+
+	// dialTCP substitutes the single dial attempt inside dialContext — a
+	// test seam, unexported because only this package's own tests set it.
+	// Per-Handler rather than a package var like internal/vpn's confPresent:
+	// http.Transport abandons an in-flight dial goroutine the moment ctx is
+	// cancelled, so a global would get swapped back underneath a goroutine
+	// that outlives the test which installed it.
+	dialTCP func(ctx context.Context, timeout time.Duration, network, addr string) (net.Conn, error)
+
+	clientOnce sync.Once
+	httpClient *http.Client
+
+	wsDialerOnce sync.Once
+	wsDialerVal  *websocket.Dialer
+
 	mu      sync.Mutex
 	wsConns map[string]*websocket.Conn
 }
 
-// NewHandler builds a Handler targeting DefaultTarget with a sane default
-// HTTP client (no timeout here — long-lived streaming responses are
-// expected; the control plane owns per-request timeouts).
+// NewHandler builds a Handler targeting DefaultTarget. The HTTP client is
+// built lazily by client() so it picks up the retrying dialer — see the
+// dial-retry envelope above, and note that a bare &http.Client{} would
+// inherit http.DefaultTransport's 30s dial timeout, dead-equal to the
+// relay's own 30s budget: a gvproxy hop that blackholes the SYN instead of
+// refusing it would then hang until the control plane gave up first, and no
+// retry would ever run.
 func NewHandler() *Handler {
-	return &Handler{Client: &http.Client{}}
+	return &Handler{}
 }
 
 func (h *Handler) target() string {
@@ -57,10 +117,135 @@ func (h *Handler) target() string {
 }
 
 func (h *Handler) client() *http.Client {
+	// A caller-supplied Client is theirs — respect it, inject nothing.
 	if h.Client != nil {
 		return h.Client
 	}
-	return http.DefaultClient
+	h.clientOnce.Do(func() {
+		// Clone: http.DefaultTransport is process-global, and mutating it
+		// would change dial behaviour for every unrelated caller in this
+		// binary. No Client.Timeout — long-lived streaming responses are
+		// expected; the control plane owns per-request timeouts.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.DialContext = h.dialContext
+		h.httpClient = &http.Client{Transport: tr}
+	})
+	return h.httpClient
+}
+
+// wsDialer is OpenWS's dialer. Handler-owned rather than
+// websocket.DefaultDialer, which is a package global shared with every other
+// gorilla user in the process. HandshakeTimeout is 10s, not the default 45s:
+// 45s outlives the relay's 30s budget, so the control plane gives up first
+// and leaves the dial orphaned.
+func (h *Handler) wsDialer() *websocket.Dialer {
+	h.wsDialerOnce.Do(func() {
+		h.wsDialerVal = &websocket.Dialer{
+			NetDialContext:   h.dialContext,
+			HandshakeTimeout: wsHandshakeTimeout,
+		}
+	})
+	return h.wsDialerVal
+}
+
+func (h *Handler) attempts() int {
+	if h.DialAttempts > 0 {
+		return h.DialAttempts
+	}
+	return dialAttempts
+}
+
+func (h *Handler) perAttemptTimeout() time.Duration {
+	if h.DialTimeout > 0 {
+		return h.DialTimeout
+	}
+	return dialTimeout
+}
+
+func (h *Handler) backoffMin() time.Duration {
+	if h.DialBackoffMin > 0 {
+		return h.DialBackoffMin
+	}
+	return dialBackoffMin
+}
+
+func (h *Handler) backoffMax() time.Duration {
+	if h.DialBackoffMax > 0 {
+		return h.DialBackoffMax
+	}
+	return dialBackoffMax
+}
+
+// realDialTCP is one dial attempt — what dialContext uses unless a test has
+// substituted Handler.dialTCP.
+func realDialTCP(ctx context.Context, timeout time.Duration, network, addr string) (net.Conn, error) {
+	return (&net.Dialer{Timeout: timeout}).DialContext(ctx, network, addr)
+}
+
+// dialContext is the only place in this package a retry may live — see the
+// dial-retry envelope above for why. Returns the LAST dial error unwrapped
+// so ServeHTTP's "upstream unreachable: %v" stays readable.
+func (h *Handler) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	dial := h.dialTCP
+	if dial == nil {
+		dial = realDialTCP
+	}
+	timeout := h.perAttemptTimeout()
+	attempts := h.attempts()
+	backoff := h.backoffMin()
+	maxBackoff := h.backoffMax()
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		conn, err := dial(ctx, timeout, network, addr)
+		if err == nil {
+			if attempt > 1 {
+				// One line, only when a retry actually saved the request —
+				// logging every first-attempt success would be per-request
+				// noise. Without this a hop degrading from "rare blip" to
+				// "failing half the time" would look perfectly healthy.
+				rlog.Printf("tunnelproxy: dial %s recovered on attempt %d/%d (previous failure: %v)\n",
+					addr, attempt, attempts, lastErr)
+			}
+			return conn, nil
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		// sleepBackoff returns false when ctx is done — the caller hung up,
+		// so stop rather than burning the remaining attempts holding a
+		// request goroutine open for nobody.
+		if !sleepBackoff(ctx, backoff) {
+			break
+		}
+		backoff = nextBackoff(backoff, maxBackoff)
+	}
+	return nil, lastErr
+}
+
+// sleepBackoff and nextBackoff mirror internal/link's own (link.go:975,
+// :986) — unexported there, so not importable. Duplicated rather than
+// extracted: internal/vpn already keeps its own backoff constants, so
+// per-package backoff is this repo's idiom, and go.mod is deliberately
+// dependency-light.
+func sleepBackoff(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func nextBackoff(cur, max time.Duration) time.Duration {
+	next := cur * 2
+	if next > max {
+		return max
+	}
+	return next
 }
 
 // ServeHTTP forwards one http_req to the local workspace server and streams
@@ -181,7 +366,7 @@ func (h *Handler) OpenWS(ctx context.Context, id, path string, headers map[strin
 		header.Set(k, v)
 	}
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, u.String(), header)
+	conn, _, err := h.wsDialer().DialContext(ctx, u.String(), header)
 	if err != nil {
 		return fmt.Errorf("dial local workspace ws %s: %w", u.String(), err)
 	}
