@@ -668,6 +668,59 @@ func (h *Handler) guardHostNotAheadOfImage(ctx context.Context, hostDir, image s
 	return fmt.Errorf("host git HEAD %s is ahead of image HEAD %s: refusing sync without force", hostHead, imageHead)
 }
 
+// pruneUnusedImages reclaims disk from accumulated old podman images before
+// Update pulls a new one — the Mac.Home host filled its Podman VM's disk
+// (1398 images, only 9 backing an existing container, 75GB reclaimable) and
+// failed the pull with "no space left on device"; fixed live with `podman
+// image prune -a -f`. That same command is safe to run unattended: podman
+// never removes an image that still backs a container, running or stopped,
+// so the workspace/postgres/redis images currently in use survive untouched
+// and only orphaned images from earlier updates are removed. `-a` is
+// required (not just the dangling-only default) because the accumulation is
+// tagged/digested old versions, not untagged layers.
+//
+// Best-effort: a prune failure is logged and swallowed rather than failing
+// the update, since a full disk is exactly the condition this step exists to
+// prevent and a broken prune must not become a new way to strand an update.
+func (h *Handler) pruneUnusedImages(ctx context.Context, emit Emit) {
+	out, err := h.runner().Run(ctx, "podman", "image", "prune", "-a", "-f")
+	if err != nil {
+		emit("warning", "update", "image prune failed ("+commandError("podman image prune", err, out).Error()+
+			") — continuing with the pull")
+		return
+	}
+	count, reclaimed := parseImagePruneOutput(out)
+	switch {
+	case count == 0:
+		emit("info", "update", "image prune: no unused images to reclaim")
+	case reclaimed != "":
+		emit("info", "update", fmt.Sprintf("image prune: removed %d unused image(s), reclaimed %s", count, reclaimed))
+	default:
+		emit("info", "update", fmt.Sprintf("image prune: removed %d unused image(s)", count))
+	}
+}
+
+// parseImagePruneOutput reads `podman image prune -a -f`'s own output — one
+// deleted image ID per line, followed by a "Total reclaimed space: <size>"
+// summary line, the same shape podman uses (mirroring docker) for every
+// prune subcommand. reclaimed is returned as podman's own formatted string
+// rather than re-parsed into bytes, since round-tripping it through a byte
+// parser and back would just risk disagreeing with what podman printed.
+func parseImagePruneOutput(out string) (count int, reclaimed string) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(line, "Total reclaimed space:"); ok {
+			reclaimed = strings.TrimSpace(rest)
+			continue
+		}
+		count++
+	}
+	return count, reclaimed
+}
+
 // Update pulls the latest aw-workspace image, syncs the baked source tree into
 // the host bind-mount, and recreates the workspace container. Mutable runtime
 // state under .aw-workspace is preserved; source files are replaced so deletes
@@ -700,6 +753,7 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	default:
 		emit("info", "update", "update target resolved to "+image)
 	}
+	h.pruneUnusedImages(ctx, emit)
 	emit("info", "update", "pulling "+image)
 	if out, err := h.runner().Run(ctx, "podman", podmanPullArgs(image)...); err != nil {
 		pullErr := commandError("podman pull "+image, err, out)

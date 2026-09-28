@@ -270,6 +270,91 @@ func TestUpdateScopesPostSyncChownToSyncedEntriesOnly(t *testing.T) {
 	}
 }
 
+// TestUpdatePrunesUnusedImagesBeforePulling is the regression test for the
+// Mac.Home incident: an aw-remote-host Podman VM filled its disk with 1398
+// accumulated images (only 9 backing a container) and failed the workspace
+// image pull with "no space left on device". Update() must now run the
+// equivalent of `podman image prune -a -f` before the pull, and log what it
+// reclaimed.
+func TestUpdatePrunesUnusedImagesBeforePulling(t *testing.T) {
+	stubRunModule(t)
+	useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.on("3fa8ba238bd4a1a5f5c9e0d1234567890abcdef1234567890abcdef12345678\n"+
+		"7c9e196e6ed5a123456789fedcba9876543210fedcba9876543210fedcba98\n\n"+
+		"Total reclaimed space: 74.05GB\n",
+		"podman", "image", "prune", "-a", "-f")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, lines := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, nil, emit); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	pruneIdx, pullIdx := -1, -1
+	for i, call := range r.calls {
+		if len(call) >= 3 && call[0] == "podman" && call[1] == "image" && call[2] == "prune" {
+			pruneIdx = i
+		}
+		if pullIdx == -1 && len(call) >= 2 && call[0] == "podman" && call[1] == "pull" {
+			pullIdx = i
+		}
+	}
+	if pruneIdx == -1 {
+		t.Fatalf("expected a `podman image prune -a -f` call, calls=%v", r.calls)
+	}
+	if pullIdx == -1 || pruneIdx > pullIdx {
+		t.Fatalf("prune must run before the pull, pruneIdx=%d pullIdx=%d calls=%v", pruneIdx, pullIdx, r.calls)
+	}
+
+	found := false
+	for _, l := range *lines {
+		if strings.Contains(l, "info/update") && strings.Contains(l, "removed 2 unused image(s)") &&
+			strings.Contains(l, "reclaimed 74.05GB") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the prune count+bytes to be logged, got lines=%v", *lines)
+	}
+}
+
+// A prune failure (e.g. a podman version that rejects a flag) must not sink
+// the whole update — the pull is what actually matters, and the disk-full
+// condition the prune exists to prevent is not made worse by skipping it.
+func TestUpdatePruneFailureDoesNotBlockThePull(t *testing.T) {
+	stubRunModule(t)
+	useTempState(t)
+	hostDir := t.TempDir()
+	t.Setenv("AW_WORKSPACE_HOST_DIR", hostDir)
+
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	r.fail(fmt.Errorf("exit status 125"), "podman", "image", "prune", "-a", "-f")
+
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir()}}
+	emit, lines := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, nil, emit); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if !r.ran("pull") {
+		t.Fatalf("expected the pull to still run after a failed prune, calls=%v", r.calls)
+	}
+	found := false
+	for _, l := range *lines {
+		if strings.Contains(l, "warning/update") && strings.Contains(l, "image prune failed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a warning/update emit for the failed prune, got lines=%v", *lines)
+	}
+}
+
 // TestUpdateRefusesWhenHostHeadIsAheadOfImage is the regression test for
 // aw-workspace:host-tree-reverted-by-stale-image-sync: Update() used to sync
 // the freshly-pulled image's baked source over the host tree with no check
