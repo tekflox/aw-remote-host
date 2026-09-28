@@ -117,7 +117,9 @@ func (h *Handler) target() string {
 }
 
 func (h *Handler) client() *http.Client {
-	// A caller-supplied Client is theirs — respect it, inject nothing.
+	// A caller-supplied Client is theirs — respect it, inject nothing. It
+	// owns its own redirect policy too, and a proxy's Client must set
+	// CheckRedirect for the reason spelled out below.
 	if h.Client != nil {
 		return h.Client
 	}
@@ -128,7 +130,28 @@ func (h *Handler) client() *http.Client {
 		// expected; the control plane owns per-request timeouts.
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.DialContext = h.dialContext
-		h.httpClient = &http.Client{Transport: tr}
+		h.httpClient = &http.Client{
+			Transport: tr,
+			// A proxy relays a 3xx; it does not chase it. Go's default
+			// policy follows up to 10 redirects, which turned every
+			// redirect the local workspace emitted into a body fetched
+			// here and served under the workspace's OWN origin — the
+			// browser never saw the 302 and never left the origin. That
+			// broke /api/apps/google-workspace-mcp/oauth/start: Google's
+			// consent page arrived as 200 HTML from
+			// api.<slug>.workspace.<domain>, so its own scripts were
+			// blocked by CORS and the sign-in form was inert.
+			//
+			// Worse than wrong: a Location is usually ABSOLUTE and often
+			// off-host, so the default policy had this agent dialling
+			// arbitrary third-party URLs from the user's own machine.
+			// ErrUseLastResponse hands the 3xx back untouched — status
+			// and Location relay through the head frame like any other
+			// response, and the browser does the redirect itself.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	})
 	return h.httpClient
 }

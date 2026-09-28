@@ -116,6 +116,65 @@ func TestServeHTTPNeverRetriesAReceived5xx(t *testing.T) {
 	}
 }
 
+// TestServeHTTPRelaysARedirectInsteadOfFollowingIt — a proxy answers a 3xx by
+// handing it to the browser, never by chasing it itself. Go's http.Client
+// follows up to 10 redirects by DEFAULT, so the bare &http.Client{Transport:
+// tr} this handler used to build silently turned every redirect the local
+// workspace emitted into "fetch the target here, relay its body under the
+// workspace's own origin".
+//
+// Live symptom (2026-09-28, workspace `fredericowu` on host Mac.Home):
+// GET /api/apps/google-workspace-mcp/oauth/start returns a real 302 to
+// accounts.google.com, and the browser received 200 + Google's sign-in HTML
+// served from api.fredericowu.workspace.aw.tekflox.com — so Google's own
+// scripts were blocked by CORS and the page was dead. Nothing was wrong with
+// the app's route; this hop ate the redirect.
+//
+// The off-host leg is the sharp edge: the Location was ABSOLUTE and external,
+// so this agent dialled it from the user's own machine. A proxy that chases
+// arbitrary redirect targets is a request-forgery surface, not just a bug.
+func TestServeHTTPRelaysARedirectInsteadOfFollowingIt(t *testing.T) {
+	var targetCalls atomic.Int32
+	// Stands in for accounts.google.com — a host this hop must never dial.
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html>consent screen</html>"))
+	}))
+	defer target.Close()
+
+	location := target.URL + "/o/oauth2/auth?client_id=x"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("location", location)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	h := fastRetry(&Handler{Target: srv.URL})
+
+	var headStatus int
+	var headHeaders map[string]string
+	var body []byte
+	h.ServeHTTP(context.Background(), "req-1", "GET", "/api/apps/google-workspace-mcp/oauth/start", nil, nil,
+		func(id string, status int, headers map[string]string) { headStatus, headHeaders = status, headers },
+		func(id string, data []byte) { body = append(body, data...) },
+		func(id string) {},
+	)
+
+	if headStatus != http.StatusFound {
+		t.Fatalf("status = %d, want 302 relayed verbatim — the browser must do the redirect, not this hop", headStatus)
+	}
+	if got := headHeaders["Location"]; got != location {
+		t.Fatalf("Location = %q, want %q", got, location)
+	}
+	if got := targetCalls.Load(); got != 0 {
+		t.Fatalf("redirect target was fetched %d time(s), want 0 — this hop must never dial the Location", got)
+	}
+	if strings.Contains(string(body), "consent screen") {
+		t.Fatalf("body = %q, want the 302's own (empty) body, not the redirect target's page", body)
+	}
+}
+
 // TestServeHTTPDoesNotRetryAfterTheRequestWasWritten is the anti-double-install
 // regression, and the whole reason the retry lives at the dial layer instead of
 // around client.Do. The upstream receives the request, runs its side effect,
