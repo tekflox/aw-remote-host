@@ -62,3 +62,45 @@ redis_wait_ready() {
   echo "redis: never answered PONG (last reply: ${reply:-<no answer>})" >&2
   return 1
 }
+
+# redis_aof_corrupted <container>
+#
+# True when <container>'s own log shows the exact string Redis prints for a
+# corrupted append-only file. Confirmed live on aw-hosted-crispal
+# (2026-09-28): a redis whose incr AOF file is unreadable crashes ~100ms
+# after accepting the base RDB on every restart, and since install.sh's own
+# self-heal recreates the container against the SAME bind-mounted data, it
+# crashed again every ~5 minutes forever — see redis_repair_aof for the fix.
+redis_aof_corrupted() {
+  local container="$1"
+  podman logs --tail 50 "$container" 2>&1 | grep -q 'Bad file format reading the append only file'
+}
+
+# redis_repair_aof <container> <data_dir>
+#
+# ONE bounded repair attempt for a redis stuck in the corrupted-AOF crash
+# loop redis_aof_corrupted detects: discards the dead container and moves
+# the WHOLE appendonlydir aside (not just the offending incr file — Redis
+# 7's multi-part AOF manifest would otherwise point at a file that no
+# longer exists and fail differently, not more gracefully) so the caller's
+# own create step starts clean. This redis is documented (see install.sh)
+# as an internal status/reconciliation cache, not user data, so discarding
+# it is an acceptable, fully-unattended-safe recovery — the simpler
+# equivalent of the manual `redis-check-aof --fix` recovery this replaces.
+#
+# Does not retry itself and does not re-create the container — the caller
+# re-runs its own `podman run`, and if THAT still fails, the failure must
+# surface normally (exit 1) instead of looping here too.
+redis_repair_aof() {
+  local container="$1" data_dir="$2"
+  local corrupt_dir
+  corrupt_dir="${data_dir}/appendonlydir.corrupt-$(date +%s)"
+  echo "redis: corrupted AOF detected in $container's log — discarding the container and moving $data_dir/appendonlydir aside"
+  podman rm -f "$container" >/dev/null 2>&1 || true
+  if [ -d "$data_dir/appendonlydir" ]; then
+    mv "$data_dir/appendonlydir" "$corrupt_dir"
+    echo "redis: moved appendonlydir aside to $corrupt_dir"
+  else
+    echo "redis: no appendonlydir present at $data_dir — nothing to move"
+  fi
+}

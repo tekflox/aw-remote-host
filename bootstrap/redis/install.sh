@@ -36,6 +36,18 @@ mapfile -t PUBLISH_ARGS < <(publish_args redis 6379 "${AW_REDIS_PUBLISH:-}")
 # Shared network so the workspace container reaches redis by name.
 ensure_network "$NETWORK_NAME"
 
+# Factored out so the AOF-repair retry below (see redis_wait_ready failure
+# handling at the bottom of this script) runs the exact same invocation as
+# the normal create path, instead of a second copy that could drift from it.
+run_redis_container() {
+  podman run -d \
+    --name "$CONTAINER_NAME" \
+    --network "$NETWORK_NAME" \
+    ${PUBLISH_ARGS[@]+"${PUBLISH_ARGS[@]}"} \
+    -v "$DATA_DIR":"$CONTAINER_DATA_DIR" \
+    "$IMAGE" redis-server --appendonly yes
+}
+
 if podman container exists "$CONTAINER_NAME"; then
   current_src="$(mount_source "$CONTAINER_NAME" "$CONTAINER_DATA_DIR")"
   if [ "$current_src" = "$DATA_DIR" ]; then
@@ -68,12 +80,7 @@ if ! podman container exists "$CONTAINER_NAME"; then
     podman unshare chown -R "${REDIS_UID}:${REDIS_GID}" "$DATA_DIR" 2>/dev/null || true
   fi
 
-  podman run -d \
-    --name "$CONTAINER_NAME" \
-    --network "$NETWORK_NAME" \
-    ${PUBLISH_ARGS[@]+"${PUBLISH_ARGS[@]}"} \
-    -v "$DATA_DIR":"$CONTAINER_DATA_DIR" \
-    "$IMAGE" redis-server --appendonly yes
+  run_redis_container
 fi
 
 echo "redis: waiting for readiness..."
@@ -86,6 +93,24 @@ source "$SCRIPT_DIR/../lib/redis_ready.sh"
 if redis_wait_ready "$CONTAINER_NAME" 120; then
   echo "redis: ready ($DATA_DIR)"
   exit 0
+fi
+
+# A corrupted AOF (2026-09-28 aw-hosted-crispal incident) makes redis crash
+# every time it's restarted against the same bind-mounted data — without
+# this, self-heal's normal every-5-minute retry just discards and recreates
+# the container forever against the SAME corrupted file. One bounded repair
+# attempt here breaks that loop; if it still doesn't come up afterwards,
+# fall through to the same exit 1 as any other non-AOF failure rather than
+# retrying the repair itself.
+if redis_aof_corrupted "$CONTAINER_NAME"; then
+  redis_repair_aof "$CONTAINER_NAME" "$DATA_DIR"
+  run_redis_container
+  if redis_wait_ready "$CONTAINER_NAME" 120; then
+    echo "redis: ready after AOF repair ($DATA_DIR)"
+    exit 0
+  fi
+  echo "redis: still not ready after AOF repair — giving up" >&2
+  exit 1
 fi
 
 echo "redis: did not become ready in time" >&2
