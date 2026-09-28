@@ -782,6 +782,126 @@ func TestRegisterFrameCarriesCapsOnReconnectToo(t *testing.T) {
 	}
 }
 
+// A host with a LANAddrsFunc configured must report its current addresses
+// on every register (including reconnects — see registerFrame's doc on
+// reading it live rather than from a stale snapshot), gated behind the
+// net_advertise Caps entry so an un-upgraded control plane simply never
+// gets the frame at all rather than choking on an unknown field.
+func TestRegisterFrameCarriesLANAddrs(t *testing.T) {
+	c := &Client{ControlPlane: "https://example.test"}
+	c.LANAddrsFunc = func() []string { return []string{"192.168.1.5", "10.0.0.7"} }
+	c.LANHTTPSPort = 8443
+	frame := c.registerFrame()
+
+	addrs, ok := frame["lan_addrs"].([]string)
+	if !ok || len(addrs) != 2 || addrs[0] != "192.168.1.5" || addrs[1] != "10.0.0.7" {
+		t.Fatalf("lan_addrs = %v", frame["lan_addrs"])
+	}
+	if frame["lan_https_port"] != 8443 {
+		t.Fatalf("lan_https_port = %v", frame["lan_https_port"])
+	}
+	caps, _ := frame["caps"].([]string)
+	found := false
+	for _, cap := range caps {
+		if cap == "net_advertise" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("caps must advertise net_advertise, got %v", caps)
+	}
+}
+
+// A host that cannot currently measure any private address (no
+// LANAddrsFunc, or one that returns nothing) must OMIT lan_addrs rather
+// than send an empty list — unlike host_power, an empty LAN address list is
+// not a real state to overwrite a previously-known-good one with (see
+// registerFrame's comment on this).
+func TestRegisterFrameOmitsLANAddrsWhenUnavailable(t *testing.T) {
+	c := &Client{ControlPlane: "https://example.test"}
+	frame := c.registerFrame()
+	if _, ok := frame["lan_addrs"]; ok {
+		t.Fatalf("expected no lan_addrs key with LANAddrsFunc unset, got %v", frame["lan_addrs"])
+	}
+
+	c.LANAddrsFunc = func() []string { return nil }
+	frame = c.registerFrame()
+	if _, ok := frame["lan_addrs"]; ok {
+		t.Fatalf("expected no lan_addrs key when LANAddrsFunc returns empty, got %v", frame["lan_addrs"])
+	}
+}
+
+// TestNetAdvertiseSentOnLANAddrChangeWhileConnected is the regression test
+// for the actual production bug this feature exists to fix: a host whose
+// LAN IP changes (DHCP lease renewal, a Wi-Fi network switch) without the
+// WebSocket itself dropping used to have no way at all to tell the control
+// plane — the register frame only fires at connect/reconnect. The poller
+// must notice the change and push an unsolicited net_advertise frame.
+func TestNetAdvertiseSentOnLANAddrChangeWhileConnected(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	var mu sync.Mutex
+	addrs := []string{"192.168.1.5"}
+	c := New(ts.URL, "awbs_test")
+	c.LANAddrsFunc = func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), addrs...)
+	}
+	c.LANHTTPSPort = 8443
+	c.LANAddrsPollInterval = 20 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, filepath.Join(t.TempDir(), "credentials.json"), RunCallbacks{
+			OnRegistered: func(reply *RegisteredReply) {
+				// Change the address only after the connection is live, so
+				// the register frame's own (correct) report of .5 doesn't
+				// race the poller's baseline read.
+				go func() {
+					time.Sleep(50 * time.Millisecond)
+					mu.Lock()
+					addrs = []string{"192.168.1.73"}
+					mu.Unlock()
+				}()
+			},
+		})
+	}()
+
+	deadline := time.After(1500 * time.Millisecond)
+	for {
+		srv.mu.Lock()
+		frames := append([]map[string]any(nil), srv.receivedFrames...)
+		srv.mu.Unlock()
+		found := false
+		for _, f := range frames {
+			if f["op"] != "net_advertise" {
+				continue
+			}
+			got, _ := f["lan_addrs"].([]any)
+			if len(got) == 1 && got[0] == "192.168.1.73" && f["lan_https_port"] == float64(8443) {
+				found = true
+			}
+		}
+		if found {
+			cancel()
+			<-done
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("no net_advertise frame with the changed address arrived; received: %+v", frames)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // TestConnectFailsWithinReadTimeoutWhenServerNeverRepliesToRegister is the
 // regression test for the confirmed crispal production incident: a server
 // that accepts the WebSocket upgrade but never writes the "registered"

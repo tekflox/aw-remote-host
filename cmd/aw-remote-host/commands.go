@@ -570,6 +570,13 @@ func runLinkOrBootstrap(cmdName string, args []string, allowProvision bool) erro
 	// (the default everywhere else, including a plain developer `link`)
 	// leaves HeartbeatFile disabled.
 	c.HeartbeatFile = strings.TrimSpace(os.Getenv("AW_REMOTE_HOST_HEARTBEAT_FILE"))
+	// Reported on every register and polled while connected (see
+	// link.Client.LANAddrsFunc) regardless of AW_LAN_FASTPATH_DISABLE — that
+	// flag only turns off the local TLS terminator below; whether the
+	// control plane ever PUBLISHES this address is a separate, per-workspace
+	// consent decision it owns (dns_publication.py's kind="lan" gate).
+	c.LANAddrsFunc = lanfastpath.LANAddrs
+	c.LANHTTPSPort = resolveLANFastPathPort()
 	c.Info = link.RegisterInfo{
 		Hostname:           hostname,
 		OS:                 runtime.GOOS,
@@ -841,6 +848,20 @@ func bootstrapWorkspaceSelfHeal(ctx context.Context, m *bootstrap.Manifest, opts
 	}
 }
 
+// resolveLANFastPathPort reads AW_LAN_FASTPATH_PORT, falling back to
+// lanfastpath.DefaultPort — shared by the terminator (startLANFastPath) and
+// the LAN address advertised over /link, which must name the SAME port the
+// terminator actually binds.
+func resolveLANFastPathPort() int {
+	port := lanfastpath.DefaultPort
+	if v := os.Getenv("AW_LAN_FASTPATH_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 {
+			port = p
+		}
+	}
+	return port
+}
+
 // startLANFastPath boots the LAN fast-path TLS terminator (case a) in the
 // background if the per-workspace cert+key have been delivered. Absent cert
 // (control-plane hasn't pushed it yet) is not an error — the workspace stays
@@ -856,12 +877,7 @@ func startLANFastPath(ctx context.Context, slug string) {
 		rlog.Printf("lan-fastpath: no cert at %s yet — local bypass off, tunnel path unaffected\n", certFile)
 		return
 	}
-	port := lanfastpath.DefaultPort
-	if v := os.Getenv("AW_LAN_FASTPATH_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil && p > 0 {
-			port = p
-		}
-	}
+	port := resolveLANFastPathPort()
 	if addrs := lanfastpath.LANAddrs(); len(addrs) > 0 {
 		rlog.Printf("lan-fastpath: LAN addrs %s — serving https :%d -> %s\n", strings.Join(addrs, ","), port, lanfastpath.DefaultTarget)
 	} else {

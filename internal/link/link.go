@@ -191,6 +191,24 @@ type Client struct {
 	// see resilience:hosted-entrypoint-signal-and-hang-supervision — or it
 	// will kill a link that is merely idle, which is worse than the bug.
 	HeartbeatFile string
+
+	// LANAddrsFunc, when set, provides this host's current private IPv4
+	// addresses on demand (see internal/lanfastpath.LANAddrs). Injected as a
+	// func rather than this package importing lanfastpath directly, so a
+	// generic /link client carries no dependency on the LAN fast-path
+	// feature. Read fresh at every register frame (so a reconnect never
+	// reports a stale value captured at process start) and polled every
+	// LANAddrsPollInterval for as long as a connection stays live — most LAN
+	// IP changes (a DHCP lease renewal, joining a different Wi-Fi network)
+	// never themselves drop the WebSocket and so would never reach the
+	// control plane if only the register frame carried them. nil disables
+	// LAN address reporting entirely (e.g. a lean/Windows link).
+	LANAddrsFunc func() []string
+	// LANHTTPSPort is the local LAN fast-path terminator's port, sent
+	// alongside lan_addrs so the control plane can publish it — 0 omits it.
+	LANHTTPSPort int
+	// LANAddrsPollInterval bounds the poller above; default 30s.
+	LANAddrsPollInterval time.Duration
 }
 
 // defaultRegisterReadTimeout / defaultPumpReadTimeout are the production
@@ -217,6 +235,16 @@ func (c *Client) pumpReadTimeout() time.Duration {
 		return c.PumpReadTimeout
 	}
 	return defaultPumpReadTimeout
+}
+
+// defaultLANAddrsPollInterval backs LANAddrsPollInterval above.
+const defaultLANAddrsPollInterval = 30 * time.Second
+
+func (c *Client) lanAddrsPollInterval() time.Duration {
+	if c.LANAddrsPollInterval > 0 {
+		return c.LANAddrsPollInterval
+	}
+	return defaultLANAddrsPollInterval
 }
 
 // New builds a Client from the CLI's --control-plane and --token flags.
@@ -295,6 +323,7 @@ func (c *Client) dial(ctx context.Context, token string) (*websocket.Conn, error
 // Append-only, and never remove an entry without removing the behaviour.
 var Caps = []string{
 	"ws_open_ok",
+	"net_advertise",
 }
 
 func (c *Client) registerFrame() map[string]any {
@@ -340,6 +369,21 @@ func (c *Client) registerFrame() map[string]any {
 		frame["container_form"] = true
 		if c.Info.ContainerID != "" {
 			frame["container_id"] = c.Info.ContainerID
+		}
+	}
+	// Read live, not from a value captured at process start: registerFrame
+	// runs on every register including reconnects, and a stale snapshot here
+	// would reproduce the exact bug this exists to fix (see net_advertise
+	// frame doc below). Omitted when unmeasurable or empty — a host with no
+	// private address right now (e.g. still coming up) must not overwrite a
+	// previously-known-good one with an empty list; the poller and future
+	// registers will report it once there is something to report.
+	if c.LANAddrsFunc != nil {
+		if addrs := c.LANAddrsFunc(); len(addrs) > 0 {
+			frame["lan_addrs"] = addrs
+			if c.LANHTTPSPort > 0 {
+				frame["lan_https_port"] = c.LANHTTPSPort
+			}
 		}
 	}
 	return frame
@@ -589,7 +633,7 @@ func (c *Client) Run(ctx context.Context, credentialsPath string, cb RunCallback
 			cb.OnRegistered(result.Reply)
 		}
 
-		pumpErr := pump(ctx, result.Conn, c.pumpReadTimeout(), c.HeartbeatFile, cb.OnCommand, cb.OnShell, cb.OnTunnelProxy)
+		pumpErr := pump(ctx, result.Conn, c.pumpReadTimeout(), c.HeartbeatFile, cb.OnCommand, cb.OnShell, cb.OnTunnelProxy, c.LANAddrsFunc, c.LANHTTPSPort, c.lanAddrsPollInterval())
 		result.Conn.Close()
 		if cb.OnDisconnect != nil {
 			cb.OnDisconnect(pumpErr)
@@ -634,7 +678,7 @@ func (w *frameWriter) WriteJSON(v any) error {
 // hangs, or the TCP path dies with no FIN/RST — surfaces as a read error
 // (and this function returning) within readTimeout instead of blocking
 // forever and starving Run's reconnect/backoff loop of its next iteration.
-func pump(ctx context.Context, conn *websocket.Conn, readTimeout time.Duration, heartbeatFile string, handler CommandHandler, newShell NewShellManagerFunc, newTunnelProxy NewTunnelProxyFunc) error {
+func pump(ctx context.Context, conn *websocket.Conn, readTimeout time.Duration, heartbeatFile string, handler CommandHandler, newShell NewShellManagerFunc, newTunnelProxy NewTunnelProxyFunc, lanAddrsFunc func() []string, lanHTTPSPort int, lanAddrsPollInterval time.Duration) error {
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -646,6 +690,10 @@ func pump(ctx context.Context, conn *websocket.Conn, readTimeout time.Duration, 
 	}()
 
 	fw := &frameWriter{conn: conn}
+
+	if lanAddrsFunc != nil {
+		go pollLANAddrs(stop, fw, lanAddrsFunc, lanHTTPSPort, lanAddrsPollInterval)
+	}
 
 	var shellMgr ShellManager
 	if newShell != nil {
@@ -705,6 +753,52 @@ func pump(ctx context.Context, conn *websocket.Conn, readTimeout time.Duration, 
 			handleTCPClose(msg, proxy)
 		}
 	}
+}
+
+// pollLANAddrs re-checks get() every interval for as long as stop is open,
+// and pushes an unsolicited {"op":"net_advertise"} frame whenever the result
+// differs from the last poll — the register frame alone only reports what
+// was true at CONNECT time (see LANAddrsFunc doc), and most LAN IP changes
+// never themselves drop the WebSocket. The first tick establishes a
+// baseline without sending: it fires ~one interval after the register frame
+// already reported the address, so re-announcing an unchanged value here
+// would just be noise.
+func pollLANAddrs(stop <-chan struct{}, fw *frameWriter, get func() []string, port int, interval time.Duration) {
+	if interval <= 0 {
+		interval = defaultLANAddrsPollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	last := get()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			cur := get()
+			if lanAddrsEqual(last, cur) {
+				continue
+			}
+			last = cur
+			frame := map[string]any{"op": "net_advertise", "lan_addrs": cur}
+			if port > 0 {
+				frame["lan_https_port"] = port
+			}
+			_ = fw.WriteJSON(frame)
+		}
+	}
+}
+
+func lanAddrsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // touchHeartbeat updates path's mtime to now, creating it on the first call.
