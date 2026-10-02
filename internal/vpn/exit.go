@@ -120,6 +120,16 @@ var egressEndpoints = []egressEndpoint{
 	{URL: "https://icanhazip.com"},
 }
 
+// privateIPv4Blocks is excluded on every PlanExclusions call, unconditionally
+// — see the loop in PlanExclusions that adds them for why. RFC1918 plus
+// link-local, not a tenant-specific guess at which private ranges matter.
+var privateIPv4Blocks = []string{
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+}
+
 // isHostEgressProbeAddress reports whether an address is one this host reaches
 // BY IP LITERAL to measure its own public address.
 //
@@ -323,6 +333,21 @@ func PlanExclusions(controlPlane string, locals []LocalPrefix, extra []string, r
 	for _, l := range locals {
 		add(l.Prefix, "directly attached network on "+l.Iface+" (LAN prefix / container bridge) — container-to-LAN and container-to-container traffic must not enter the tunnel")
 	}
+
+	// Private IPv4 space is excluded unconditionally, independent of what
+	// this host happens to have an interface on. The 2026-10-02 incident is
+	// why: the warm-pool Redis an exit gate swept into the tunnel sat on a
+	// THIRD docker network (172.18.0.0/16) that was neither an interface on
+	// the gate host nor a route in its table — reachability rode the default
+	// route into the bare metal's own inter-bridge forwarding, which makes it
+	// structurally invisible to LocalPrefixes() no matter how that sweep is
+	// widened. An exit gate carries INTERNET egress; a destination in
+	// private address space never belongs in the tunnel — it either resolves
+	// on this host's own path already, or it was never reachable at all.
+	for _, p := range privateIPv4Blocks {
+		add(p, "private address space — an exit gate carries internet egress; private destinations stay on this host's own path")
+	}
+
 	for _, raw := range extra {
 		prefix := strings.TrimSpace(raw)
 		if prefix == "" {

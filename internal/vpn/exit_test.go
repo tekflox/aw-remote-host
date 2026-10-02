@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 )
@@ -83,7 +84,8 @@ func TestPlanExclusionsPinsControlPlaneFirst(t *testing.T) {
 	if plan.ControlPlaneHost != "api.aw.tekflox.com" {
 		t.Fatalf("host = %q", plan.ControlPlaneHost)
 	}
-	if len(plan.Exclusions) != 3 {
+	// control plane + the 2 locals + the 4 built-in private-space blocks.
+	if len(plan.Exclusions) != 7 {
 		t.Fatalf("exclusions = %+v", plan.Exclusions)
 	}
 	// First, and said out loud: this ordering is what a human reads off
@@ -100,9 +102,12 @@ func TestPlanExclusionsPinsControlPlaneFirst(t *testing.T) {
 	if !strings.Contains(plan.Exclusions[0].Reason, "this host's own path rather than through the gate") {
 		t.Fatalf("reason = %q", plan.Exclusions[0].Reason)
 	}
-	for _, e := range plan.Exclusions[1:] {
-		if !strings.Contains(e.Reason, "container-to-LAN") {
-			t.Fatalf("an attached-network exclusion must justify itself as container traffic, got %q", e.Reason)
+	// The locals, specifically — not "everything after the first", because
+	// the private-space defaults now sit among them and justify themselves
+	// differently (checked below).
+	for _, l := range locals {
+		if !strings.Contains(exclusionFor(t, plan, l.Prefix).Reason, "container-to-LAN") {
+			t.Fatalf("an attached-network exclusion must justify itself as container traffic, got %+v", exclusionFor(t, plan, l.Prefix))
 		}
 	}
 	// The podman subnet and the LAN prefix, the two the card names
@@ -112,6 +117,70 @@ func TestPlanExclusionsPinsControlPlaneFirst(t *testing.T) {
 			t.Fatalf("%s missing from %+v", want, plan.Exclusions)
 		}
 	}
+}
+
+// The default exclusions are unconditional: every PlanExclusions call carries
+// all of RFC1918 plus link-local, whether or not a local interface sits on
+// any of it.
+func TestPlanExclusionsAlwaysExcludesPrivateSpace(t *testing.T) {
+	plan, err := PlanExclusions("https://api.aw.tekflox.com", nil, nil, staticResolver("65.109.66.88"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range privateIPv4Blocks {
+		e := exclusionFor(t, plan, want)
+		if !strings.Contains(e.Reason, "an exit gate carries internet egress") {
+			t.Fatalf("%s reason = %q", want, e.Reason)
+		}
+	}
+}
+
+// REGRESSION, named for the incident: 2026-10-02, selecting an exit gate on
+// aw-host swept the warm-pool Redis at 172.18.0.1:6379 — on a THIRD docker
+// network, neither an interface on the gate host nor a route in its table —
+// into the tunnel. tailscale's ACL rejected it 310 times over a 28-minute
+// outage, which is exactly "the workspace's runners are unreachable". That
+// address is structurally invisible to LocalPrefixes(); only an unconditional
+// private-space exclusion covers it.
+func TestPlanExclusionsCoversTheWarmPoolRedisOutageOf20261002(t *testing.T) {
+	plan, err := PlanExclusions("https://api.aw.tekflox.com", nil, nil, staticResolver("65.109.66.88"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !planCoversIP(t, plan, "172.18.0.1") {
+		t.Fatalf("172.18.0.1 (the warm-pool Redis from the 2026-10-02 outage) is not covered by any exclusion: %+v", plan.Exclusions)
+	}
+}
+
+// exclusionFor finds the exclusion for an exact prefix, failing the test if
+// it is missing — the lookup half of hasPrefix, for callers that then want to
+// assert something about the Reason rather than just presence.
+func exclusionFor(t *testing.T, p ExclusionPlan, prefix string) Exclusion {
+	t.Helper()
+	for _, e := range p.Exclusions {
+		if e.Prefix == prefix {
+			return e
+		}
+	}
+	t.Fatalf("%s missing from %+v", prefix, p.Exclusions)
+	return Exclusion{}
+}
+
+// planCoversIP reports whether any exclusion's CIDR contains ip — the test
+// doubles as a check that the exclusion is a real, parseable CIDR.
+func planCoversIP(t *testing.T, p ExclusionPlan, ip string) bool {
+	t.Helper()
+	target := net.ParseIP(ip)
+	for _, e := range p.Exclusions {
+		_, ipnet, err := net.ParseCIDR(e.Prefix)
+		if err != nil {
+			t.Fatalf("exclusion %q is not a parseable CIDR: %v", e.Prefix, err)
+		}
+		if ipnet.Contains(target) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPlanExclusionsAcceptsABareControlPlaneAddress(t *testing.T) {

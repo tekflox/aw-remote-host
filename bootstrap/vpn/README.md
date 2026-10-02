@@ -106,6 +106,40 @@ actually resolves to.
 > container-scoped path is a change in *that* repo, not this one. Until it is
 > lifted the UI path stays closed and the CLI / `/link` verb are the ways in.
 
+## The second invariant: private space never enters the tunnel
+
+This is the correction of 2026-10-02. A gate selected on `aw-host` swept the
+workspace's own warm-pool Redis (`172.18.0.1:6379`, on a *third* docker
+network — neither an interface on `aw-host` nor a route in its table,
+reachable only through the bare metal's own inter-bridge forwarding) into the
+tunnel. tailscale's ACL rejected the flow outright, 310 times over a real
+28-minute window — the "workspace's runners unreachable" incident.
+
+`LocalPrefixes()` could never have caught this one: it sweeps interfaces, and
+this address was on none of this host's. Discovering every docker network on
+the physical machine a gate host happens to share hardware with is not a
+fixable gap in that sweep — it is a different, unbounded problem, and the next
+missing network would just be the same outage again under a different IP.
+
+So `PlanExclusions` (`internal/vpn/exit.go`) now excludes all of IPv4 private
+address space unconditionally, independent of what this host is attached to:
+
+- `10.0.0.0/8`
+- `172.16.0.0/12`
+- `192.168.0.0/16`
+- `169.254.0.0/16`
+
+The principle: an exit gate exists to carry **internet** egress. A destination
+in private address space never belongs in the tunnel — it either resolves on
+this host's own path already, or it was never reachable in the first place.
+These ride the same `to <prefix> lookup main` mechanism as every other
+exclusion, at the same priority, so nothing about the routing model changes —
+only what is in the list.
+
+`LocalPrefixes()` is not retired by this. It still protects a directly
+attached **public** prefix, which the private blocks do not cover, and the
+exact-prefix dedup means the two never conflict.
+
 ## Offering a node that is already on the mesh
 
 `--advertise-exit-node` above is an ENROLMENT flag: it decides, once, at the
