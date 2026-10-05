@@ -277,8 +277,8 @@ func nextBackoff(cur, max time.Duration) time.Duration {
 // rationale as handleCmd/handlePTYOpen: a slow upstream must never block the
 // read loop that keeps the liveness ping/pong alive.
 func (h *Handler) ServeHTTP(
-	ctx context.Context, id, method, path string, headers map[string]string, body []byte,
-	head func(id string, status int, headers map[string]string),
+	ctx context.Context, id, method, path string, headers http.Header, body []byte,
+	head func(id string, status int, headers http.Header),
 	chunk func(id string, data []byte),
 	end func(id string),
 ) {
@@ -289,12 +289,15 @@ func (h *Handler) ServeHTTP(
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target, reqBody)
 	if err != nil {
-		head(id, http.StatusBadGateway, map[string]string{"content-type": "text/plain"})
+		head(id, http.StatusBadGateway, http.Header{"Content-Type": []string{"text/plain"}})
 		chunk(id, []byte(fmt.Sprintf("bad request: %v", err)))
 		end(id)
 		return
 	}
-	for k, v := range headers {
+	for k, vs := range headers {
+		if len(vs) == 0 {
+			continue
+		}
 		// Go's http.Client reads the outgoing wire "Host:" from req.Host
 		// (falling back to req.URL.Host), never from req.Header — setting
 		// it here via req.Header.Set would be silently discarded when the
@@ -305,27 +308,34 @@ func (h *Handler) ServeHTTP(
 		// (<app_id>.app.<slug>...) apart from its own API/SPA hosts; that
 		// only works end-to-end if this hop actually sets req.Host instead
 		// of leaving it defaulted to the 127.0.0.1 target.
+		//
+		// Host is single-valued by definition, so the last value wins here
+		// exactly as .Set did before headers became multi-valued.
 		if strings.EqualFold(k, "host") {
-			req.Host = v
+			req.Host = vs[len(vs)-1]
 			continue
 		}
-		req.Header.Set(k, v)
+		// .Add, not .Set: a request name carrying several values (Cookie,
+		// Accept-Encoding, X-Forwarded-For) must reach the upstream with all
+		// of them, not just the last.
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
 	}
 
 	resp, err := h.client().Do(req)
 	if err != nil {
-		head(id, http.StatusBadGateway, map[string]string{"content-type": "text/plain"})
+		head(id, http.StatusBadGateway, http.Header{"Content-Type": []string{"text/plain"}})
 		chunk(id, []byte(fmt.Sprintf("upstream unreachable: %v", err)))
 		end(id)
 		return
 	}
 	defer resp.Body.Close()
 
-	respHeaders := make(map[string]string, len(resp.Header))
-	for k := range resp.Header {
-		respHeaders[k] = resp.Header.Get(k)
-	}
-	head(id, resp.StatusCode, respHeaders)
+	// Clone, not the live map: resp.Header must stay owned by the response
+	// whose body we are still reading below, and the callback hands this to
+	// link.go's frame encoder on another goroutine.
+	head(id, resp.StatusCode, resp.Header.Clone())
 
 	buf := make([]byte, chunkSize)
 	for {
@@ -371,7 +381,7 @@ func normalizePath(path string) string {
 // no promise about when a newly spawned goroutine gets scheduled relative to
 // its parent, so an ack written from there could arrive after a message it
 // was supposed to precede.
-func (h *Handler) OpenWS(ctx context.Context, id, path string, headers map[string]string, onOpen func(), sendMsg func(id string, data []byte, isText bool)) error {
+func (h *Handler) OpenWS(ctx context.Context, id, path string, headers http.Header, onOpen func(), sendMsg func(id string, data []byte, isText bool)) error {
 	target := strings.TrimRight(h.target(), "/") + normalizePath(path)
 	wsURL := strings.Replace(target, "http://", "ws://", 1)
 	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
@@ -382,7 +392,7 @@ func (h *Handler) OpenWS(ctx context.Context, id, path string, headers map[strin
 	}
 
 	header := http.Header{}
-	for k, v := range headers {
+	for k, vs := range headers {
 		// Strip the reserved handshake headers gorilla's dialer sets itself —
 		// forwarding the browser's verbatim (relayed through the /link tunnel)
 		// makes DialContext fail "duplicate header not allowed" (notably
@@ -395,7 +405,12 @@ func (h *Handler) OpenWS(ctx context.Context, id, path string, headers map[strin
 			strings.EqualFold(k, "sec-websocket-protocol") {
 			continue
 		}
-		header.Set(k, v)
+		// .Add per value — same reason as the ServeHTTP request loop. The
+		// forbidden-list guard above still runs once per NAME, so a reserved
+		// header is dropped whole however many values it arrived with.
+		for _, v := range vs {
+			header.Add(k, v)
+		}
 	}
 
 	conn, _, err := h.wsDialer().DialContext(ctx, u.String(), header)
