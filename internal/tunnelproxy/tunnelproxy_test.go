@@ -61,7 +61,7 @@ func TestServeHTTPRetriesATransientDialFailure(t *testing.T) {
 	var body []byte
 	ended := false
 	h.ServeHTTP(context.Background(), "req-1", "GET", "/", nil, nil,
-		func(id string, status int, headers map[string]string) { headStatus = status },
+		func(id string, status int, headers http.Header) { headStatus = status },
 		func(id string, data []byte) { body = append(body, data...) },
 		func(id string) { ended = true },
 	)
@@ -100,7 +100,7 @@ func TestServeHTTPNeverRetriesAReceived5xx(t *testing.T) {
 	var headStatus int
 	var body []byte
 	h.ServeHTTP(context.Background(), "req-1", "POST", "/api/apps/install", nil, []byte(`{"app":"x"}`),
-		func(id string, status int, headers map[string]string) { headStatus = status },
+		func(id string, status int, headers http.Header) { headStatus = status },
 		func(id string, data []byte) { body = append(body, data...) },
 		func(id string) {},
 	)
@@ -153,10 +153,10 @@ func TestServeHTTPRelaysARedirectInsteadOfFollowingIt(t *testing.T) {
 	h := fastRetry(&Handler{Target: srv.URL})
 
 	var headStatus int
-	var headHeaders map[string]string
+	var headHeaders http.Header
 	var body []byte
 	h.ServeHTTP(context.Background(), "req-1", "GET", "/api/apps/google-workspace-mcp/oauth/start", nil, nil,
-		func(id string, status int, headers map[string]string) { headStatus, headHeaders = status, headers },
+		func(id string, status int, headers http.Header) { headStatus, headHeaders = status, headers },
 		func(id string, data []byte) { body = append(body, data...) },
 		func(id string) {},
 	)
@@ -164,7 +164,7 @@ func TestServeHTTPRelaysARedirectInsteadOfFollowingIt(t *testing.T) {
 	if headStatus != http.StatusFound {
 		t.Fatalf("status = %d, want 302 relayed verbatim — the browser must do the redirect, not this hop", headStatus)
 	}
-	if got := headHeaders["Location"]; got != location {
+	if got := headHeaders.Get("Location"); got != location {
 		t.Fatalf("Location = %q, want %q", got, location)
 	}
 	if got := targetCalls.Load(); got != 0 {
@@ -200,7 +200,7 @@ func TestServeHTTPDoesNotRetryAfterTheRequestWasWritten(t *testing.T) {
 	var headStatus int
 	ended := false
 	h.ServeHTTP(context.Background(), "req-1", "POST", "/api/apps/install", nil, []byte(`{"app":"x"}`),
-		func(id string, status int, headers map[string]string) { headStatus = status },
+		func(id string, status int, headers http.Header) { headStatus = status },
 		func(id string, data []byte) {},
 		func(id string) { ended = true },
 	)
@@ -229,7 +229,7 @@ func TestServeHTTPGivesUpAfterMaxAttempts(t *testing.T) {
 	var body []byte
 	ended := false
 	h.ServeHTTP(context.Background(), "req-1", "GET", "/", nil, nil,
-		func(id string, status int, headers map[string]string) { headStatus = status },
+		func(id string, status int, headers http.Header) { headStatus = status },
 		func(id string, data []byte) { body = append(body, data...) },
 		func(id string) { ended = true },
 	)
@@ -276,7 +276,7 @@ func TestServeHTTPRetryStopsOnContextCancellation(t *testing.T) {
 	ended := false
 	start := time.Now()
 	h.ServeHTTP(ctx, "req-1", "GET", "/", nil, nil,
-		func(id string, status int, headers map[string]string) { headStatus = status },
+		func(id string, status int, headers http.Header) { headStatus = status },
 		func(id string, data []byte) {},
 		func(id string) { ended = true },
 	)
@@ -484,12 +484,12 @@ func TestServeHTTPStreamsHeadChunksAndEnd(t *testing.T) {
 	h := &Handler{Target: srv.URL}
 
 	var headStatus int
-	var headHeaders map[string]string
+	var headHeaders http.Header
 	var chunks [][]byte
 	ended := false
 
-	h.ServeHTTP(context.Background(), "req-1", "GET", "/dashboard", map[string]string{"X-Test": "yes"}, nil,
-		func(id string, status int, headers map[string]string) {
+	h.ServeHTTP(context.Background(), "req-1", "GET", "/dashboard", http.Header{"X-Test": []string{"yes"}}, nil,
+		func(id string, status int, headers http.Header) {
 			if id != "req-1" {
 				t.Errorf("head: id = %q, want req-1", id)
 			}
@@ -513,8 +513,8 @@ func TestServeHTTPStreamsHeadChunksAndEnd(t *testing.T) {
 	if headStatus != http.StatusOK {
 		t.Fatalf("status = %d, want 200", headStatus)
 	}
-	if headHeaders["Content-Type"] != "text/plain" {
-		t.Fatalf("content-type = %q", headHeaders["Content-Type"])
+	if headHeaders.Get("Content-Type") != "text/plain" {
+		t.Fatalf("content-type = %q", headHeaders.Get("Content-Type"))
 	}
 	var body []byte
 	for _, c := range chunks {
@@ -534,7 +534,7 @@ func TestServeHTTPUpstreamUnreachableIs502(t *testing.T) {
 	var headStatus int
 	ended := false
 	h.ServeHTTP(context.Background(), "req-1", "GET", "/", nil, nil,
-		func(id string, status int, headers map[string]string) { headStatus = status },
+		func(id string, status int, headers http.Header) { headStatus = status },
 		func(id string, data []byte) {},
 		func(id string) { ended = true },
 	)
@@ -557,7 +557,7 @@ func TestServeHTTPForwardsRequestBody(t *testing.T) {
 
 	h := &Handler{Target: srv.URL}
 	h.ServeHTTP(context.Background(), "req-1", "POST", "/", nil, []byte("payload"),
-		func(string, int, map[string]string) {}, func(string, []byte) {}, func(string) {},
+		func(string, int, http.Header) {}, func(string, []byte) {}, func(string) {},
 	)
 
 	if string(receivedBody) != "payload" {
@@ -581,11 +581,11 @@ func TestServeHTTPSetsRequestHostFromHeaders(t *testing.T) {
 	defer srv.Close()
 
 	h := &Handler{Target: srv.URL}
-	h.ServeHTTP(context.Background(), "req-1", "GET", "/", map[string]string{
-		"Host":    "signoz.app.acme.workspace.aw.tekflox.com",
-		"X-Other": "kept",
+	h.ServeHTTP(context.Background(), "req-1", "GET", "/", http.Header{
+		"Host":    []string{"signoz.app.acme.workspace.aw.tekflox.com"},
+		"X-Other": []string{"kept"},
 	}, nil,
-		func(string, int, map[string]string) {}, func(string, []byte) {}, func(string) {},
+		func(string, int, http.Header) {}, func(string, []byte) {}, func(string) {},
 	)
 
 	if gotHost != "signoz.app.acme.workspace.aw.tekflox.com" {
@@ -673,15 +673,15 @@ func TestOpenWSStripsReservedHandshakeHeaders(t *testing.T) {
 	defer srv.Close()
 
 	h := &Handler{Target: srv.URL}
-	reserved := map[string]string{
-		"Sec-Websocket-Key":        "dGhlIHNhbXBsZSBub25jZQ==",
-		"Sec-Websocket-Version":    "13",
-		"Sec-Websocket-Extensions": "permessage-deflate; client_max_window_bits",
-		"Sec-Websocket-Protocol":   "chat",
-		"Connection":               "Upgrade",
-		"Upgrade":                  "websocket",
-		"Host":                     "browser.example",
-		"Cookie":                   "aw_id_jwt=abc", // a NON-reserved header must still pass through
+	reserved := http.Header{
+		"Sec-Websocket-Key":        []string{"dGhlIHNhbXBsZSBub25jZQ=="},
+		"Sec-Websocket-Version":    []string{"13"},
+		"Sec-Websocket-Extensions": []string{"permessage-deflate; client_max_window_bits"},
+		"Sec-Websocket-Protocol":   []string{"chat"},
+		"Connection":               []string{"Upgrade"},
+		"Upgrade":                  []string{"websocket"},
+		"Host":                     []string{"browser.example"},
+		"Cookie":                   []string{"aw_id_jwt=abc"}, // a NON-reserved header must still pass through
 	}
 	done := make(chan struct{})
 	err := h.OpenWS(context.Background(), "sess-x", "/ws", reserved, nil, func(id string, data []byte, isText bool) {
@@ -714,4 +714,126 @@ func TestCloseWSIsIdempotent(t *testing.T) {
 	if err := h.CloseWS("never-opened"); err != nil {
 		t.Fatalf("CloseWS on unknown session should be a no-op, got: %v", err)
 	}
+}
+
+// TestServeHTTPPreservesMultipleSetCookie is the regression test for the
+// collapsed-cart bug: WooCommerce's add-to-cart emits three Set-Cookie
+// headers, and the old `respHeaders[k] = resp.Header.Get(k)` kept only the
+// first — the two extra cookies died here, before anything was serialised.
+func TestServeHTTPPreservesMultipleSetCookie(t *testing.T) {
+	cookies := []string{
+		"woocommerce_items_in_cart=1; path=/",
+		"woocommerce_cart_hash=abc123; path=/",
+		"wp_woocommerce_session_9f=lmn%7C%7C456; path=/",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, c := range cookies {
+			w.Header().Add("Set-Cookie", c)
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	var headHeaders http.Header
+	h := &Handler{Target: srv.URL}
+	h.ServeHTTP(context.Background(), "req-1", "POST", "/?add-to-cart=42", nil, nil,
+		func(id string, status int, headers http.Header) { headHeaders = headers },
+		func(string, []byte) {}, func(string) {},
+	)
+
+	got := headHeaders.Values("Set-Cookie")
+	if len(got) != 3 {
+		t.Fatalf("Set-Cookie count = %d, want 3 — headers collapsed: %#v", len(got), got)
+	}
+	for i, want := range cookies {
+		if got[i] != want {
+			t.Errorf("Set-Cookie[%d] = %q, want %q", i, got[i], want)
+		}
+	}
+}
+
+// TestServeHTTPForwardsMultiValuedRequestHeader covers the request direction:
+// the loop used .Set, so a name arriving with several values reached the
+// upstream carrying only the last one.
+func TestServeHTTPForwardsMultiValuedRequestHeader(t *testing.T) {
+	var gotCookies []string
+	var gotXFF []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCookies = r.Header.Values("Cookie")
+		gotXFF = r.Header.Values("X-Forwarded-For")
+		w.WriteHeader(204)
+	}))
+	defer srv.Close()
+
+	h := &Handler{Target: srv.URL}
+	h.ServeHTTP(context.Background(), "req-1", "GET", "/", http.Header{
+		"Cookie":          []string{"a=1", "b=2"},
+		"X-Forwarded-For": []string{"203.0.113.1", "198.51.100.7"},
+	}, nil,
+		func(string, int, http.Header) {}, func(string, []byte) {}, func(string) {},
+	)
+
+	if len(gotCookies) != 2 {
+		t.Errorf("upstream saw %d Cookie headers, want 2: %#v", len(gotCookies), gotCookies)
+	}
+	if len(gotXFF) != 2 {
+		t.Errorf("upstream saw %d X-Forwarded-For headers, want 2: %#v", len(gotXFF), gotXFF)
+	}
+}
+
+// TestServeHTTPMultiValuedHostStillSetsReqHost guards the Host special case
+// against the .Set -> .Add change: Host must land on req.Host (the only place
+// http.Client reads the outgoing wire Host from), not in req.Header, even
+// though it now arrives as a value slice like every other name.
+func TestServeHTTPMultiValuedHostStillSetsReqHost(t *testing.T) {
+	var gotHost string
+	var hostHeader []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		hostHeader = r.Header.Values("Host")
+		w.WriteHeader(204)
+	}))
+	defer srv.Close()
+
+	h := &Handler{Target: srv.URL}
+	h.ServeHTTP(context.Background(), "req-1", "GET", "/", http.Header{
+		"Host": []string{"signoz.app.acme.workspace.aw.tekflox.com"},
+	}, nil,
+		func(string, int, http.Header) {}, func(string, []byte) {}, func(string) {},
+	)
+
+	if gotHost != "signoz.app.acme.workspace.aw.tekflox.com" {
+		t.Fatalf("r.Host = %q, want the forwarded app-mount host", gotHost)
+	}
+	if len(hostHeader) != 0 {
+		t.Errorf("Host leaked into req.Header as %#v — must go to req.Host only", hostHeader)
+	}
+}
+
+// TestOpenWSStripsReservedHeaderWithMultipleValues guards the gorilla
+// forbidden-list strip: the guard runs once per NAME, so a reserved header
+// arriving with several values must be dropped whole. If any survived, every
+// browser WebSocket fails the dial with "duplicate header not allowed".
+func TestOpenWSStripsReservedHeaderWithMultipleValues(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer srv.Close()
+
+	h := &Handler{Target: srv.URL}
+	err := h.OpenWS(context.Background(), "sess-m", "/ws", http.Header{
+		"Sec-Websocket-Extensions": []string{"permessage-deflate", "client_max_window_bits"},
+		"Connection":               []string{"Upgrade", "keep-alive"},
+		"Cookie":                   []string{"a=1", "b=2"},
+	}, nil, func(id string, data []byte, isText bool) {})
+	if err != nil {
+		t.Fatalf("OpenWS failed with multi-valued reserved headers (regression): %v", err)
+	}
+	defer h.CloseAllWS()
 }

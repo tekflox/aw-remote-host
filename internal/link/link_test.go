@@ -527,19 +527,41 @@ type fakeTunnelProxy struct {
 	mu      sync.Mutex
 	opened  []string
 	openErr map[string]error // id -> error OpenWS should return for that id
+	// Headers as pump() actually decoded them off the wire, keyed by frame
+	// id — how the headers_multi decode tests observe the real dispatch path
+	// instead of calling headersFromFrame directly.
+	gotHTTPHeaders map[string]http.Header
+	gotWSHeaders   map[string]http.Header
+	// Response headers ServeHTTP hands back to the head callback, if set.
+	respHeaders http.Header
 }
 
 func newFakeTunnelProxy() *fakeTunnelProxy {
-	return &fakeTunnelProxy{openErr: map[string]error{}}
+	return &fakeTunnelProxy{
+		openErr:        map[string]error{},
+		gotHTTPHeaders: map[string]http.Header{},
+		gotWSHeaders:   map[string]http.Header{},
+	}
 }
 
-func (f *fakeTunnelProxy) ServeHTTP(ctx context.Context, id, method, path string, headers map[string]string,
-	body []byte, head func(id string, status int, headers map[string]string),
+func (f *fakeTunnelProxy) ServeHTTP(ctx context.Context, id, method, path string, headers http.Header,
+	body []byte, head func(id string, status int, headers http.Header),
 	chunk func(id string, data []byte), end func(id string)) {
+	f.mu.Lock()
+	f.gotHTTPHeaders[id] = headers
+	resp := f.respHeaders
+	f.mu.Unlock()
+	if resp != nil {
+		head(id, 200, resp)
+		end(id)
+	}
 }
 
-func (f *fakeTunnelProxy) OpenWS(ctx context.Context, id, path string, headers map[string]string,
+func (f *fakeTunnelProxy) OpenWS(ctx context.Context, id, path string, headers http.Header,
 	onOpen func(), sendMsg func(id string, data []byte, isText bool)) error {
+	f.mu.Lock()
+	f.gotWSHeaders[id] = headers
+	f.mu.Unlock()
 	f.mu.Lock()
 	err := f.openErr[id]
 	f.mu.Unlock()
@@ -1363,5 +1385,305 @@ func TestRunTerminalVsRetryableSplit(t *testing.T) {
 				t.Errorf("register attempts = %d, want it to have retried", n)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// headers_multi wire compatibility (see the protocol docstring at the top of
+// link.go). These are the tests that make the four old/new combinations safe:
+// everything about the LEGACY field has to stay exactly as it was.
+// ---------------------------------------------------------------------------
+
+// TestHeadersWireEmitsBothFields is the encoder half of the Set-Cookie fix:
+// headers_multi carries all three cookies, while the legacy headers object
+// still carries exactly one — the FIRST, byte-for-byte what the old
+// `respHeaders[k] = resp.Header.Get(k)` produced for an old control plane.
+func TestHeadersWireEmitsBothFields(t *testing.T) {
+	h := http.Header{
+		"Set-Cookie": []string{
+			"woocommerce_items_in_cart=1; path=/",
+			"woocommerce_cart_hash=abc123; path=/",
+			"wp_woocommerce_session_9f=lmn%7C%7C456; path=/",
+		},
+		"Content-Type": []string{"text/html"},
+	}
+	legacy, multi := headersWire(h)
+
+	if got := legacy["Set-Cookie"]; got != "woocommerce_items_in_cart=1; path=/" {
+		t.Errorf("legacy Set-Cookie = %q, want the FIRST value (frozen compat rule)", got)
+	}
+	if len(legacy) != 2 {
+		t.Errorf("legacy field has %d names, want 2: %#v", len(legacy), legacy)
+	}
+	var cookies []string
+	for _, p := range multi {
+		if p[0] == "Set-Cookie" {
+			cookies = append(cookies, p[1])
+		}
+	}
+	if len(cookies) != 3 {
+		t.Fatalf("headers_multi has %d Set-Cookie pairs, want 3: %#v", len(cookies), multi)
+	}
+	for i, want := range h["Set-Cookie"] {
+		if cookies[i] != want {
+			t.Errorf("headers_multi Set-Cookie[%d] = %q, want %q (order within a name matters)", i, cookies[i], want)
+		}
+	}
+}
+
+// TestHeadersWireSkipsEmptyValueSlice — a name present with no values is not
+// something net/http produces, but it must not emit a bogus empty pair.
+func TestHeadersWireSkipsEmptyValueSlice(t *testing.T) {
+	legacy, multi := headersWire(http.Header{"X-Empty": []string{}, "X-Real": []string{"v"}})
+	if _, ok := legacy["X-Empty"]; ok {
+		t.Errorf("legacy field should omit a valueless name: %#v", legacy)
+	}
+	if len(multi) != 1 || multi[0][0] != "X-Real" {
+		t.Errorf("headers_multi = %#v, want just the X-Real pair", multi)
+	}
+}
+
+// TestHeadersFromFramePrefersMulti — a new peer's frame carries both; the
+// full-fidelity field must win.
+func TestHeadersFromFramePrefersMulti(t *testing.T) {
+	got := headersFromFrame(map[string]any{
+		"headers": map[string]any{"Set-Cookie": "only-the-first"},
+		"headers_multi": []any{
+			[]any{"Set-Cookie", "a=1"},
+			[]any{"Set-Cookie", "b=2"},
+			[]any{"Content-Type", "text/html"},
+		},
+	})
+	if vs := got.Values("Set-Cookie"); len(vs) != 2 || vs[0] != "a=1" || vs[1] != "b=2" {
+		t.Errorf("Set-Cookie = %#v, want both pairs from headers_multi", vs)
+	}
+	if got.Get("Content-Type") != "text/html" {
+		t.Errorf("Content-Type = %q", got.Get("Content-Type"))
+	}
+}
+
+// TestHeadersFromFrameFallsBackToLegacy — an OLD peer sends only "headers".
+// This is the (new decoder, old encoder) half of the no-coordinated-deploy
+// guarantee.
+func TestHeadersFromFrameFallsBackToLegacy(t *testing.T) {
+	got := headersFromFrame(map[string]any{
+		"headers": map[string]any{"Cookie": "aw_id_jwt=abc", "X-Other": "kept"},
+	})
+	if got.Get("Cookie") != "aw_id_jwt=abc" {
+		t.Errorf("Cookie = %q, want the legacy value", got.Get("Cookie"))
+	}
+	if got.Get("X-Other") != "kept" {
+		t.Errorf("X-Other = %q", got.Get("X-Other"))
+	}
+}
+
+// TestHeadersFromFrameMalformedMultiFallsBackToLegacy is the one that matters
+// most for safety: a headers_multi we cannot use must never zero the headers.
+// Dropping them silently would strip the auth cookie with no error anywhere —
+// the exact failure mode that made the additive field non-negotiable.
+func TestHeadersFromFrameMalformedMultiFallsBackToLegacy(t *testing.T) {
+	legacy := map[string]any{"Cookie": "aw_id_jwt=abc"}
+	cases := []struct {
+		name  string
+		multi any
+	}{
+		{"wrong type (object)", map[string]any{"Cookie": "x"}},
+		{"wrong type (string)", "Cookie: x"},
+		{"wrong type (number)", 42},
+		{"null", nil},
+		{"empty list", []any{}},
+		{"list of non-pairs", []any{"Cookie", "x"}},
+		{"pairs of wrong arity", []any{[]any{"Cookie"}, []any{"a", "b", "c"}}},
+		{"pairs of wrong element type", []any{[]any{1, 2}, []any{"", "novalue"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := headersFromFrame(map[string]any{"headers": legacy, "headers_multi": tc.multi})
+			if got.Get("Cookie") != "aw_id_jwt=abc" {
+				t.Fatalf("Cookie = %q, want the legacy fallback — headers were zeroed", got.Get("Cookie"))
+			}
+		})
+	}
+}
+
+// TestHeadersFromFramePartiallyMalformedMultiKeepsGoodPairs — a list that
+// yields at least one usable pair is used, with the junk entries skipped.
+func TestHeadersFromFramePartiallyMalformedMultiKeepsGoodPairs(t *testing.T) {
+	got := headersFromFrame(map[string]any{
+		"headers":       map[string]any{"Cookie": "legacy-value"},
+		"headers_multi": []any{"junk", []any{"Cookie", "real=1"}, []any{"bad"}},
+	})
+	if vs := got.Values("Cookie"); len(vs) != 1 || vs[0] != "real=1" {
+		t.Errorf("Cookie = %#v, want just the one usable pair", vs)
+	}
+}
+
+// TestHeadersFromFrameNoHeadersAtAll — neither field present is an empty
+// header set, not a panic.
+func TestHeadersFromFrameNoHeadersAtAll(t *testing.T) {
+	if got := headersFromFrame(map[string]any{"op": "http_req"}); len(got) != 0 {
+		t.Errorf("got %#v, want empty", got)
+	}
+}
+
+// TestCapsAdvertisesHeadersMulti — operator visibility only; nothing gates on
+// it, but it must be advertised so "which hosts still collapse cookies?" is
+// answerable.
+func TestCapsAdvertisesHeadersMulti(t *testing.T) {
+	for _, c := range Caps {
+		if c == "http_headers_multi" {
+			return
+		}
+	}
+	t.Fatalf("Caps missing http_headers_multi: %#v", Caps)
+}
+
+// TestRunHTTPReqDecodesHeadersMultiThroughPump drives the REAL frame dispatch
+// (not headersFromFrame directly): a control plane sending headers_multi must
+// reach the proxy with every value, and the http_resp_head frame that comes
+// back must carry BOTH fields.
+func TestRunHTTPReqDecodesHeadersMultiThroughPump(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.framesToSend = []map[string]any{
+		{
+			"op": "http_req", "id": "r1", "method": "GET", "path": "/",
+			"headers": map[string]any{"Cookie": "b=2"},
+			"headers_multi": []any{
+				[]any{"Cookie", "a=1"},
+				[]any{"Cookie", "b=2"},
+			},
+		},
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	proxy := newFakeTunnelProxy()
+	proxy.respHeaders = http.Header{"Set-Cookie": []string{"x=1", "y=2", "z=3"}}
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnTunnelProxy: func() TunnelProxy { return proxy },
+		})
+	}()
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	<-done
+
+	proxy.mu.Lock()
+	gotReq := proxy.gotHTTPHeaders["r1"]
+	proxy.mu.Unlock()
+	if vs := gotReq.Values("Cookie"); len(vs) != 2 || vs[0] != "a=1" || vs[1] != "b=2" {
+		t.Errorf("proxy saw Cookie = %#v, want both values decoded off headers_multi", vs)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	var head map[string]any
+	for _, f := range srv.receivedFrames {
+		if f["op"] == "http_resp_head" && f["id"] == "r1" {
+			head = f
+		}
+	}
+	if head == nil {
+		t.Fatalf("no http_resp_head frame received: %+v", srv.receivedFrames)
+	}
+	legacy, ok := head["headers"].(map[string]any)
+	if !ok {
+		t.Fatalf("headers field is %T, want a JSON object — an old host must still parse it", head["headers"])
+	}
+	if legacy["Set-Cookie"] != "x=1" {
+		t.Errorf("legacy Set-Cookie = %v, want the first value x=1", legacy["Set-Cookie"])
+	}
+	multi, ok := head["headers_multi"].([]any)
+	if !ok {
+		t.Fatalf("headers_multi is %T, want a list", head["headers_multi"])
+	}
+	if len(multi) != 3 {
+		t.Errorf("headers_multi has %d pairs, want 3: %#v", len(multi), multi)
+	}
+}
+
+// TestRunWSOpenDecodesHeadersMultiThroughPump — same for the ws_open frame.
+func TestRunWSOpenDecodesHeadersMultiThroughPump(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.framesToSend = []map[string]any{
+		{
+			"op": "ws_open", "id": "s1", "path": "/ws",
+			"headers":       map[string]any{"Cookie": "b=2"},
+			"headers_multi": []any{[]any{"Cookie", "a=1"}, []any{"Cookie", "b=2"}},
+		},
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	proxy := newFakeTunnelProxy()
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnTunnelProxy: func() TunnelProxy { return proxy },
+		})
+	}()
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	<-done
+
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
+	if vs := proxy.gotWSHeaders["s1"].Values("Cookie"); len(vs) != 2 {
+		t.Errorf("proxy saw Cookie = %#v, want both values decoded off headers_multi", vs)
+	}
+}
+
+// TestRunHTTPReqFromLegacyControlPlane is the (new Go, OLD Python) half of the
+// no-coordinated-deploy guarantee: a frame with only the legacy field must
+// still deliver the headers.
+func TestRunHTTPReqFromLegacyControlPlane(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.framesToSend = []map[string]any{
+		{
+			"op": "http_req", "id": "r1", "method": "GET", "path": "/",
+			"headers": map[string]any{"Cookie": "aw_id_jwt=abc", "Host": "acme.workspace"},
+		},
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	proxy := newFakeTunnelProxy()
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnTunnelProxy: func() TunnelProxy { return proxy },
+		})
+	}()
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	<-done
+
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
+	got := proxy.gotHTTPHeaders["r1"]
+	if got.Get("Cookie") != "aw_id_jwt=abc" {
+		t.Errorf("Cookie = %q — an old control plane's headers must survive", got.Get("Cookie"))
+	}
+	if got.Get("Host") != "acme.workspace" {
+		t.Errorf("Host = %q", got.Get("Host"))
 	}
 }

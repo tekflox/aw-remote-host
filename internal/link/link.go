@@ -26,10 +26,10 @@
 // src/api/routes/workspace_tunnel_proxy.py, the control-plane consumer),
 // keyed by a request/session id the control plane picks:
 //
-//   - control-plane -> host: {"op":"http_req","id","method","path","headers","body"?} (b64)
-//   - host -> control-plane: {"op":"http_resp_head","id","status","headers"}, then
+//   - control-plane -> host: {"op":"http_req","id","method","path","headers","headers_multi"?,"body"?} (b64)
+//   - host -> control-plane: {"op":"http_resp_head","id","status","headers","headers_multi"}, then
 //     zero or more {"op":"http_resp_chunk","id","data"} (b64), then {"op":"http_resp_end","id"}
-//   - control-plane -> host: {"op":"ws_open","id","path","headers"}
+//   - control-plane -> host: {"op":"ws_open","id","path","headers","headers_multi"?}
 //   - host -> control-plane: {"op":"ws_open_ok","id"} once the local dial has
 //     actually succeeded — distinct from having merely sent the ws_open
 //     frame, so the control plane can gate accepting the browser's own
@@ -40,6 +40,30 @@
 //   - either direction:      {"op":"ws_msg","id","data","dir":"text"|"binary"} (data b64)
 //   - either direction:      {"op":"ws_close","id","reason"?} — host -> control-plane
 //     also covers a failed local dial (in place of ws_open_ok)
+//
+// Multi-valued headers ("headers" vs "headers_multi"). HTTP allows a field
+// name to repeat — Set-Cookie almost always does — but "headers" is a JSON
+// object, so it can only carry one value per name. Every frame above that
+// carries "headers" therefore ALSO carries "headers_multi", a list of
+// [name, value] pairs with the full set. The two fields are an ADDITIVE pair,
+// and three rules keep the rollout safe (see headersFromFrame / headersWire):
+//
+//  1. "headers" keeps its exact legacy content and type. It is never made
+//     polymorphic: this binary ships on users' own machines and updates on
+//     their schedule, so an un-upgraded host must keep working untouched. A
+//     JSON array where the old decoder expected an object type-asserts to an
+//     EMPTY map with no error, which would strip every request header —
+//     including the auth cookie — silently.
+//  2. Which value survives into the legacy field is frozen PER DIRECTION:
+//     first-value-wins on the response (host -> control plane), last-value-wins
+//     on the request (control plane -> host, built by the backend). The two are
+//     genuinely different and must not be "unified".
+//  3. Decoders pick by PRESENCE of "headers_multi", never by capability
+//     negotiation, so all four old/new combinations work with no coordinated
+//     deploy. The http_headers_multi cap exists for operator visibility only.
+//
+// Not fixed by this: the WebSocket upgrade RESPONSE carries no headers on
+// either bridge, so a Set-Cookie emitted during a WS handshake is still lost.
 //
 // pump() dispatches these to whatever TunnelProxy RunCallbacks.OnTunnelProxy
 // builds for the live connection, same "one instance per connection, torn
@@ -56,6 +80,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -324,6 +349,14 @@ func (c *Client) dial(ctx context.Context, token string) (*websocket.Conn, error
 var Caps = []string{
 	"ws_open_ok",
 	"net_advertise",
+	// Deliberately NOT load-bearing: no code path on either side gates on
+	// this. Both decoders detect the headers_multi field by PRESENCE, which
+	// is what makes the four (old/new Go x old/new Python) combinations safe
+	// without a coordinated deploy. It is advertised purely so an operator
+	// can answer "which hosts still collapse multi-valued headers?" — a
+	// cli_version comparison cannot answer that here (see the note above on
+	// reported version != running code).
+	"http_headers_multi",
 }
 
 func (c *Client) registerFrame() map[string]any {
@@ -532,12 +565,12 @@ type NewShellManagerFunc func(emit func(id, dataB64 string)) ShellManager
 // down via CloseAllWS when the connection drops — mirrors ShellManager).
 type TunnelProxy interface {
 	ServeHTTP(
-		ctx context.Context, id, method, path string, headers map[string]string, body []byte,
-		head func(id string, status int, headers map[string]string),
+		ctx context.Context, id, method, path string, headers http.Header, body []byte,
+		head func(id string, status int, headers http.Header),
 		chunk func(id string, data []byte),
 		end func(id string),
 	)
-	OpenWS(ctx context.Context, id, path string, headers map[string]string, onOpen func(), sendMsg func(id string, data []byte, isText bool)) error
+	OpenWS(ctx context.Context, id, path string, headers http.Header, onOpen func(), sendMsg func(id string, data []byte, isText bool)) error
 	WSMessage(id string, data []byte, isText bool) error
 	CloseWS(id string) error
 	CloseAllWS()
@@ -925,15 +958,88 @@ func handleCmd(ctx context.Context, fw *frameWriter, msg map[string]any, handler
 	}()
 }
 
-func stringMap(v any) map[string]string {
-	out := map[string]string{}
-	m, _ := v.(map[string]any)
+// headersFromFrame decodes a frame's header payload into a multi-valued
+// http.Header, preferring the full-fidelity "headers_multi" field and falling
+// back to the legacy single-value "headers" object.
+//
+// Defensive in the same spirit as the backend's _parse_caps: the value crosses
+// a trust boundary from the control plane, and anything unrecognised must
+// degrade to the legacy field rather than to NO headers. Losing the request
+// headers silently would strip the auth cookie — see the "do not make headers
+// polymorphic" note on the protocol docstring above.
+//
+// "headers_multi" wins only when it is a list that yields at least one usable
+// pair. A present-but-unusable value (wrong type, or a list of nothing but
+// garbage) falls through to "headers" instead of producing an empty header
+// set; a sender that populates one field always populates both, so the
+// fallback can only ever be an improvement over empty.
+func headersFromFrame(msg map[string]any) http.Header {
+	if raw, ok := msg["headers_multi"]; ok {
+		if pairs, isList := raw.([]any); isList {
+			out := http.Header{}
+			n := 0
+			for _, p := range pairs {
+				pair, ok := p.([]any)
+				if !ok || len(pair) != 2 {
+					continue
+				}
+				k, kOK := pair[0].(string)
+				v, vOK := pair[1].(string)
+				if !kOK || !vOK || k == "" {
+					continue
+				}
+				out.Add(k, v)
+				n++
+			}
+			if n > 0 {
+				return out
+			}
+		}
+	}
+	out := http.Header{}
+	m, _ := msg["headers"].(map[string]any)
 	for k, val := range m {
 		if s, ok := val.(string); ok {
-			out[k] = s
+			out.Add(k, s)
 		}
 	}
 	return out
+}
+
+// headersWire encodes an http.Header for the wire as BOTH fields: the legacy
+// single-value "headers" object and the full-fidelity "headers_multi" list of
+// [name, value] pairs.
+//
+// The legacy field is built FIRST-value-wins, byte-for-byte what the
+// pre-headers_multi encoder produced (`respHeaders[k] = resp.Header.Get(k)`).
+// That rule is a frozen compatibility contract, not a style choice: the
+// control plane's request-side legacy field is LAST-value-wins instead, and
+// "unifying" the two directions would silently change what an un-upgraded
+// host on the other end receives. See aw-workspace
+// docs/standards/app-backend-websocket-messaging.md §2.6.2.
+//
+// Keys are emitted in sorted order purely for determinism (Go map iteration is
+// randomised); header order across distinct names carries no HTTP meaning,
+// while order WITHIN one name is preserved, which is what Set-Cookie needs.
+func headersWire(h http.Header) (map[string]string, [][]string) {
+	legacy := make(map[string]string, len(h))
+	multi := make([][]string, 0, len(h))
+	names := make([]string, 0, len(h))
+	for k := range h {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		vs := h[k]
+		if len(vs) == 0 {
+			continue
+		}
+		legacy[k] = vs[0]
+		for _, v := range vs {
+			multi = append(multi, []string{k, v})
+		}
+	}
+	return legacy, multi
 }
 
 // handleHTTPReq forwards one http_req frame to proxy.ServeHTTP in its own
@@ -944,7 +1050,7 @@ func handleHTTPReq(ctx context.Context, fw *frameWriter, msg map[string]any, pro
 	id, _ := msg["id"].(string)
 	method, _ := msg["method"].(string)
 	path, _ := msg["path"].(string)
-	headers := stringMap(msg["headers"])
+	headers := headersFromFrame(msg)
 
 	var body []byte
 	if b64, ok := msg["body"].(string); ok && b64 != "" {
@@ -954,9 +1060,10 @@ func handleHTTPReq(ctx context.Context, fw *frameWriter, msg map[string]any, pro
 	}
 
 	if proxy == nil {
+		legacy, multi := headersWire(http.Header{"Content-Type": []string{"text/plain"}})
 		_ = fw.WriteJSON(map[string]any{
 			"op": "http_resp_head", "id": id, "status": 502,
-			"headers": map[string]string{"content-type": "text/plain"},
+			"headers": legacy, "headers_multi": multi,
 		})
 		_ = fw.WriteJSON(map[string]any{
 			"op": "http_resp_chunk", "id": id,
@@ -968,8 +1075,12 @@ func handleHTTPReq(ctx context.Context, fw *frameWriter, msg map[string]any, pro
 
 	go func() {
 		proxy.ServeHTTP(ctx, id, method, path, headers, body,
-			func(id string, status int, headers map[string]string) {
-				_ = fw.WriteJSON(map[string]any{"op": "http_resp_head", "id": id, "status": status, "headers": headers})
+			func(id string, status int, headers http.Header) {
+				legacy, multi := headersWire(headers)
+				_ = fw.WriteJSON(map[string]any{
+					"op": "http_resp_head", "id": id, "status": status,
+					"headers": legacy, "headers_multi": multi,
+				})
 			},
 			func(id string, data []byte) {
 				_ = fw.WriteJSON(map[string]any{
@@ -992,7 +1103,7 @@ func handleHTTPReq(ctx context.Context, fw *frameWriter, msg map[string]any, pro
 func handleWSOpen(ctx context.Context, fw *frameWriter, msg map[string]any, proxy TunnelProxy) {
 	id, _ := msg["id"].(string)
 	path, _ := msg["path"].(string)
-	headers := stringMap(msg["headers"])
+	headers := headersFromFrame(msg)
 
 	if proxy == nil {
 		_ = fw.WriteJSON(map[string]any{"op": "ws_close", "id": id, "reason": "no tunnel proxy registered on this host"})

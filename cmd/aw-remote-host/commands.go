@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -1179,13 +1180,13 @@ func newLinkProxy() *linkProxy {
 }
 
 func (p *linkProxy) ServeHTTP(ctx context.Context, id, method, path string,
-	headers map[string]string, body []byte,
-	head func(id string, status int, headers map[string]string),
+	headers http.Header, body []byte,
+	head func(id string, status int, headers http.Header),
 	chunk func(id string, data []byte), end func(id string)) {
 	p.web.ServeHTTP(ctx, id, method, path, headers, body, head, chunk, end)
 }
 
-func (p *linkProxy) OpenWS(ctx context.Context, id, path string, headers map[string]string,
+func (p *linkProxy) OpenWS(ctx context.Context, id, path string, headers http.Header,
 	onOpen func(), sendMsg func(id string, data []byte, isText bool)) error {
 	return p.web.OpenWS(ctx, id, path, headers, onOpen, sendMsg)
 }
