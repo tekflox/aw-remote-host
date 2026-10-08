@@ -579,6 +579,221 @@ func TestUpdateResolvesTheRequestedVersionByTagOnADigestPinnedHost(t *testing.T)
 	}
 }
 
+// A `podman rm` that cannot remove the old container must fail the update
+// outright. bootstrap/workspace/install.sh short-circuits on a container that
+// already exists and exits 0 without consulting $AW_WORKSPACE_IMAGE, so
+// carrying on past a failed removal let bootstrap accept the OLD container and
+// recordInstalledImage then persist the new image as installed — the exact
+// record-before-verify write that left this project's own host claiming
+// v0.42.0 while serving v0.41.0.
+func TestUpdateFailsWhenWorkspaceRemovalIsBlocked(t *testing.T) {
+	modules := stubRunModule(t)
+	statePath := useTempState(t)
+	t.Setenv("AW_WORKSPACE_HOST_DIR", t.TempDir())
+	const target = "ghcr.io/fredericowu/aw-workspace:v0.41.0"
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	stubVerifiedImage(r.fakeRunner, target, "sha256:new")
+	r.on("container has dependent runner containers", "podman", "rm", "-f", "--ignore", "--depend", WorkspaceContainer)
+	r.fail(fmt.Errorf("exit status 125"), "podman", "rm", "-f", "--ignore", "--depend", WorkspaceContainer)
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir(), StatePath: statePath}}
+	emit, lines := collectEmits()
+	data, err := h.Update(context.Background(), h.Opts, map[string]any{"version": "v0.41.0"}, emit)
+	if err == nil || !strings.Contains(err.Error(), "dependent runner") || data != nil {
+		t.Fatalf("expected removal diagnostic and no success, got data=%v err=%v", data, err)
+	}
+	if len(*modules) != 0 {
+		t.Fatalf("bootstrap must not accept the old container: %v", *modules)
+	}
+	st, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.WorkspaceImage != "" {
+		t.Fatalf("failed update recorded an installed image: %s", st.WorkspaceImage)
+	}
+	if !strings.Contains(strings.Join(*lines, "\n"), "dependent runner") {
+		t.Fatalf("activity must report the removal failure: %v", *lines)
+	}
+}
+
+// stubRecreatedWorkspace makes the running workspace container look like it
+// was created from imageID and answers /api/health with version — the two
+// probes verifyRecreatedWorkspace cross-checks a recreate against.
+func stubRecreatedWorkspace(r *fakeRunner, target, targetID, runningID, version string) {
+	r.on(targetID, "podman", "image", "inspect", target, "--format", "{{.Id}}")
+	r.on(runningID, "podman", "inspect", WorkspaceContainer, "--format", "{{.Image}}")
+	r.on(`{"status":"ok","version":"`+version+`"}`, "curl", "-fsS", "--max-time", probeTimeout, HealthURL)
+}
+
+// TestUpdateDoesNotRecordAnImageTheContainerIsNotRunning is the regression test
+// for the 2026-10-08 incident: Update recorded recreateImage in state.json the
+// moment runModulesWithEnv returned nil, which proves the bootstrap SCRIPT
+// succeeded, not that the container was rebuilt. install.sh exits 0 on an
+// already-existing container, so the old one kept serving while state.json —
+// which workspaceImage() treats as this host's steady-state truth — asserted a
+// version that had never run, aiming every later Reinstall/Bootstrap at it.
+func TestUpdateDoesNotRecordAnImageTheContainerIsNotRunning(t *testing.T) {
+	stubRunModule(t)
+	statePath := useTempState(t)
+	t.Setenv("AW_WORKSPACE_HOST_DIR", t.TempDir())
+	const target = "ghcr.io/fredericowu/aw-workspace:v0.42.0"
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	stubVerifiedImage(r.fakeRunner, target, "sha256:new")
+	// The recreate silently did not happen: the container still runs the old
+	// image's id, while the update targets the new one.
+	stubRecreatedWorkspace(r.fakeRunner, imageRepository(target)+"@sha256:new",
+		"id-v0420", "id-v0410", "v0.41.0")
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir(), StatePath: statePath}}
+	emit, lines := collectEmits()
+
+	data, err := h.Update(context.Background(), h.Opts, map[string]any{"version": "v0.42.0"}, emit)
+	if err == nil || data != nil {
+		t.Fatalf("expected the update to fail, got data=%v err=%v", data, err)
+	}
+	if !strings.Contains(err.Error(), "id-v0410") || !strings.Contains(err.Error(), "not recreated") {
+		t.Fatalf("error must name the image actually running: %v", err)
+	}
+	st, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.WorkspaceImage != "" {
+		t.Fatalf("an unverified recreate was recorded as installed: %s", st.WorkspaceImage)
+	}
+	if !strings.Contains(strings.Join(*lines, "\n"), "id-v0410") {
+		t.Fatalf("activity must report the mismatch: %v", *lines)
+	}
+}
+
+// The container can be rebuilt from the right image and still come back
+// serving the wrong version — a host tree the sync did not actually replace,
+// a mis-stamped build. The version the workspace reports over its own
+// /api/health is the claim aw-backend verifies against, so it is the claim
+// state.json has to earn before it records anything.
+func TestUpdateDoesNotRecordWhenTheWorkspaceReportsAnotherVersion(t *testing.T) {
+	stubRunModule(t)
+	statePath := useTempState(t)
+	t.Setenv("AW_WORKSPACE_HOST_DIR", t.TempDir())
+	const target = "ghcr.io/fredericowu/aw-workspace:v0.42.0"
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	stubVerifiedImage(r.fakeRunner, target, "sha256:new")
+	// Right image id on both sides, wrong version coming back from the app.
+	stubRecreatedWorkspace(r.fakeRunner, imageRepository(target)+"@sha256:new",
+		"id-v0420", "id-v0420", "v0.33.0")
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir(), StatePath: statePath}}
+	emit, _ := collectEmits()
+
+	data, err := h.Update(context.Background(), h.Opts, map[string]any{"version": "v0.42.0"}, emit)
+	if err == nil || data != nil {
+		t.Fatalf("expected the update to fail, got data=%v err=%v", data, err)
+	}
+	if !strings.Contains(err.Error(), "v0.33.0") || !strings.Contains(err.Error(), "v0.42.0") {
+		t.Fatalf("error must name both the reported and the requested version: %v", err)
+	}
+	st, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.WorkspaceImage != "" {
+		t.Fatalf("a version-mismatched recreate was recorded as installed: %s", st.WorkspaceImage)
+	}
+}
+
+// The happy path still records — the verification must not be so strict that
+// a real update can no longer move this host's steady-state image.
+func TestUpdateRecordsTheImageOnceTheRecreateIsVerified(t *testing.T) {
+	stubRunModule(t)
+	statePath := useTempState(t)
+	t.Setenv("AW_WORKSPACE_HOST_DIR", t.TempDir())
+	const target = "ghcr.io/fredericowu/aw-workspace:v0.42.0"
+	recreated := imageRepository(target) + "@sha256:new"
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	stubVerifiedImage(r.fakeRunner, target, "sha256:new")
+	stubRecreatedWorkspace(r.fakeRunner, recreated, "id-v0420", "id-v0420", "v0.42.0")
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir(), StatePath: statePath}}
+	emit, _ := collectEmits()
+
+	data, err := h.Update(context.Background(), h.Opts, map[string]any{"version": "v0.42.0"}, emit)
+	if err != nil || data == nil {
+		t.Fatalf("a verified recreate must succeed, got data=%v err=%v", data, err)
+	}
+	st, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.WorkspaceImage != recreated {
+		t.Fatalf("state.WorkspaceImage = %q, want %q", st.WorkspaceImage, recreated)
+	}
+}
+
+// TestReinstallReconcilesAStateImageTheContainerIsNotRunning covers the half of
+// the 2026-10-08 fix that closing the bad write cannot reach: hosts that ALREADY
+// took one. Reinstall recreates from whatever workspaceImage() reads out of
+// state.json, so a record left pointing at a version that never ran turns one
+// failed update into an unrequested version jump on the next reinstall. The
+// record is corrected to what is actually running, not cleared — clearing it
+// would hand the recreate back to the AW_WORKSPACE_IMAGE env pin.
+func TestReinstallReconcilesAStateImageTheContainerIsNotRunning(t *testing.T) {
+	stubRunModule(t)
+	statePath := useTempState(t)
+	const recorded = "ghcr.io/fredericowu/aw-workspace@sha256:never-ran"
+	const running = "ghcr.io/fredericowu/aw-workspace@sha256:actually-running"
+	if err := state.Update(statePath, func(s *state.State) { s.WorkspaceImage = recorded }); err != nil {
+		t.Fatal(err)
+	}
+	r := newFakeRunner()
+	r.on("id-recorded", "podman", "image", "inspect", recorded, "--format", "{{.Id}}")
+	r.on("id-running", "podman", "inspect", WorkspaceContainer, "--format", "{{.Image}}")
+	r.on(running, "podman", "inspect", WorkspaceContainer, "--format", "{{.ImageName}}")
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir(), StatePath: statePath}}
+	emit, lines := collectEmits()
+
+	if _, err := h.Reinstall(context.Background(), h.Opts, emit); err != nil {
+		t.Fatalf("reinstall: %v", err)
+	}
+	st, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.WorkspaceImage != running {
+		t.Fatalf("state.WorkspaceImage = %q, want it corrected to %q", st.WorkspaceImage, running)
+	}
+	if !strings.Contains(strings.Join(*lines, "\n"), "corrected the record") {
+		t.Fatalf("the repair must be visible in the activity log: %v", *lines)
+	}
+}
+
+// A state.json that agrees with the running container must be left exactly as
+// it is — the reconcile is a repair for a proven divergence, not a rewrite on
+// every reinstall.
+func TestReinstallLeavesAnAgreeingStateImageAlone(t *testing.T) {
+	stubRunModule(t)
+	statePath := useTempState(t)
+	const recorded = "ghcr.io/fredericowu/aw-workspace@sha256:in-sync"
+	if err := state.Update(statePath, func(s *state.State) { s.WorkspaceImage = recorded }); err != nil {
+		t.Fatal(err)
+	}
+	r := newFakeRunner()
+	r.on("same-id", "podman", "image", "inspect", recorded, "--format", "{{.Id}}")
+	r.on("same-id", "podman", "inspect", WorkspaceContainer, "--format", "{{.Image}}")
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir(), StatePath: statePath}}
+	emit, lines := collectEmits()
+
+	if _, err := h.Reinstall(context.Background(), h.Opts, emit); err != nil {
+		t.Fatalf("reinstall: %v", err)
+	}
+	st, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.WorkspaceImage != recorded {
+		t.Fatalf("state.WorkspaceImage = %q, want it untouched at %q", st.WorkspaceImage, recorded)
+	}
+	if strings.Contains(strings.Join(*lines, "\n"), "corrected the record") {
+		t.Fatalf("nothing diverged, so nothing should have been corrected: %v", *lines)
+	}
+}
+
 // An update exists to install NEW code, so it cannot succeed offline. The
 // branch that used to warn "image pull failed; using existing local image" and
 // carry on installed the cached — i.e. stale — image, and made every recovery

@@ -551,6 +551,10 @@ func (h *Handler) Reinstall(ctx context.Context, opts BootstrapOpts, emit Emit) 
 	if emit == nil {
 		emit = noopEmit
 	}
+	// Before the image this host recreates from is read back out of state.json
+	// by workspaceImage(), make sure it is not a record left behind by an
+	// update that only looked like it installed something.
+	h.reconcileRecordedImage(ctx, opts, emit)
 	emit("info", "reinstall", "removing workspace container for a fresh recreate")
 	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", WorkspaceContainer)
 	return h.runModules(ctx, opts, false, emit)
@@ -885,12 +889,25 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	}
 
 	emit("info", "update", "recreating workspace container from "+recreateImage)
-	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", WorkspaceContainer)
+	// Warm runner containers depend on the workspace container. A plain rm
+	// fails while they exist; --depend removes those ephemeral dependents as
+	// part of the already-authorized workspace update. Continuing after a
+	// failed removal would let bootstrap accept the old healthy container and
+	// record the new image as installed although it never ran.
+	if out, err := h.runner().Run(ctx, "podman", "rm", "-f", "--ignore", "--depend", WorkspaceContainer); err != nil {
+		removeErr := commandError("remove workspace container before update", err, out)
+		emit("error", "update", removeErr.Error())
+		return nil, removeErr
+	}
 	if _, err := h.runModulesWithEnv(ctx, opts, false, emit, []string{"AW_WORKSPACE_IMAGE=" + recreateImage}); err != nil {
 		return nil, err
 	}
+	if err := h.verifyRecreatedWorkspace(ctx, recreateImage, version, emit); err != nil {
+		return nil, err
+	}
 	// Only now — a pull that was verified against the registry AND a container
-	// that came back up — does this host's steady-state image move. Everything
+	// PROVEN to be running that image and reporting that version — does this
+	// host's steady-state image move. Everything
 	// that recreates the container later (reinstall, bootstrap) reads this back
 	// through workspaceImage(), so an AW_WORKSPACE_IMAGE env pin set once by
 	// whoever created the aw-remote-host container can no longer quietly pull
@@ -912,6 +929,202 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 		data["version"] = version
 	}
 	return data, nil
+}
+
+// recreateVerifyAttempts/recreateVerifyInterval bound how long
+// verifyRecreatedWorkspace waits for the freshly-recreated workspace to answer
+// /api/health with a version. bootstrap/workspace/install.sh has already
+// blocked on readiness by the time Update gets here, so the first probe
+// normally answers; this only covers a container that became ready for the
+// script and is briefly not answering this process yet. Vars, not consts, so
+// tests can collapse the wait.
+var (
+	recreateVerifyAttempts = 10
+	recreateVerifyInterval = 3 * time.Second
+)
+
+// verifyRecreatedWorkspace proves the container that is NOW running really was
+// built from recreateImage — and, when the update targeted a specific version,
+// that the workspace itself reports that version over its own /api/health —
+// BEFORE Update records recreateImage as this host's steady-state reference.
+//
+// Update used to treat runModulesWithEnv returning nil as proof of exactly
+// that, which it is not. bootstrap/workspace/install.sh short-circuits on a
+// container that already exists ("container already exists, ensuring it's
+// running") and exits 0 without ever consulting $AW_WORKSPACE_IMAGE, so any
+// path that leaves the old container standing — the `podman rm` above failing,
+// something recreating it concurrently — produced a "successful" update that
+// installed nothing while recordInstalledImage persisted the new reference as
+// fact. Measured live on this project's own host 2026-10-08: state.json
+// carried v0.42.0's digest while the running container had been serving
+// v0.41.0 continuously since the previous day.
+//
+// That lie does not stay contained in the one failed update, which is what
+// makes this worth a hard failure rather than a warning: workspaceImage()
+// treats the recorded value as truth, so the next Reinstall or Bootstrap
+// installs a version that was never verified to work here.
+//
+// A PROVEN mismatch fails hard, leaving state.json on its last true value and
+// letting aw-backend's own _wait_for_workspace_version report the real
+// installed version instead of a now-permanent fiction. "Can't tell" warns and
+// proceeds — the same shape verifyImageDigest and guardHostNotAheadOfImage
+// use, for the same reason: a false refusal here would strand every future
+// update on hosts these probes cannot speak about.
+func (h *Handler) verifyRecreatedWorkspace(ctx context.Context, recreateImage, version string, emit Emit) error {
+	target := h.imageID(ctx, recreateImage)
+	running := h.containerImageID(ctx)
+	switch {
+	case target == "" || running == "":
+		emit("warning", "update", "could not read the image id of both "+recreateImage+
+			" and the running workspace container — proceeding without the recreate cross-check")
+	case target != running:
+		msg := "the workspace container was not recreated from " + recreateImage +
+			": it is still running image " + running + ", not " + target +
+			" — refusing to record an image that never ran"
+		emit("error", "update", msg)
+		return fmt.Errorf("%s", msg)
+	default:
+		emit("info", "update", "verified the running container was recreated from "+recreateImage)
+	}
+
+	if version == "" {
+		return nil
+	}
+	want := shortenSHAVersion(version)
+	reported := ""
+	for attempt := 0; attempt < recreateVerifyAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(recreateVerifyInterval)
+		}
+		healthy, v := h.probeHealth(ctx)
+		if !healthy {
+			continue // not up yet — the one case worth waiting on
+		}
+		// It answered. The version it serves comes from the image's own baked
+		// env, so this first answer is also its final one: retrying a
+		// mismatch would only delay a verdict that cannot change.
+		reported, _ = v.(string)
+		break
+	}
+	switch {
+	case reported == "":
+		emit("warning", "update", "the recreated workspace did not report a version over /api/health"+
+			" — proceeding without the version cross-check")
+	case reported != want:
+		msg := "the recreated workspace reports version " + reported + ", not the requested " + want +
+			" — refusing to record " + recreateImage + " as installed"
+		emit("error", "update", msg)
+		return fmt.Errorf("%s", msg)
+	default:
+		emit("info", "update", "the recreated workspace reports version "+reported+" over /api/health")
+	}
+	return nil
+}
+
+// imageID resolves a reference — a tag or any digest — to the local image ID it
+// names, which is also what a container records as the image it was created
+// from. Comparing IDs rather than references is what makes the check above
+// immune to the several equivalent spellings of one image: measured on this
+// host, a multi-arch image's tag, its manifest-index digest and its
+// platform-manifest digest are three different strings for the same ID, and
+// recreateImage is built from whichever of them verifyImageDigest returned.
+func (h *Handler) imageID(ctx context.Context, image string) string {
+	out, err := h.runner().Run(ctx, "podman", "image", "inspect", image, "--format", "{{.Id}}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+func (h *Handler) containerImageID(ctx context.Context) string {
+	out, err := h.runner().Run(ctx, "podman", "inspect", WorkspaceContainer, "--format", "{{.Image}}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// containerImageRef returns the reference the running workspace container was
+// created from — a digest reference in practice, since that is what Update
+// recreates from, which is the same immutable shape recordInstalledImage
+// persists.
+func (h *Handler) containerImageRef(ctx context.Context) string {
+	out, err := h.runner().Run(ctx, "podman", "inspect", WorkspaceContainer, "--format", "{{.ImageName}}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// reconcileRecordedImage repairs a state.json whose workspace_image disagrees
+// with the container actually running, before a recreate path trusts it.
+//
+// Closing the bad write (verifyRecreatedWorkspace, above) does not help the
+// hosts that already took one. workspaceImage() treats this field as the
+// host's steady-state truth, so a wrong value is not a stale cache entry to be
+// refreshed later — it is the image the next Reinstall or Bootstrap will
+// install, which turns one failed update into a version jump nobody asked for.
+// This project's own host carried exactly that from 2026-10-07 until it was
+// reconciled: workspace_image asserting v0.42.0 against a container that had
+// never left v0.41.0.
+//
+// Only a PROVEN divergence is corrected, and it is corrected TO THE RUNNING
+// CONTAINER rather than cleared: what is actually running is the one fact here
+// that cannot be wrong, and clearing the field would hand the next recreate
+// straight back to the AW_WORKSPACE_IMAGE env pin whose override is the whole
+// point of recording an installed image (see workspaceImage's own comment on
+// the 2026-09-10 incident).
+//
+// Best-effort throughout: this runs to make a later recreate honest, so it
+// must never be the reason a reinstall or bootstrap fails.
+func (h *Handler) reconcileRecordedImage(ctx context.Context, opts BootstrapOpts, emit Emit) {
+	path := opts.StatePath
+	if path == "" {
+		var err error
+		if path, err = workspaceStatePath(); err != nil {
+			return
+		}
+	}
+	st, err := state.Load(path)
+	if err != nil {
+		return
+	}
+	recorded := strings.TrimSpace(st.WorkspaceImage)
+	if recorded == "" {
+		return // nothing recorded — workspaceImage() falls back on its own
+	}
+	running := h.containerImageID(ctx)
+	if running == "" {
+		return // no workspace container to compare against (fresh/offline host)
+	}
+	recordedID := h.imageID(ctx, recorded)
+	if recordedID == "" || recordedID == running {
+		return // the recorded image is gone from local storage, or it agrees
+	}
+	runningRef := h.containerImageRef(ctx)
+	if runningRef == "" {
+		return
+	}
+	if err := recordInstalledImage(opts, runningRef); err != nil {
+		emit("warning", "reconcile", "state.json records "+recorded+
+			" but the workspace container actually runs "+runningRef+
+			", and the record could not be corrected: "+err.Error())
+		return
+	}
+	emit("warning", "reconcile", "state.json recorded "+recorded+
+		" as this host's workspace image, but the running container was created from "+runningRef+
+		" — corrected the record to what is actually running before recreating from it")
+}
+
+// shortenSHAVersion normalizes a version string the way probeHealth reports
+// one, so the two can be compared like with like: a build stamped with a raw
+// git SHA is reported shortened, and an update target carrying the same SHA has
+// to be shortened the same way before it can ever match.
+func shortenSHAVersion(version string) string {
+	if isLongHexSHA(version) {
+		return version[:7]
+	}
+	return version
 }
 
 // recordInstalledImage persists the reference an update actually installed, so
@@ -1066,9 +1279,15 @@ func restartHostServiceSoon(slug string) error {
 // is older than the one that last bootstrapped it. args["force"] (bool)
 // bypasses that guard for this one call, mirroring the CLI's --force flag.
 func (h *Handler) Bootstrap(ctx context.Context, opts BootstrapOpts, args map[string]any, emit Emit) (map[string]any, error) {
+	if emit == nil {
+		emit = noopEmit
+	}
 	if force, _ := args["force"].(bool); force {
 		opts.Force = true
 	}
+	// Same reason as Reinstall's: this recreates the workspace container from
+	// whatever workspaceImage() reads out of state.json.
+	h.reconcileRecordedImage(ctx, opts, emit)
 	return h.runModules(ctx, opts, true, emit)
 }
 
@@ -1405,9 +1624,7 @@ func (h *Handler) probeHealth(ctx context.Context) (bool, any) {
 	if version == "" {
 		return true, nil
 	}
-	if isLongHexSHA(version) {
-		version = version[:7]
-	}
+	version = shortenSHAVersion(version)
 	return true, version
 }
 
