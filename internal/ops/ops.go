@@ -141,6 +141,28 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 			"which does not exist on this host — it is linked lean. "+
 			"exec_*, list_processes and fs_* are the verbs this host serves", verb)
 	}
+	// Serialize the verbs that RECREATE the workspace container, per
+	// machine, before dispatching any of them — see
+	// workspace_lock_unix.go for the double-click incident this closes and
+	// why the lock is a kernel-released flock in MachineDir rather than a
+	// mutex on this Handler.
+	//
+	// Scoped deliberately to the three that CREATE. stop/restart/uninstall
+	// stay unlocked because they are the recovery path: a user whose
+	// update is wedged must still be able to stop or bounce the container,
+	// and putting those behind the same lock would strand them behind the
+	// very operation they are trying to escape.
+	if workspaceRecreateVerbs[verb] {
+		release, err := acquireWorkspaceLock(verb, emit)
+		if err != nil {
+			// A contention rejection already emitted its own user-facing
+			// warning inside acquireWorkspaceLock; returning the error is
+			// what stops this duplicate request from running.
+			return nil, err
+		}
+		defer release()
+	}
+
 	switch verb {
 	case "stop":
 		return h.Stop(ctx, emit)
@@ -227,6 +249,16 @@ var workspaceLifecycleVerbs = map[string]bool{
 	"reinstall": true,
 	"bootstrap": true,
 	"update":    true,
+}
+
+// workspaceRecreateVerbs is the subset of the above that pulls/syncs
+// workspace source and recreates the container from it — i.e. the ones that
+// corrupt each other when two run at once, and therefore the ones Dispatch
+// takes the per-machine lifecycle lock for. See workspace_lock_unix.go.
+var workspaceRecreateVerbs = map[string]bool{
+	"update":    true,
+	"reinstall": true,
+	"bootstrap": true,
 }
 
 // "self-update" is deliberately NOT in that list, and this is the whole
@@ -725,10 +757,46 @@ func parseImagePruneOutput(out string) (count int, reclaimed string) {
 	return count, reclaimed
 }
 
+// removeStaleUpdateSeeds deletes every leftover `<workspace>-update*` seed
+// container: the fixed-name one older versions of this binary created, plus
+// any uniquely-named one orphaned by a pass that was killed between `podman
+// create` and its deferred cleanup.
+//
+// MUST only be called while holding the per-machine lifecycle lock (see
+// workspace_lock_unix.go) — a sweep racing a concurrent update would delete
+// that update's live seed, which is precisely the bug the unique naming
+// closed. Best-effort throughout: these containers are never running (they
+// exist only to be `podman cp`-ed out of), so a failure to remove one is a
+// disk-space nit, not a correctness problem.
+func (h *Handler) removeStaleUpdateSeeds(ctx context.Context, emit Emit) {
+	// `--filter name=` is a regex match in podman, anchored here so it can
+	// never widen to the workspace container itself.
+	out, err := h.runner().Run(ctx, "podman", "ps", "-a", "--format", "{{.Names}}",
+		"--filter", "name=^"+WorkspaceContainer+"-update")
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Fields(out) {
+		// Defense in depth against a future rename making the filter above
+		// match more than intended: never touch the workspace container.
+		if name == "" || name == WorkspaceContainer {
+			continue
+		}
+		if _, rmErr := h.runner().Run(ctx, "podman", "rm", "-f", name); rmErr == nil {
+			emit("info", "update", "removed stale update seed container "+name)
+		}
+	}
+}
+
 // Update pulls the latest aw-workspace image, syncs the baked source tree into
 // the host bind-mount, and recreates the workspace container. Mutable runtime
 // state under .aw-workspace is preserved; source files are replaced so deletes
 // in the image actually take effect on already-installed hosts.
+//
+// Serialized per machine by Dispatch's workspace-lifecycle lock — see
+// workspace_lock_unix.go. Calling this concurrently (which a double-clicked
+// Update button did until 2026-10-08) interleaves two source syncs into the
+// same host dir and recreates the container underneath the other pass.
 func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[string]any, emit Emit) (map[string]any, error) {
 	if emit == nil {
 		emit = noopEmit
@@ -830,8 +898,25 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	}
 	defer os.RemoveAll(staging)
 
-	seedContainer := WorkspaceContainer + "-update"
-	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", seedContainer)
+	// Unique per pass, same convention as the staging dir just above, and
+	// for the same reason. This used to be the FIXED name
+	// WorkspaceContainer+"-update", which made two overlapping updates
+	// destroy each other twice over: the `rm -f` below force-removed the
+	// seed the other pass was still `podman cp`-ing out of, and the
+	// deferred cleanup removed whichever seed existed at the time it ran —
+	// i.e. the OTHER pass's. Dispatch's per-machine lock is the primary
+	// fix (no two passes should overlap at all now); this is the belt to
+	// that braces, and it also means a seed leaked by a killed update can
+	// never be mistaken for, or clobber, a live one.
+	seedContainer := fmt.Sprintf("%s-update-%d", WorkspaceContainer, time.Now().UnixNano())
+	// Sweep seeds left behind by a killed pass, and the single fixed-name
+	// seed older versions of this binary created. Safe to do unconditionally
+	// because Dispatch holds the per-machine lifecycle lock for the whole
+	// of this function, so nothing else can own a seed right now — without
+	// that lock this sweep would be the very cross-kill the unique name
+	// above exists to prevent. Best-effort: a seed we fail to remove costs
+	// disk, not correctness, since ours is uniquely named.
+	h.removeStaleUpdateSeeds(ctx, emit)
 	if _, err := h.runner().Run(ctx, "podman", "create", "--name", seedContainer, recreateImage); err != nil {
 		return nil, fmt.Errorf("podman create update seed: %w", err)
 	}
