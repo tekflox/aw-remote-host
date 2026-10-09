@@ -726,6 +726,55 @@ func TestUpdateRecordsTheImageOnceTheRecreateIsVerified(t *testing.T) {
 	}
 }
 
+// TestUpdateSnapshotsTheOutgoingWorkspaceLogBeforeRecreating is the
+// regression test for "Log do workspace no aw-console (streaming)"
+// (observability:workspace-log-stream-console): podman only ever knows
+// about the CURRENT container, so once Update recreates the workspace
+// container the one log an operator most wants — what the PREVIOUS boot
+// was doing — is gone with no way to ask podman for it again. Update must
+// save it to disk before the recreate, not after.
+func TestUpdateSnapshotsTheOutgoingWorkspaceLogBeforeRecreating(t *testing.T) {
+	stubRunModule(t)
+	statePath := useTempState(t)
+	t.Setenv("AW_WORKSPACE_HOST_DIR", t.TempDir())
+	const target = "ghcr.io/fredericowu/aw-workspace:v0.42.0"
+	recreated := imageRepository(target) + "@sha256:new"
+	r := &copyingRunner{fakeRunner: newFakeRunner()}
+	stubVerifiedImage(r.fakeRunner, target, "sha256:new")
+	stubRecreatedWorkspace(r.fakeRunner, recreated, "id-v0420", "id-v0420", "v0.42.0")
+	r.fakeRunner.on("the previous boot's last line\n", "podman", "logs", "--timestamps", WorkspaceContainer)
+	h := &Handler{Runner: r, Opts: BootstrapOpts{ExtractDir: t.TempDir(), StatePath: statePath}}
+	emit, _ := collectEmits()
+
+	if _, err := h.Update(context.Background(), h.Opts, map[string]any{"version": "v0.42.0"}, emit); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	data, err := h.WorkspaceLogs(context.Background(), map[string]any{"source": "previous"}, nil)
+	if err != nil {
+		t.Fatalf("WorkspaceLogs(source=previous): %v", err)
+	}
+	if data["found"] != true || data["content"] != "the previous boot's last line\n" {
+		t.Fatalf("expected the pre-recreate snapshot to be readable as the previous boot's log, got %v", data)
+	}
+
+	// The snapshot call must land BEFORE the container is removed — not
+	// after, where there would be nothing left for podman logs to read.
+	removeIdx, snapshotIdx := -1, -1
+	for i, call := range r.fakeRunner.calls {
+		if len(call) >= 2 && call[0] == "podman" && call[1] == "rm" {
+			removeIdx = i
+		}
+		if len(call) >= 3 && call[0] == "podman" && call[1] == "logs" && call[2] == "--timestamps" && len(call) == 4 {
+			snapshotIdx = i
+		}
+	}
+	if snapshotIdx == -1 || removeIdx == -1 || snapshotIdx > removeIdx {
+		t.Fatalf("expected the snapshot's podman logs call before the container removal, snapshotIdx=%d removeIdx=%d calls=%v",
+			snapshotIdx, removeIdx, r.fakeRunner.calls)
+	}
+}
+
 // TestReinstallReconcilesAStateImageTheContainerIsNotRunning covers the half of
 // the 2026-10-08 fix that closing the bad write cannot reach: hosts that ALREADY
 // took one. Reinstall recreates from whatever workspaceImage() reads out of

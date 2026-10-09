@@ -166,7 +166,24 @@ func useTempState(t *testing.T) string {
 	prev := workspaceStatePath
 	workspaceStatePath = func() (string, error) { return path, nil }
 	t.Cleanup(func() { workspaceStatePath = prev })
+
+	// Update also snapshots the outgoing workspace container's log to this
+	// process's "machine" state dir right before recreating the container
+	// (see snapshotWorkspaceLogBeforeRecreate) — redirect that to a
+	// throwaway directory too, same reasoning as the state.json override
+	// above: a test must never depend on, or write into, this process's
+	// real $HOME.
+	useTempWorkspaceLogSnapshotDir(t)
 	return path
+}
+
+func useTempWorkspaceLogSnapshotDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	prev := workspaceLogSnapshotDirFunc
+	workspaceLogSnapshotDirFunc = func() (string, error) { return dir, nil }
+	t.Cleanup(func() { workspaceLogSnapshotDirFunc = prev })
+	return dir
 }
 
 func TestWorkspaceImageUsesEnvironmentOverride(t *testing.T) {

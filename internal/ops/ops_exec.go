@@ -198,6 +198,25 @@ func (h *Handler) ExecStart(ctx context.Context, args map[string]any, emit Emit)
 	}
 
 	timeout := time.Duration(floatArg(args, "timeout_s", execDefaultTimeout.Seconds()) * float64(time.Second))
+	shellName, shellArgs := shellCommand(command)
+	return h.startTrackedProcess(command, shellName, shellArgs, timeout, emit)
+}
+
+// startTrackedProcess is the job-bookkeeping core ExecStart uses — spawn,
+// register in the shared jobs registry, wire capped output buffers, and
+// own the goroutine that waits on it and records a terminal status. Pulled
+// out of ExecStart so other read-only verbs (workspace_logs) can run a
+// FIXED, non-shell-interpreted argv (name/args given directly, never a
+// string handed to a shell) through the exact same job/exec_status/
+// exec_wait/exec_kill contract instead of inventing a second one.
+//
+// label is purely cosmetic (what shows up as the job's "command" in
+// exec_status/list_processes and in the emitted activity lines) — it does
+// NOT have to be how name/args were actually constructed.
+func (h *Handler) startTrackedProcess(label, name string, args []string, timeout time.Duration, emit Emit) (map[string]any, error) {
+	if emit == nil {
+		emit = noopEmit
+	}
 	if timeout <= 0 || timeout > execHardTimeout {
 		timeout = execHardTimeout
 	}
@@ -207,15 +226,14 @@ func (h *Handler) ExecStart(ctx context.Context, args map[string]any, emit Emit)
 		return nil, err
 	}
 
-	// Deliberately NOT derived from ctx (the cmd-frame's request context,
-	// which link.go's handleCmd may cancel once cmd_result is written) —
-	// this job must keep running independently after exec_start replies.
+	// Deliberately NOT derived from the caller's request context (which
+	// link.go's handleCmd may cancel once cmd_result is written) — this
+	// job must keep running independently after the verb replies.
 	jobCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	shellName, shellArgs := shellCommand(command)
-	cmd := exec.CommandContext(jobCtx, shellName, shellArgs...)
+	cmd := exec.CommandContext(jobCtx, name, args...)
 	configureProcessGroup(cmd)
 	// Go's default ctx-cancel behavior only kills cmd.Process itself — if
-	// the shell forked instead of exec'ing (a grandchild inherits the
+	// the child forked instead of exec'ing (a grandchild inherits the
 	// stdout/stderr pipe fds this package wires below), that grandchild
 	// keeps the pipe open and cmd.Wait() hangs past the deadline waiting
 	// for EOF even though the direct child is long dead. Kill the whole
@@ -233,7 +251,7 @@ func (h *Handler) ExecStart(ctx context.Context, args map[string]any, emit Emit)
 
 	job := &execJob{
 		ID:        id,
-		Command:   command,
+		Command:   label,
 		StartedAt: time.Now(),
 		status:    ExecRunning,
 		stdout:    &capBuffer{},
@@ -251,7 +269,7 @@ func (h *Handler) ExecStart(ctx context.Context, args map[string]any, emit Emit)
 	}
 	job.PID = cmd.Process.Pid
 	jobs.add(job)
-	emit("info", "exec", fmt.Sprintf("job %s started (pid %d): %s", id, job.PID, command))
+	emit("info", "exec", fmt.Sprintf("job %s started (pid %d): %s", id, job.PID, label))
 
 	go func() {
 		defer close(job.done)

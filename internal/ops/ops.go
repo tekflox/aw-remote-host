@@ -123,7 +123,7 @@ type Handler struct {
 
 // Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|"update"|
 // "self-update"|"uninstall"|"health"|"exec_start"|"exec_status"|"exec_wait"|
-// "exec_kill"|"list_processes"|"agent_sessions"|"fs_stat"|"fs_list"|"fs_mkdir"|"fs_delete"|
+// "exec_kill"|"list_processes"|"workspace_logs"|"agent_sessions"|"fs_stat"|"fs_list"|"fs_mkdir"|"fs_delete"|
 // "fs_read_chunk"|"fs_write_chunk"|"firewall_apply"|"firewall_status"|
 // "vpn_status"|"vpn_bootstrap"|"vpn_advertise_exit"|"vpn_use_exit"|
 // "vpn_clear_exit"|"vpn_public_ip"|"vpn_external_route"|
@@ -188,6 +188,8 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.ExecWait(ctx, args)
 	case "exec_kill":
 		return h.ExecKill(ctx, args, emit)
+	case "workspace_logs":
+		return h.WorkspaceLogs(ctx, args, emit)
 	case "list_processes":
 		return h.ListProcesses(ctx), nil
 	case "agent_sessions":
@@ -243,12 +245,13 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 // have podman in the first place. workspaceRuntimeSupported is the
 // build-tagged switch — see proc_unix.go / proc_windows.go.
 var workspaceLifecycleVerbs = map[string]bool{
-	"stop":      true,
-	"restart":   true,
-	"uninstall": true,
-	"reinstall": true,
-	"bootstrap": true,
-	"update":    true,
+	"stop":           true,
+	"restart":        true,
+	"uninstall":      true,
+	"reinstall":      true,
+	"bootstrap":      true,
+	"update":         true,
+	"workspace_logs": true,
 }
 
 // workspaceRecreateVerbs is the subset of the above that pulls/syncs
@@ -1116,6 +1119,7 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 		}
 	}
 
+	h.snapshotWorkspaceLogBeforeRecreate(ctx, emit)
 	emit("info", "update", "recreating workspace container from "+recreateImage)
 	// Warm runner containers depend on the workspace container. A plain rm
 	// fails while they exist; --depend removes those ephemeral dependents as
