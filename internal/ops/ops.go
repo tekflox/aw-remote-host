@@ -614,6 +614,147 @@ func (h *Handler) Reinstall(ctx context.Context, opts BootstrapOpts, emit Emit) 
 // Only a PROVEN case — the image's own commit is a strict ancestor of the
 // host's HEAD — refuses outright; args["force"]=true overrides it for an
 // intentional rollback.
+// imageWorkspaceVersion reads AW_WORKSPACE_VERSION out of the image's own
+// env — the build stamps it from the release tag (see the aw-workspace
+// Dockerfile's ARG/ENV). Empty when the image predates that wiring, or is a
+// local "dev" build, in which case every caller treats it as "can't tell".
+func (h *Handler) imageWorkspaceVersion(ctx context.Context, image string) string {
+	out, err := h.runner().Run(ctx, "podman", "image", "inspect", image,
+		"--format", "{{range .Config.Env}}{{println .}}{{end}}")
+	if err != nil {
+		return ""
+	}
+	version := ""
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "AW_WORKSPACE_VERSION="); ok && v != "" && v != "dev" {
+			version = v
+		}
+	}
+	return version
+}
+
+// gitIn builds args for a git call against hostDir as this daemon's root
+// user. safe.directory is not optional: the daemon is root while the tree is
+// owned by the workspace uid (1001), so without it every call dies with
+// "detected dubious ownership" — and a guard that cannot run is worse than
+// no guard, because it looks like one that passed.
+func gitIn(hostDir string, args ...string) []string {
+	return append([]string{"-c", "safe.directory=" + hostDir, "-C", hostDir}, args...)
+}
+
+// guardHostUncommittedEdits refuses a sync that would overwrite uncommitted
+// work in the host tree.
+//
+// guardHostNotAheadOfImage below covers COMMITTED work, and only that: it
+// compares HEADs. Uncommitted edits are invisible to a HEAD comparison, and
+// they are the likelier loss — someone editing a file in the workspace has
+// not necessarily committed it when they hit Update. syncWorkspaceSource
+// then `os.RemoveAll`s every top-level entry the image ships and copies over
+// it, so the edit is gone with no signal at all. Frederico, 2026-10-10:
+// "eu nao quero perder mudanças locais".
+//
+// Only TRACKED modifications block. Untracked files are left out on purpose:
+// a live workspace accumulates them constantly (scratch dirs, logs, app
+// state), they are almost never the thing someone is editing, and blocking
+// on them would make Update refuse forever on a normal host — a guard that
+// always fires gets disabled, which costs more than it saves.
+//
+// Best-effort, like its sibling: a host with no git, or no checkout, is not
+// blocked. Failing closed there would strand updates on every host that
+// never had a repo to begin with. force=true overrides.
+func (h *Handler) guardHostUncommittedEdits(ctx context.Context, hostDir string, force bool, emit Emit) error {
+	out, err := h.runner().Run(ctx, "git", gitIn(hostDir, "status", "--porcelain")...)
+	if err != nil {
+		return nil // not a checkout, or git can't run — nothing provable here
+	}
+	var dirty []string
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 3 {
+			continue
+		}
+		// Porcelain v1: first two columns are the index/worktree status.
+		// "??" is untracked and "!!" ignored — neither counts, see above.
+		if strings.HasPrefix(line, "??") || strings.HasPrefix(line, "!!") {
+			continue
+		}
+		dirty = append(dirty, strings.TrimSpace(line))
+	}
+	if len(dirty) == 0 {
+		return nil
+	}
+	shown := dirty
+	if len(shown) > 10 {
+		shown = shown[:10]
+	}
+	detail := strings.Join(shown, "; ")
+	if len(dirty) > len(shown) {
+		detail += fmt.Sprintf("; … +%d", len(dirty)-len(shown))
+	}
+	if force {
+		emit("warning", "update", fmt.Sprintf(
+			"%s has %d uncommitted change(s) and force=true — syncing anyway, this WILL discard them: %s",
+			hostDir, len(dirty), detail))
+		return nil
+	}
+	emit("error", "update", fmt.Sprintf(
+		"refusing to sync: %s has %d uncommitted change(s) the image would overwrite — commit, stash or revert them, or re-run with force=true to discard: %s",
+		hostDir, len(dirty), detail))
+	return fmt.Errorf("%s has %d uncommitted change(s): refusing to overwrite them without force", hostDir, len(dirty))
+}
+
+// realignHostGitHead points the host checkout's HEAD at the commit the image
+// was built from, AFTER its tree has been synced from that image.
+//
+// Without this the two drift apart permanently and both guards rot. The sync
+// replaces the FILES but never the git metadata, so HEAD keeps naming an
+// older commit while the tree holds newer content — measured on the aw host
+// 2026-10-09: HEAD at bb23bd8 while the files were v0.49.0 (7524dd0). Three
+// consequences, each worse than the last:
+//
+//   - `git status` reports every synced file as modified. 11 of them on that
+//     host, none of them a real edit.
+//   - which makes a genuine local edit indistinguishable from image content,
+//     so guardHostUncommittedEdits above would refuse every update forever.
+//   - and `git log` lies about which version is running, which is how three
+//     separate diagnoses went wrong in one session.
+//
+// `reset --mixed` moves HEAD and the index and LEAVES THE WORKING TREE
+// ALONE — the tree is already the image's content at this point, so the
+// result is a clean status. A file the image does not ship stays untracked
+// and untouched.
+//
+// Best-effort by design: a host whose git cannot resolve the image's commit
+// (shallow clone, no tags fetched, unrelated history) is left exactly as it
+// was. Failing the update here would turn a cosmetic misalignment into a
+// stranded host.
+func (h *Handler) realignHostGitHead(ctx context.Context, hostDir, version string, emit Emit) {
+	version = strings.TrimSpace(version)
+	if version == "" || version == "dev" {
+		return
+	}
+	if _, err := h.runner().Run(ctx, "git", gitIn(hostDir, "rev-parse", "--git-dir")...); err != nil {
+		return // not a checkout — nothing to realign
+	}
+	out, err := h.runner().Run(ctx, "git", gitIn(hostDir, "rev-parse", version+"^{commit}")...)
+	if err != nil {
+		emit("warning", "update", fmt.Sprintf(
+			"synced the tree but could not resolve %s in %s's git history — HEAD still names an older commit, so `git status` there will show the synced files as modified",
+			version, hostDir))
+		return
+	}
+	commit := strings.TrimSpace(out)
+	if commit == "" {
+		return
+	}
+	if _, err := h.runner().Run(ctx, "git", gitIn(hostDir, "reset", "--mixed", commit)...); err != nil {
+		emit("warning", "update", fmt.Sprintf(
+			"synced the tree but could not move %s's HEAD to %s (%v) — `git status` there will show the synced files as modified",
+			hostDir, commit, err))
+		return
+	}
+	emit("info", "update", fmt.Sprintf("realigned %s's git HEAD to %s (%s)", hostDir, commit, version))
+}
+
 func (h *Handler) guardHostNotAheadOfImage(ctx context.Context, hostDir, image string, force bool, emit Emit) error {
 	// safe.directory is not optional here, and installing `git` in the image
 	// (v0.1.96) was only half the fix. This daemon runs as root while the host
@@ -651,15 +792,7 @@ func (h *Handler) guardHostNotAheadOfImage(ctx context.Context, hostDir, image s
 		return nil // not a git checkout (or git unavailable) — nothing to guard
 	}
 
-	imageHead := ""
-	if out, err := h.runner().Run(ctx, "podman", "image", "inspect", image,
-		"--format", "{{range .Config.Env}}{{println .}}{{end}}"); err == nil {
-		for _, line := range strings.Split(out, "\n") {
-			if v, ok := strings.CutPrefix(strings.TrimSpace(line), "AW_WORKSPACE_VERSION="); ok && v != "" && v != "dev" {
-				imageHead = v
-			}
-		}
-	}
+	imageHead := h.imageWorkspaceVersion(ctx, image)
 	if imageHead == "" {
 		return nil // unknown image version — nothing to guard
 	}
@@ -888,6 +1021,12 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	if err := h.guardHostNotAheadOfImage(ctx, hostDir, recreateImage, force, emit); err != nil {
 		return nil, err
 	}
+	// COMMITTED work is the guard above; this one covers the uncommitted
+	// kind, which a HEAD comparison cannot see and which is the likelier
+	// thing to lose. Both run before anything is written.
+	if err := h.guardHostUncommittedEdits(ctx, hostDir, force, emit); err != nil {
+		return nil, err
+	}
 
 	staging := filepath.Join(hostDir, fmt.Sprintf(".aw-workspace-update-%d", time.Now().UnixNano()))
 	if err := os.RemoveAll(staging); err != nil {
@@ -931,6 +1070,10 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 		return nil, err
 	}
 	emit("info", "update", fmt.Sprintf("synced %d top-level entries from the image into %s", len(written), hostDir))
+	// The tree is now the image's; make the git metadata say so too.
+	// Skipping this is what let HEAD and the files drift apart for weeks and
+	// left guardHostUncommittedEdits above with no usable baseline.
+	h.realignHostGitHead(ctx, hostDir, h.imageWorkspaceVersion(ctx, recreateImage), emit)
 	// copyPath (inside syncWorkspaceSource) writes as this process's own
 	// user, which leaves the just-synced entries owned by someone the
 	// `ubuntu` user inside the container can't write to. Two cases:
