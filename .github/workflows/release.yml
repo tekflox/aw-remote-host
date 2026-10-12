@@ -32,7 +32,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Exported so the `image` job builds the SAME version this job releases,
     # rather than resolving its own. There is exactly one version authority in
     # this repo and it is the step below — a second workflow on its own push
@@ -40,7 +40,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -160,7 +160,7 @@ jobs:
       image: ${{ steps.ref.outputs.image }}
       digest: ${{ steps.push.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -232,7 +232,7 @@ jobs:
   # is the same failure as a stale build wearing a different hat.
   notify:
     needs: [build, image]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Notify aw-backend release registry
         env:
