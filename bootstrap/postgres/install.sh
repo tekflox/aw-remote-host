@@ -44,7 +44,10 @@ POSTGRES_GID="999"
 
 # Host-port publish is optional — see bootstrap/lib/publish.sh for why a taken
 # port must not fail the install.
-mapfile -t PUBLISH_ARGS < <(publish_args postgres 5432 "${AW_POSTGRES_PUBLISH:-}")
+PUBLISH_ARGS=()
+while IFS= read -r line; do
+  PUBLISH_ARGS+=("$line")
+done < <(publish_args postgres 5432 "${AW_POSTGRES_PUBLISH:-}")
 
 # Shared network so the workspace container reaches postgres by name (a BYOD
 # host has no aw-sandbox netns to piggyback on 127.0.0.1).

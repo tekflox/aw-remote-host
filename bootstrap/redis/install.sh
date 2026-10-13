@@ -31,7 +31,10 @@ REDIS_GID="999"
 
 # Host-port publish is optional — see bootstrap/lib/publish.sh for why a taken
 # port must not fail the install.
-mapfile -t PUBLISH_ARGS < <(publish_args redis 6379 "${AW_REDIS_PUBLISH:-}")
+PUBLISH_ARGS=()
+while IFS= read -r line; do
+  PUBLISH_ARGS+=("$line")
+done < <(publish_args redis 6379 "${AW_REDIS_PUBLISH:-}")
 
 # Shared network so the workspace container reaches redis by name.
 ensure_network "$NETWORK_NAME"
