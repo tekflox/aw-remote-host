@@ -78,14 +78,15 @@ if [ "$(uname -s)" = "Darwin" ]; then
   # error message is accurate, but every module here still drives
   # containers via the `podman` CLI, so podman itself must end up working.
   if ! command -v podman >/dev/null 2>&1; then
-    if command -v brew >/dev/null 2>&1; then
-      echo "podman: installing via Homebrew"
-      brew install podman
+    if command -v brew >/dev/null 2>&1 && brew install podman; then
+      echo "podman: installed via Homebrew"
     else
-      echo "podman: Homebrew not found — installing a vendored podman (no package manager/admin rights needed)"
+      echo "podman: Homebrew unavailable or the install didn't succeed (common on a dedicated service account that doesn't own the Homebrew prefix) — installing a vendored podman instead (no package manager/admin rights needed)"
       install_vendored_podman
     fi
   fi
+
+  command -v podman >/dev/null 2>&1 || { echo "podman: no working install after brew + vendored fallback" >&2; exit 1; }
 
   ensure_applehv_provider
 

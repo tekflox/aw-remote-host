@@ -26,9 +26,11 @@ up working regardless of which backend you use:
 - If none is running, `install.sh` installs `podman` via Homebrew (if
   available) and starts a podman machine (`podman machine init && podman
   machine start`).
-- **If Homebrew isn't available either** (a clean BYOD Mac — no brew, no
-  colima, no Docker Desktop), `install.sh` vendors podman itself instead of
-  giving up — see "No Homebrew" below.
+- **If Homebrew isn't available, or `brew install podman` fails** (e.g. a
+  dedicated service account that doesn't own the Homebrew prefix — a clean
+  BYOD Mac with no brew, no colima, no Docker Desktop is the other case),
+  `install.sh` falls back to vendoring podman itself instead of giving up —
+  see "No Homebrew" below.
 - If colima or Docker Desktop is already running, both scripts detect it
   and treat it as OK — but if `podman info` still fails against it, the
   fix is the same: `podman machine init && podman machine start`.
