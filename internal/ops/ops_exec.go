@@ -22,9 +22,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/tekflox/aw-remote-host/internal/bootstrap"
 )
 
 const (
@@ -231,6 +234,12 @@ func (h *Handler) startTrackedProcess(label, name string, args []string, timeout
 	// job must keep running independently after the verb replies.
 	jobCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	cmd := exec.CommandContext(jobCtx, name, args...)
+	if dir, ok := bootstrap.PodmanVendoredBinDir(); ok {
+		// Same PATH-prepend as execRunner.Run above — WorkspaceLogs' follow-
+		// mode podman stream and ExecStart's shell commands both go through
+		// this shared execution core, so one fix point covers both callers.
+		cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
 	configureProcessGroup(cmd)
 	// Go's default ctx-cancel behavior only kills cmd.Process itself — if
 	// the child forked instead of exec'ing (a grandchild inherits the

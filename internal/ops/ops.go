@@ -68,7 +68,17 @@ type Runner interface {
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, name, args...)
+	if dir, ok := bootstrap.PodmanVendoredBinDir(); ok {
+		// Same duplicate-last-wins PATH-prepend trick as
+		// bootstrap/runner.go's runScript — without it, every operational
+		// verb (install/start/stop/health) inherits this long-running
+		// process's own os.Environ() and can't see a vendored macOS podman
+		// install that bootstrap already resolved. No-op when podman is
+		// already on PATH normally (the common case).
+		cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 

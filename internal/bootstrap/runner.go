@@ -49,7 +49,7 @@ func runScript(ctx context.Context, path string, opts RunOptions) (string, error
 	}
 	cmd := exec.CommandContext(ctx, "bash", path)
 	env := append(os.Environ(), opts.Env...)
-	if dir, ok := podmanVendoredBinDir(); ok {
+	if dir, ok := PodmanVendoredBinDir(); ok {
 		// exec.Cmd keeps only the last value for a duplicate env key, so
 		// appending PATH last here overrides the inherited os.Environ()
 		// one — this is how a vendored podman (bootstrap/podman/install.sh's
@@ -68,11 +68,13 @@ func runScript(ctx context.Context, path string, opts RunOptions) (string, error
 	return buf.String(), err
 }
 
-// podmanVendoredBinDir reports the vendored podman bin directory written by
+// PodmanVendoredBinDir reports the vendored podman bin directory written by
 // bootstrap/podman/install.sh's install_vendored_podman() (macOS, no brew),
 // if it exists on this machine — the runner's half of the dependency
-// propagation contract documented in bootstrap/lib/README.md.
-func podmanVendoredBinDir() (string, bool) {
+// propagation contract documented in bootstrap/lib/README.md. Exported so
+// internal/ops can apply the same PATH-prepend to its own podman shellouts
+// (install/start/stop/health/logs), not just bootstrap module scripts.
+func PodmanVendoredBinDir() (string, bool) {
 	home, err := homedir.Dir()
 	if err != nil {
 		return "", false
