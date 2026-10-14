@@ -68,12 +68,51 @@ func runScript(ctx context.Context, path string, opts RunOptions) (string, error
 	return buf.String(), err
 }
 
+// ApplyVendoredPodmanPATH prepends the vendored podman bin dir (if any) onto
+// THIS PROCESS's own PATH, once, at startup — before anything calls
+// exec.Command("podman", ...) with a bare name.
+//
+// This has to happen before any such call, not around it: Go's
+// exec.Command resolves a bare executable name via LookPath AT
+// CONSTRUCTION TIME, using the calling process's os.Getenv("PATH") — not
+// whatever cmd.Env a caller sets afterward, which only affects what the
+// CHILD sees once started. execRunner.Run and startTrackedProcess used to
+// each set cmd.Env with this same prepend, which looked right and is what
+// every manual reproduction confirmed — right up until the one caller that
+// passes a bare "podman" straight to exec.CommandContext (ops.go's
+// Health/Stop/Restart/etc., and ops_logs.go's follow-mode WorkspaceLogs) hit
+// a host where podman was NOT on the inherited PATH at all (a vendored-only
+// macOS install, PATH=/usr/bin:/bin:/usr/sbin:/sbin) — LookPath failed before
+// a process was ever forked, every time, deterministically. startTrackedProcess's
+// OTHER caller (ExecStart) never caught this: it invokes a bare "sh" (which
+// IS on that base PATH), and the shell child does its own PATH lookup for the
+// "podman" text inside the command string using its inherited environment —
+// a lookup that happens entirely downstream of Go's own LookPath, never
+// vulnerable to this timing gap.
+//
+// Setting PATH on the process itself, instead of patching it onto each
+// exec.Cmd after construction, closes this for every call site at once —
+// present and future — rather than requiring every new "podman"/"curl"/"df"
+// shellout to remember the same patch. Returns the dir it prepended and
+// whether it did anything, for logging/tests. Idempotent to call more than
+// once (tests do); a dev host with no vendored install at all is a no-op.
+func ApplyVendoredPodmanPATH() (string, bool) {
+	dir, ok := PodmanVendoredBinDir()
+	if !ok {
+		return "", false
+	}
+	os.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return dir, true
+}
+
 // PodmanVendoredBinDir reports the vendored podman bin directory written by
 // bootstrap/podman/install.sh's install_vendored_podman() (macOS, no brew),
 // if it exists on this machine — the runner's half of the dependency
 // propagation contract documented in bootstrap/lib/README.md. Exported so
 // internal/ops can apply the same PATH-prepend to its own podman shellouts
-// (install/start/stop/health/logs), not just bootstrap module scripts.
+// (install/start/stop/health/logs), not just bootstrap module scripts, and
+// so ApplyVendoredPodmanPATH above can apply it once, process-wide, at
+// startup.
 func PodmanVendoredBinDir() (string, bool) {
 	home, err := homedir.Dir()
 	if err != nil {

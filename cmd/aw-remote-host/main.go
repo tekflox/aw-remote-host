@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/tekflox/aw-remote-host/internal/bootstrap"
 	"github.com/tekflox/aw-remote-host/internal/rlog"
 )
 
@@ -33,6 +34,12 @@ const defaultControlPlane = "https://api.aw.tekflox.com"
 func main() {
 	redirectOutputIfWindowless()
 	rlog.Init(os.Stdout)
+	// Must run before any command below ever shells out to a bare "podman" —
+	// see ApplyVendoredPodmanPATH's own doc for why this has to happen here,
+	// once, rather than per-call. No-op on a host with no vendored install.
+	if dir, applied := bootstrap.ApplyVendoredPodmanPATH(); applied {
+		rlog.Printf("main: prepended vendored podman bin dir onto PATH: %s", dir)
+	}
 
 	if len(os.Args) < 2 {
 		usage()

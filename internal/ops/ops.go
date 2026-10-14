@@ -69,16 +69,18 @@ type Runner interface {
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	// Deliberately NOT patching cmd.Env with the vendored-podman PATH-prepend
+	// here: exec.CommandContext resolves a bare `name` via LookPath AT THIS
+	// CONSTRUCTION LINE, using the process's own os.Getenv("PATH") — a
+	// cmd.Env set afterward only affects what the CHILD sees once started,
+	// too late to influence this lookup. That is the bug this function used
+	// to have (every verb that passes "podman" straight to Run, including
+	// Health(), failed LookPath before ever forking on a host where podman
+	// only exists via the vendored dir). The fix is at startup instead — see
+	// bootstrap.ApplyVendoredPodmanPATH, called once from main() — so by the
+	// time any Run() call constructs its exec.Cmd, the process's own PATH
+	// already has the vendored dir on it and this plain lookup just works.
 	cmd := exec.CommandContext(ctx, name, args...)
-	if dir, ok := bootstrap.PodmanVendoredBinDir(); ok {
-		// Same duplicate-last-wins PATH-prepend trick as
-		// bootstrap/runner.go's runScript — without it, every operational
-		// verb (install/start/stop/health) inherits this long-running
-		// process's own os.Environ() and can't see a vendored macOS podman
-		// install that bootstrap already resolved. No-op when podman is
-		// already on PATH normally (the common case).
-		cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -1855,6 +1857,15 @@ func (h *Handler) Health(ctx context.Context) (result map[string]any) {
 	out, err := h.runner().Run(ctx, "podman", "inspect", "--format",
 		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
 	if err != nil {
+		// Without this, "the shellout failed to even run" (a bad PATH, podman
+		// missing, the binary itself erroring) and "the shellout ran fine and
+		// the container really is stopped" are indistinguishable from the
+		// offline{} shape alone — which is exactly how the LookPath-timing bug
+		// this log line was added for went unnoticed through multiple
+		// independent investigations. out is included: podman writes its
+		// error message to stdout/stderr, which Run's CombinedOutput folds in
+		// here, not into err itself.
+		rlog.Printf("ops: health: podman inspect failed: %v (output: %q)", err, strings.TrimSpace(out))
 		return offline
 	}
 	parts := strings.SplitN(strings.TrimSpace(out), "\t", 2)
