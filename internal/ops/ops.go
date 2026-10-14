@@ -23,6 +23,7 @@ import (
 	"github.com/tekflox/aw-remote-host/internal/bootstrap"
 	"github.com/tekflox/aw-remote-host/internal/homedir"
 	"github.com/tekflox/aw-remote-host/internal/hostpower"
+	"github.com/tekflox/aw-remote-host/internal/rlog"
 	"github.com/tekflox/aw-remote-host/internal/state"
 	"github.com/tekflox/aw-remote-host/internal/updater"
 )
@@ -1812,6 +1813,20 @@ func effectiveWorkers(statePath string) string {
 	return strconv.Itoa(st.EffectiveWorkers())
 }
 
+// healthTimeout bounds Handler.Health()'s own call chain independently of
+// the ambient ctx, which on the /link tunnel's dispatch path is the
+// WS-CONNECTION-LIFETIME context (see pump/handleCmd in
+// internal/link/link.go), not a per-command deadline. probeHealth already
+// carries its own `curl --max-time 5`, but containerStats' `podman stats
+// --no-stream` and diskUsage's `df` do not — without this, a single wedged
+// shellout in either could silently eat the whole client-side dispatch
+// budget (30s in RemoteHostPlacementDriver.COMMAND_TIMEOUT_S) with zero
+// signal anywhere, which is exactly what made the "health" verb hang
+// end-to-end while every sibling verb kept round-tripping fine over the
+// same live tunnel. A var, not a const, so a test can shrink it instead of
+// waiting out the real 10s.
+var healthTimeout = 10 * time.Second
+
 // Health gathers {healthy, uptime_s, disk, cpu_pct, mem, offline} — the
 // same contract src/api/placement/base.py's PlacementDriver.health()
 // documents and docker_driver.py's health() already returns for managed
@@ -1819,7 +1834,19 @@ func effectiveWorkers(statePath string) string {
 // offline=true) whenever the workspace container isn't running, gracefully
 // rather than erroring — a BYOD host being asleep/off is an expected state,
 // not a failure.
-func (h *Handler) Health(ctx context.Context) map[string]any {
+func (h *Handler) Health(ctx context.Context) (result map[string]any) {
+	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
+	defer cancel()
+
+	// Host-side evidence of entry/exit, so a future hang shows up in
+	// ~/.aw-remote-host's rotating log instead of being a silent black hole
+	// the way this one was — relay_command on the aw-backend side burned a
+	// full 30s timeout with nothing to show for it anywhere.
+	rlog.Printf("ops: health: started")
+	defer func() {
+		rlog.Printf("ops: health: finished healthy=%v offline=%v", result["healthy"], result["offline"])
+	}()
+
 	offline := map[string]any{
 		"healthy": false, "uptime_s": nil, "disk": nil,
 		"cpu_pct": nil, "mem": nil, "offline": true,

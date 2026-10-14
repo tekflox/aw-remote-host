@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tekflox/aw-remote-host/internal/state"
 )
@@ -27,6 +28,20 @@ type fakeRunner struct {
 	// probe carries a shell script built inside internal/vpn, which this
 	// package neither owns nor should be pinning a copy of.
 	prefixes []prefixAnswer
+	// hangs names commands that must block until the caller's ctx is done
+	// instead of returning — the fixture for proving a caller bounds a
+	// wedged shellout with its own timeout rather than inheriting a
+	// connection-lifetime context that never fires on its own. A real
+	// podman/df hang has no deadline of its own, which is exactly the gap
+	// healthTimeout closes.
+	hangs map[string]bool
+}
+
+func (f *fakeRunner) hang(name string, args ...string) {
+	if f.hangs == nil {
+		f.hangs = map[string]bool{}
+	}
+	f.hangs[f.key(name, args...)] = true
 }
 
 // prefixAnswer is one scripted reply matched on the LEADING arguments. The
@@ -76,12 +91,19 @@ func (f *fakeRunner) ran(arg string) bool {
 	return false
 }
 
-func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	call := append([]string{name}, args...)
 	f.calls = append(f.calls, call)
 	k := f.key(name, args...)
+	hangs := f.hangs[k]
+	f.mu.Unlock()
+	if hangs {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if err, ok := f.errs[k]; ok {
 		return f.outputs[k], err
 	}
@@ -653,6 +675,46 @@ func TestHealthWhenHTTPProbeFails(t *testing.T) {
 	}
 	if got["healthy"] != false {
 		t.Errorf("expected healthy=false when the HTTP probe fails, got %v", got)
+	}
+}
+
+// TestHealthBoundsAWedgedShelloutWithItsOwnTimeout is the regression test
+// for card aw-backend-byod-health-dispatch-mismatch-fredericowu: the
+// "health" verb dispatch hung the full 30s client-side budget with zero
+// response, while every sibling verb round-tripped fine over the same live
+// tunnel. Root cause was containerStats'/diskUsage's shellouts relying
+// entirely on the ambient (connection-lifetime) ctx for a deadline — Health
+// now wraps that ctx in its own bounded healthTimeout, so a wedged `podman
+// stats` can no longer block the whole call indefinitely.
+func TestHealthBoundsAWedgedShelloutWithItsOwnTimeout(t *testing.T) {
+	prev := healthTimeout
+	healthTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { healthTimeout = prev })
+
+	r := newFakeRunner()
+	r.on("true\t2020-01-01T00:00:00.000000000Z", "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	r.on("", "curl", "-fsS", "--max-time", probeTimeout, HealthURL)
+	r.hang("podman", "stats", "--no-stream", "--format",
+		"{{.CPUPerc}}\t{{.MemUsage}}", WorkspaceContainer)
+	h := &Handler{Runner: r}
+
+	start := time.Now()
+	got := h.Health(context.Background())
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("Health took %v — a wedged containerStats shellout must not block the whole call past healthTimeout", elapsed)
+	}
+	if got["cpu_pct"] != nil || got["mem"] != nil {
+		t.Errorf("expected cpu_pct/mem nil once containerStats is cut off by the timeout, got cpu_pct=%v mem=%v",
+			got["cpu_pct"], got["mem"])
+	}
+	// The rest of the chain, which ran before the hang, must still be
+	// reported — a timeout in one sub-probe degrades that probe, not the
+	// whole health report.
+	if got["offline"] != false || got["healthy"] != true {
+		t.Errorf("expected the container-running/HTTP-healthy result to survive the containerStats timeout, got %v", got)
 	}
 }
 
