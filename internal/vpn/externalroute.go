@@ -216,9 +216,27 @@ type ExternalRoutePlan struct {
 	TunnelVia   string   `json:"tunnel_via"`
 	TunnelDev   string   `json:"tunnel_dev"`
 	Exclusions  []string `json:"exclusions"`
-	MainGateway string   `json:"main_gateway"`
-	MainDev     string   `json:"main_dev"`
-	Refusal     string   `json:"refusal,omitempty"`
+	// KillSwitchPins is the subset of Exclusions that is the control plane —
+	// the pins whose absence means `external-down` cannot be delivered.
+	//
+	// Carried, and persisted, because Exclusions is no longer only the control
+	// plane: the private half is a constant that cannot fail to resolve, so a
+	// status measuring the whole list would report a kill switch on a route
+	// that never pinned one. See killSwitchPins and ExternalStatusReport.
+	KillSwitchPins []string `json:"kill_switch_pins,omitempty"`
+	// PrivateSkipped is the private blocks this plan deliberately did NOT hold
+	// outside the tunnel, each with the reason, one sentence per entry.
+	//
+	// Reported rather than dropped for the same reason Exclusion.Reason is
+	// printed on the mesh path: the operator question an exclusion list raises
+	// is always "what is still reachable", and a block that is missing because
+	// the tunnel's own inner network sits inside it reads as an oversight
+	// unless it says so. Never persisted — it is a property of the plan that
+	// produced a table, not of the routes that have to be undone.
+	PrivateSkipped []string `json:"private_skipped,omitempty"`
+	MainGateway    string   `json:"main_gateway"`
+	MainDev        string   `json:"main_dev"`
+	Refusal        string   `json:"refusal,omitempty"`
 	// ExpectEgress is spec.ExpectEgress, carried onto the plan so it can be
 	// persisted alongside everything else this apply recorded — see
 	// ExternalStatusReport, the reader that turns a later mismatch into a
@@ -545,7 +563,18 @@ func PlanExternalRoute(ctx context.Context, spec ExternalRouteSpec) (*ExternalRo
 	plan.MainGateway, plan.MainDev = gw, mdev
 
 	exclusions, killSwitch := planExternalExclusions(ctx, spec.ControlPlane)
-	plan.Exclusions = exclusions
+	// The private blocks come AFTER the control plane and never instead of it:
+	// the kill switch is the one exclusion whose absence turns a bad tunnel
+	// into a machine that needs a visit, so it goes in first and is the first
+	// thing applyExternalRoute writes. See privateTableExclusions for the
+	// outage this half fixes and for the inner-network trap it handles.
+	private, skipped := privateTableExclusions(
+		tunnelInnerAddresses(ctx, runner, plan.TunnelDev),
+		linkScopedPrefixesInTable(ctx, runner, spec.Table),
+	)
+	plan.Exclusions = append(exclusions, private...)
+	plan.KillSwitchPins = exclusions
+	plan.PrivateSkipped = skipped
 
 	// The DNS half's PLAN-time preconditions (§4.1 and §4.2). Failing any of
 	// them leaves the four fields empty, which every function below reads as
@@ -694,6 +723,12 @@ func ExternalRoute(ctx context.Context, spec ExternalRouteSpec, progress Progres
 	progress.emit("info", "the rule is anchored on %s/32 — a single host address that belongs to that container and cannot be this machine.", plan.SourceIP)
 	for _, ex := range plan.Exclusions {
 		progress.emit("info", "  %s stays OUTSIDE the tunnel", ex)
+	}
+	// A block that is NOT excluded is as much part of what this apply does as
+	// one that is, and the reason has to arrive with the result rather than be
+	// reconstructed from the code later.
+	for _, s := range plan.PrivateSkipped {
+		progress.emit("info", "  %s", s)
 	}
 	// Loudly, and in the same stream as everything else that just happened.
 	// The kill switch going missing used to be completely silent.
@@ -1209,6 +1244,16 @@ func mainDefault(ctx context.Context, r Runner) (gw, dev string, err error) {
 // planExternalExclusions holds the CONTROL PLANE outside the tunnel, and
 // nothing else.
 //
+// NOT THE WHOLE LIST SINCE 2026-10-26. privateTableExclusions below supplies
+// the unconditional private-space half, and PlanExternalRoute appends it to
+// what this returns. The two are kept apart because they answer different
+// questions and fail differently: this one is the KILL SWITCH, resolved from a
+// hostname and reported as a bool because an apply that could not pin it is
+// not the same as one with nothing to pin. The private half is a constant list
+// that cannot fail to resolve. Folding them together would hide a missing kill
+// switch inside a list that is never empty — exactly the false reassurance the
+// bool below was added to remove.
+//
 // DNS GOES THROUGH THE VPN — decided by Frederico, 2026-09-05, and this
 // function used to do the opposite. It pinned every nameserver it could find
 // outside the tunnel, which meant a user who turned the VPN on still resolved
@@ -1284,6 +1329,196 @@ func planExternalExclusions(ctx context.Context, controlPlane string) (exclusion
 	// resolver that timed out) pins nothing, and saying otherwise would be the
 	// exact false reassurance this return value exists to remove.
 	return out, len(out) > 0
+}
+
+// privateTableExclusions decides which of privateIPv4Blocks may be held
+// outside an external tunnel's own table, and says why about the ones that may
+// not.
+//
+// THIS IS THE 2026-10-02 FIX ARRIVING ON THE OTHER PATH, and the delay is the
+// lesson. PlanExclusions (exit.go) has excluded all of RFC1918 plus link-local
+// unconditionally since 89a87ee, on the principle written in this module's
+// README: a tunnel carries INTERNET egress, and a destination in private
+// address space never belongs in it — it either resolves on this host's own
+// path already, or it was never reachable at all. That landed on the mesh's
+// table 52 only. The external tunnel built its own list — the control plane,
+// and nothing else — so `grep -rn '172.16.0.0/12' internal/` answered exit.go
+// and nothing else, and half the code obeyed the principle.
+//
+// MEASURED LIVE, 2026-10-26: dialling the gl-inet tunnel killed every
+// agents-platform run on this deployment. The rule is `from 10.89.0.25 lookup
+// 200`, and 10.89.0.25 is the aw-remote-host-workspace container whose netns
+// every aw-warm-* agent CLI shares — routing it routes every runner at once.
+// AP-MT's shared Redis, where the `run:{run_id}:events` stream a run's whole
+// output travels on lives, answers on 172.18.0.1: a docker bridge of the
+// PHYSICAL machine, which is neither an interface here nor a route in table
+// 200, so it rode the tunnel's default and disappeared. `POST /execute` still
+// answered 200 and every runner still showed as registered, while every run
+// died at the 600s "the producer appears to have died" mark with XLEN 0 on its
+// stream. 172.16.0.0/12 is the one line that covers it (172.18 and 172.19
+// both), and it is why this function exists.
+//
+// WHAT IS NOT A BLIND COPY OF 89a87ee — the only real difference between the
+// two paths. On the mesh, tailscale lives in 100.64.0.0/10, so all four blocks
+// were free to exclude. An external tunnel's own INNER network is routinely
+// inside one of them: gl-inet carries 10.8.0.11/32 here and its hub answers on
+// 10.8.0.2. An exclusion is a route INSIDE the tunnel's table, and it is more
+// specific than that table's own `default dev <iface>` — so a blanket
+// `10.0.0.0/8 via <main gateway>` would take the tunnel's own inner network
+// off the tunnel. Longest prefix still wins, which is why a /24 bridge inside
+// 10/8 needs no special handling; what cannot be handled that way is the block
+// that CONTAINS the tunnel's own address, because there is no more-specific
+// route this package knows to write for the far side of a tunnel. That block
+// is therefore left out, with its reason carried to the narration rather than
+// silently dropped — and left out BY DERIVATION, not by hardcoding 10/8, so a
+// profile whose inner network is elsewhere still gets the full list.
+//
+// inner is what the tunnel itself lives on: the profile's `address` at dial
+// time, the live addresses on the tunnel device at route time. linkScoped is
+// what the table already carries (or is about to carry) link-scope; a block
+// that is EXACTLY one of those is skipped as well, because that connected
+// route already keeps the network out of the tunnel by a more direct path, and
+// a second route for the same prefix with a different nexthop is an `ip route
+// add` that fails and an `ip route del` that removes the wrong one.
+func privateTableExclusions(inner, linkScoped []string) (keep, skipped []string) {
+	for _, block := range privateIPv4Blocks {
+		_, parsed, err := net.ParseCIDR(block)
+		if err != nil {
+			continue
+		}
+		if addr := firstAddressInside(inner, parsed); addr != "" {
+			skipped = append(skipped, fmt.Sprintf("%s is NOT held outside the tunnel: the tunnel's own inner address %s is inside it, and an exclusion is a route in the tunnel's own table that beats that table's default — excluding this block would take the tunnel's inner network off the tunnel. Anything inside it that has to stay off the tunnel needs a more specific route in this table", block, addr))
+			continue
+		}
+		if containsAddress(linkScoped, block) {
+			skipped = append(skipped, fmt.Sprintf("%s needs no exclusion: this table already carries it link-scope, which keeps it out of the tunnel by a more direct path than a route through the main gateway would", block))
+			continue
+		}
+		keep = append(keep, block)
+	}
+	return keep, skipped
+}
+
+// killSwitchPins is which of a recorded route's exclusions are the CONTROL
+// PLANE — the pins whose absence means Disconnect cannot be issued — as
+// opposed to the unconditional private-space half, which is a constant and
+// proves nothing about the management path.
+//
+// It prefers the recorded subset, and falls back to "everything that is not
+// one of the private blocks" for a record written before that field existed.
+// The fallback is exact rather than a guess: until 2026-10-26 the only thing
+// in this list WAS the control plane, so a record without the field has
+// nothing else in it. Without the fallback, upgrading the binary under a live
+// route would warn NO KILL SWITCH about a route that has one, until the next
+// apply rewrote the record — a false alarm on the one surface whose whole job
+// is to be believed.
+func killSwitchPins(route *state.ExternalRouteState) []string {
+	if route == nil {
+		return nil
+	}
+	if len(route.KillSwitchPins) > 0 {
+		return route.KillSwitchPins
+	}
+	var pins []string
+	for _, prefix := range route.Exclusions {
+		if !containsAddress(privateIPv4Blocks, prefix) {
+			pins = append(pins, prefix)
+		}
+	}
+	return pins
+}
+
+// firstAddressInside reports the first of addrs — bare addresses or CIDRs,
+// mixed, because the profile writes CIDRs and `ip addr show` prints them too —
+// that falls inside n, or "" when none does.
+func firstAddressInside(addrs []string, n *net.IPNet) string {
+	for _, raw := range addrs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			if parsed, _, err := net.ParseCIDR(raw); err == nil {
+				ip = parsed
+			}
+		}
+		if ip == nil {
+			continue
+		}
+		v4 := ip.To4()
+		if v4 == nil || !n.Contains(v4) {
+			continue
+		}
+		return raw
+	}
+	return ""
+}
+
+// tunnelInnerAddresses reads what the tunnel device itself carries, which is
+// how the route path answers the collision question the dial path answers from
+// the profile.
+//
+// Best effort, and the direction of the failure is deliberate: a device that
+// cannot be read yields nothing, nothing reads as "no collision known", and
+// the full private list is then excluded. That errs toward keeping private
+// space OUT of the tunnel, which is the failure actually measured here — a
+// swallowed Redis takes every run on the host down, while a tunnel's inner
+// network being reachable by the host's own path instead costs nothing that
+// has ever been used from a routed container.
+func tunnelInnerAddresses(ctx context.Context, r Runner, dev string) []string {
+	if strings.TrimSpace(dev) == "" {
+		return nil
+	}
+	out, err := r.Run(ctx, "ip", "-4", "-o", "addr", "show", "dev", dev)
+	if err != nil {
+		return nil
+	}
+	var addrs []string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		for i := 0; i < len(fields)-1; i++ {
+			if fields[i] != "inet" {
+				continue
+			}
+			if ip, _, perr := net.ParseCIDR(fields[i+1]); perr == nil && ip.To4() != nil {
+				addrs = append(addrs, fields[i+1])
+			}
+		}
+	}
+	return addrs
+}
+
+// linkScopedPrefixesInTable reads the prefixes a table already carries with a
+// device and no gateway — externalup.go's connected routes, as the kernel has
+// them. Read rather than assumed because the tunnel's table is not always
+// built by this tool: aw-vpn-hub builds one of exactly this shape itself, and
+// a route applied on top of it has to see what is really there.
+func linkScopedPrefixesInTable(ctx context.Context, r Runner, table int) []string {
+	out, err := r.Run(ctx, "ip", "route", "show", "table", strconv.Itoa(table))
+	if err != nil {
+		return nil
+	}
+	var prefixes []string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] == "default" {
+			continue
+		}
+		if _, _, perr := net.ParseCIDR(fields[0]); perr != nil {
+			continue
+		}
+		via := false
+		for _, f := range fields[1:] {
+			if f == "via" {
+				via = true
+			}
+		}
+		if !via {
+			prefixes = append(prefixes, fields[0])
+		}
+	}
+	return prefixes
 }
 
 // resolveControlPlaneIPs is best-effort by design: a control plane that cannot
@@ -1897,18 +2132,19 @@ func MeasureNetnsEgress(ctx context.Context, r Runner, runtime, containerID stri
 func saveExternalRouteState(plan ExternalRoutePlan) error {
 	return mutateExternalRouteState(func(v *state.VPNState) {
 		v.ExternalRoute = &state.ExternalRouteState{
-			Container:    plan.Container,
-			ContainerID:  plan.ContainerID,
-			SourceIP:     plan.SourceIP,
-			Table:        plan.Table,
-			Priority:     plan.Priority,
-			Runtime:      plan.Runtime,
-			TunnelDev:    plan.TunnelDev,
-			MainGateway:  plan.MainGateway,
-			MainDev:      plan.MainDev,
-			Exclusions:   plan.Exclusions,
-			RoutedAt:     time.Now().UTC().Format(time.RFC3339),
-			ExpectEgress: plan.ExpectEgress,
+			Container:      plan.Container,
+			ContainerID:    plan.ContainerID,
+			SourceIP:       plan.SourceIP,
+			Table:          plan.Table,
+			Priority:       plan.Priority,
+			Runtime:        plan.Runtime,
+			TunnelDev:      plan.TunnelDev,
+			MainGateway:    plan.MainGateway,
+			MainDev:        plan.MainDev,
+			Exclusions:     plan.Exclusions,
+			KillSwitchPins: plan.KillSwitchPins,
+			RoutedAt:       time.Now().UTC().Format(time.RFC3339),
+			ExpectEgress:   plan.ExpectEgress,
 
 			DNSServers:    plan.DNSServers,
 			DNSNetwork:    plan.DNSNetwork,
@@ -1962,17 +2198,18 @@ func loadExternalRouteState() (*ExternalRoutePlan, error) {
 		dnsPriority = ExternalRouteDNSPriority
 	}
 	return &ExternalRoutePlan{
-		Container:    e.Container,
-		ContainerID:  e.ContainerID,
-		SourceIP:     e.SourceIP,
-		Table:        e.Table,
-		Priority:     e.Priority,
-		Runtime:      e.Runtime,
-		TunnelDev:    e.TunnelDev,
-		MainGateway:  e.MainGateway,
-		MainDev:      e.MainDev,
-		Exclusions:   e.Exclusions,
-		ExpectEgress: e.ExpectEgress,
+		Container:      e.Container,
+		ContainerID:    e.ContainerID,
+		SourceIP:       e.SourceIP,
+		Table:          e.Table,
+		Priority:       e.Priority,
+		Runtime:        e.Runtime,
+		TunnelDev:      e.TunnelDev,
+		MainGateway:    e.MainGateway,
+		MainDev:        e.MainDev,
+		Exclusions:     e.Exclusions,
+		KillSwitchPins: killSwitchPins(e),
+		ExpectEgress:   e.ExpectEgress,
 
 		DNSServers:    e.DNSServers,
 		DNSNetwork:    e.DNSNetwork,

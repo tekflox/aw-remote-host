@@ -169,8 +169,16 @@ type ExternalTunnelState struct {
 	// written into the tunnel's table alongside the default. Recorded so the
 	// teardown removes the same routes the dial installed — re-discovering
 	// them afterwards would compute a set that was never installed.
-	Connected     []ConnectedRouteState `json:"connected_routes,omitempty"`
-	ProfileSHA256 string                `json:"profile_sha256,omitempty"`
+	Connected []ConnectedRouteState `json:"connected_routes,omitempty"`
+	// PrivateExclusions is the private-IPv4 space this dial pointed back at
+	// the host's own gateway inside the tunnel's table, so a private
+	// destination never enters the tunnel. Recorded for the same reason
+	// Connected is, and it is not the same set on every host: the block
+	// containing the tunnel's own inner network is deliberately left out, so
+	// re-deriving this at teardown time from a different profile would compute
+	// routes that were never installed.
+	PrivateExclusions []string `json:"private_exclusions,omitempty"`
+	ProfileSHA256     string   `json:"profile_sha256,omitempty"`
 	// DialedAt is RFC3339.
 	DialedAt string `json:"dialed_at,omitempty"`
 }
@@ -199,6 +207,15 @@ type ExternalRouteState struct {
 	MainGateway string   `json:"main_gateway,omitempty"`
 	MainDev     string   `json:"main_dev,omitempty"`
 	Exclusions  []string `json:"exclusions,omitempty"`
+	// KillSwitchPins is the subset of Exclusions that is the control plane.
+	//
+	// Recorded separately because Exclusions also carries unconditional
+	// private IPv4 space, which can never fail to resolve — so a status that
+	// measured the whole list would report a kill switch on a route whose
+	// control plane never resolved at all. A record written before this field
+	// existed has only control-plane pins in Exclusions, which is what lets
+	// the reader fall back exactly rather than guess.
+	KillSwitchPins []string `json:"kill_switch_pins,omitempty"`
 	// RoutedAt is RFC3339.
 	RoutedAt string `json:"routed_at,omitempty"`
 	// ExpectEgress is the public IP the caller asked this route to present,

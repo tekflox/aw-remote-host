@@ -229,10 +229,21 @@ func ExternalStatus(ctx context.Context, spec ExternalStatusSpec) (ExternalStatu
 	// restart may have flushed the routes out from under a healthy record —
 	// the same flush Reassert exists for. Either way Disconnect may not reach
 	// the workspace, and either way nothing else would say so.
+	//
+	// MEASURED ON THE PINS, NOT ON THE WHOLE LIST, since 2026-10-26. Until
+	// that day the exclusion list WAS the control plane, so "the record lists
+	// exclusions" and "a kill switch was pinned" were the same sentence. The
+	// list now also carries the unconditional private-space half, which is a
+	// constant and can never fail to resolve — so a route whose control plane
+	// never resolved records a non-empty list of exclusions that are all
+	// installed, and counting those would report a kill switch that does not
+	// exist. That is the exact false reassurance this bool was added to remove,
+	// arriving through the back door of a longer list.
 	killSwitch := false
-	if route != nil && len(route.Exclusions) > 0 {
-		killSwitch = true
-		for _, prefix := range route.Exclusions {
+	if route != nil {
+		pins := killSwitchPins(route)
+		killSwitch = len(pins) > 0
+		for _, prefix := range pins {
 			installed, err := routeInstalled(ctx, runner, ExternalRoutePlan{Table: route.Table}, prefix)
 			if err != nil || !installed {
 				killSwitch = false

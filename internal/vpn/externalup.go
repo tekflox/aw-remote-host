@@ -597,8 +597,20 @@ type ExternalUpPlan struct {
 	MainGateway   string           `json:"main_gateway"`
 	MainDev       string           `json:"main_dev"`
 	Connected     []ConnectedRoute `json:"connected_routes"`
-	Runtime       string           `json:"runtime,omitempty"`
-	ProfileSHA256 string           `json:"profile_sha256"`
+	// PrivateExclusions is the unconditional private-IPv4 half of invariant 1:
+	// the blocks written into this table pointing back at the host's own
+	// gateway, so a destination in private address space never enters the
+	// tunnel. Computed by privateTableExclusions from this profile's own inner
+	// address and from Connected, and PERSISTED for the same reason Connected
+	// is — the teardown removes what the dial installed, and re-deriving it at
+	// teardown time could compute a set that was never written.
+	PrivateExclusions []string `json:"private_exclusions,omitempty"`
+	// PrivateSkipped is the blocks deliberately left out, with the reason.
+	// Narrated at dial time and not persisted: it describes the decision, not
+	// the routes that have to be undone.
+	PrivateSkipped []string `json:"private_skipped,omitempty"`
+	Runtime        string   `json:"runtime,omitempty"`
+	ProfileSHA256  string   `json:"profile_sha256"`
 	// AlreadyUp is set when this exact profile is recorded, the interface
 	// carries its peer and the table already holds the default — see
 	// invariant 6, and assume the invocation may be delivered twice.
@@ -639,8 +651,8 @@ func (p ExternalUpPlan) pinPlan() ExternalRoutePlan {
 func (p ExternalUpPlan) endpointPrefix() string { return p.EndpointIP + "/32" }
 
 // tableArgs is every `ip route` this plan writes into the tunnel's table, IN
-// THE ORDER IT MUST WRITE THEM: the connected routes first, then the endpoint
-// pin, and the DEFAULT LAST.
+// THE ORDER IT MUST WRITE THEM: the connected routes first, then the private
+// exclusions, then the endpoint pin, and the DEFAULT LAST.
 //
 // The order is the invariant, not a preference. Between installing a default
 // and installing the connected routes there is a window in which a container
@@ -648,10 +660,19 @@ func (p ExternalUpPlan) endpointPrefix() string { return p.EndpointIP + "/32" }
 // Postgres, Redis, every agent runner — and that window is exactly the outage
 // this ordering exists to make impossible. Returning the whole sequence from
 // one function is what lets a test assert it without running anything.
+//
+// The private exclusions sit under the same rule and for the same reason, one
+// step wider: the connected routes only cover what this HOST is attached to,
+// and the 2026-10-26 outage was a Redis on a bridge of the physical machine
+// that no interface here has and no connected route covers. They are written
+// before the default so that window cannot exist for them either.
 func (p ExternalUpPlan) tableArgs(verb string) [][]string {
 	var out [][]string
 	for _, c := range p.Connected {
 		out = append(out, []string{"route", verb, c.Prefix, "dev", c.Dev, "table", strconv.Itoa(p.Table)})
+	}
+	for _, prefix := range p.PrivateExclusions {
+		out = append(out, p.pinPlan().excludeArgs(pinVerb(verb), prefix))
 	}
 	out = append(out, p.pinPlan().excludeArgs(pinVerb(verb), p.endpointPrefix()))
 	out = append(out, []string{"route", verb, "default", "dev", p.Iface, "table", strconv.Itoa(p.Table)})
@@ -778,6 +799,17 @@ func PlanExternalUp(ctx context.Context, spec ExternalUpSpec) (*ExternalUpPlan, 
 		return plan, nil
 	}
 	plan.Connected = connected
+
+	// INVARIANT 1, the half the connected sweep structurally cannot reach.
+	// Derived from THIS profile's own inner address, which is why the dial path
+	// asks the profile and the route path asks the live device — see
+	// privateTableExclusions for the measured outage and for why 10.0.0.0/8 is
+	// the one block that can collide with the tunnel it is protecting.
+	var connectedPrefixes []string
+	for _, c := range connected {
+		connectedPrefixes = append(connectedPrefixes, c.Prefix)
+	}
+	plan.PrivateExclusions, plan.PrivateSkipped = privateTableExclusions(spec.Profile.Address, connectedPrefixes)
 
 	// INVARIANT 7. The egress confirmation that follows a dial starts a
 	// throwaway container, i.e. needs a registry pull at exactly the moment a
@@ -1073,6 +1105,12 @@ func ExternalUp(ctx context.Context, spec ExternalUpSpec, progress Progress) (Ex
 	for _, c := range plan.Connected {
 		progress.emit("info", "  %s stays reachable via %s INSIDE table %d — discovered from this host's own main table, never hardcoded", c.Prefix, c.Dev, plan.Table)
 	}
+	for _, prefix := range plan.PrivateExclusions {
+		progress.emit("info", "  %s is held OUTSIDE the tunnel via %s dev %s — a tunnel carries internet egress, and a private destination either already resolves on this host's own path or was never reachable at all", prefix, plan.MainGateway, plan.MainDev)
+	}
+	for _, s := range plan.PrivateSkipped {
+		progress.emit("info", "  %s", s)
+	}
 	progress.emit("info", "  %s (the tunnel endpoint) is pinned to %s dev %s so the tunnel's own traffic cannot route into itself", plan.endpointPrefix(), plan.MainGateway, plan.MainDev)
 	if len(plan.DNS) > 0 {
 		progress.emit("info", "the profile's resolvers (%s) are recorded and NOT written into the config: wg-quick's DNS= rewrites the whole host's resolver, which is the same lockout arriving through DNS instead of routing", strings.Join(plan.DNS, ", "))
@@ -1206,10 +1244,14 @@ func applyExternalUp(ctx context.Context, r Runner, plan ExternalUpPlan) error {
 
 	pin := plan.pinPlan()
 	for _, args := range plan.tableArgs("replace") {
-		// The pin is the only add-verb entry, and the only one that needs a
-		// presence check to stay idempotent.
-		if len(args) > 1 && args[1] == "add" {
-			if ok, err := routeInstalled(ctx, r, pin, plan.endpointPrefix()); err == nil && ok {
+		// The add-verb entries — the endpoint pin and the private exclusions —
+		// are the ones that need a presence check to stay idempotent, because
+		// `add` on a prefix already in the table fails where `replace` would
+		// not. The prefix is read off the ARGS rather than assumed to be the
+		// endpoint's: there is more than one add-verb entry now, and a guard
+		// that checked a fixed prefix would skip or re-add the wrong route.
+		if len(args) > 2 && args[1] == "add" {
+			if ok, err := routeInstalled(ctx, r, pin, args[2]); err == nil && ok {
 				continue
 			}
 		}
@@ -1633,18 +1675,19 @@ func saveExternalTunnelState(plan ExternalUpPlan) error {
 	}
 	return mutateExternalRouteState(func(v *state.VPNState) {
 		v.ExternalTunnel = &state.ExternalTunnelState{
-			Type:          plan.Type,
-			Iface:         plan.Iface,
-			Table:         plan.Table,
-			ConfPath:      plan.ConfPath,
-			Endpoint:      plan.Endpoint,
-			EndpointIP:    plan.EndpointIP,
-			PeerPublicKey: plan.PeerPublicKey,
-			MainGateway:   plan.MainGateway,
-			MainDev:       plan.MainDev,
-			Connected:     connected,
-			ProfileSHA256: plan.ProfileSHA256,
-			DialedAt:      time.Now().UTC().Format(time.RFC3339),
+			Type:              plan.Type,
+			Iface:             plan.Iface,
+			Table:             plan.Table,
+			ConfPath:          plan.ConfPath,
+			Endpoint:          plan.Endpoint,
+			EndpointIP:        plan.EndpointIP,
+			PeerPublicKey:     plan.PeerPublicKey,
+			MainGateway:       plan.MainGateway,
+			MainDev:           plan.MainDev,
+			Connected:         connected,
+			PrivateExclusions: plan.PrivateExclusions,
+			ProfileSHA256:     plan.ProfileSHA256,
+			DialedAt:          time.Now().UTC().Format(time.RFC3339),
 		}
 	})
 }
@@ -1681,17 +1724,18 @@ func loadExternalTunnelPlan() (*ExternalUpPlan, error) {
 		connected = append(connected, ConnectedRoute{Prefix: c.Prefix, Dev: c.Dev})
 	}
 	plan := &ExternalUpPlan{
-		Type:          rec.Type,
-		Iface:         rec.Iface,
-		Table:         rec.Table,
-		ConfPath:      rec.ConfPath,
-		Endpoint:      rec.Endpoint,
-		EndpointIP:    rec.EndpointIP,
-		PeerPublicKey: rec.PeerPublicKey,
-		MainGateway:   rec.MainGateway,
-		MainDev:       rec.MainDev,
-		Connected:     connected,
-		ProfileSHA256: rec.ProfileSHA256,
+		Type:              rec.Type,
+		Iface:             rec.Iface,
+		Table:             rec.Table,
+		ConfPath:          rec.ConfPath,
+		Endpoint:          rec.Endpoint,
+		EndpointIP:        rec.EndpointIP,
+		PeerPublicKey:     rec.PeerPublicKey,
+		MainGateway:       rec.MainGateway,
+		MainDev:           rec.MainDev,
+		Connected:         connected,
+		PrivateExclusions: rec.PrivateExclusions,
+		ProfileSHA256:     rec.ProfileSHA256,
 	}
 	plan.ipPath, _ = lookupExternalBinary("ip")
 	plan.wgQuickPath, _ = lookupExternalBinary("wg-quick")

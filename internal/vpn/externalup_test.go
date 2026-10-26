@@ -407,6 +407,122 @@ func TestTheEndpointPinIsSpelledLikeAnExclusionAndKeepsOnlink(t *testing.T) {
 	}
 }
 
+// INVARIANT 1, the half the connected sweep structurally cannot reach.
+//
+// The connected routes only cover what THIS host is attached to. The
+// 2026-10-26 outage was a Redis on 172.18.0.1 — a docker bridge of the
+// physical machine, neither an interface here nor a route in table 200 — so no
+// widening of the attachment sweep could ever have found it. The private
+// blocks are the unconditional answer, and they go in BEFORE the default for
+// the same reason the connected routes do: between the two there is a window
+// in which the routed container has internet and no event stream.
+func TestTheDialHoldsPrivateSpaceOutsideTheTunnelBeforeTheDefault(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	r := upHost()
+	plan := planUpOn(t, r, mustProfile(t))
+
+	if err := applyExternalUp(context.Background(), r, *plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	defaultAt := callIndex(r, "ip route replace default dev wg0 table 200")
+	if defaultAt < 0 {
+		t.Fatalf("the tunnel's default was never installed; calls: %v", r.calls)
+	}
+	// Spelled by excludeArgs — the same code as the endpoint pin and as
+	// vpn_external_route's exclusions, onlink included, not a third copy.
+	for _, block := range []string{"172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"} {
+		want := "ip route add " + block + " via 172.18.0.1 dev eth0 onlink table 200"
+		at := callIndex(r, want)
+		if at < 0 {
+			t.Fatalf("%q never ran, so a private destination still enters the tunnel; calls: %v", want, r.calls)
+		}
+		if at > defaultAt {
+			t.Fatalf("%s was held outside the tunnel AFTER the default went in (%d > %d) — that window is the outage", block, at, defaultAt)
+		}
+	}
+}
+
+// The derivation, from the dial side: the canonical profile's own address is
+// 10.5.0.2/32, so 10.0.0.0/8 is the block that cannot be excluded without
+// taking this tunnel's inner network off this tunnel. A profile living
+// elsewhere gets it.
+func TestTheDialDoesNotExcludeTheBlockItsOwnAddressLivesIn(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	plan := planUpOn(t, upHost(), mustProfile(t))
+	if containsString(plan.PrivateExclusions, "10.0.0.0/8") {
+		t.Fatalf("10.0.0.0/8 excluded while this profile's address is 10.5.0.2/32: %v", plan.PrivateExclusions)
+	}
+	if !strings.Contains(strings.Join(plan.PrivateSkipped, " "), "10.5.0.2/32") {
+		t.Fatalf("the skip did not name the colliding address: %v", plan.PrivateSkipped)
+	}
+
+	elsewhere := mustProfile(t)
+	elsewhere.Address = []string{"100.64.0.5/32"}
+	out := planUpOn(t, upHost(), elsewhere)
+	if !containsString(out.PrivateExclusions, "10.0.0.0/8") {
+		t.Fatalf("10.0.0.0/8 was skipped for a profile that does not live in it, so the skip is hardcoded rather than derived: %v", out.PrivateExclusions)
+	}
+}
+
+// A re-dial onto a table that already carries some of the exclusions must add
+// the missing ones and leave the present ones alone.
+//
+// The private blocks go in with `add` rather than `replace`, because that is
+// what excludeArgs spells and `onlink` lives on the add — and `ip route add`
+// on a prefix already in the table FAILS, which in applyExternalUp is a dial
+// that refuses outright. There is now more than one add-verb entry in the
+// table build, so the presence check has to be about the prefix in front of it
+// rather than about the endpoint pin it used to be the only one of.
+func TestARedialAddsOnlyTheExclusionsThatAreMissing(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	r := upHost()
+	r.answers["ip route show table 200"] = "default dev wg0 \n" +
+		"1.2.3.4/32 via 172.18.0.1 dev eth0 onlink \n" +
+		"172.16.0.0/12 via 172.18.0.1 dev eth0 onlink \n"
+	plan := planUpOn(t, r, mustProfile(t))
+	if err := applyExternalUp(context.Background(), r, *plan); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	for _, already := range []string{"ip route add 1.2.3.4/32", "ip route add 172.16.0.0/12"} {
+		if r.ran(already) {
+			t.Fatalf("%q ran against a table that already carries it — `ip route add` fails there and the whole dial refuses: %v", already, r.calls)
+		}
+	}
+	for _, missing := range []string{"ip route add 192.168.0.0/16", "ip route add 169.254.0.0/16"} {
+		if !r.ran(missing) {
+			t.Fatalf("%q never ran, so a block missing from the table stayed missing: %v", missing, r.calls)
+		}
+	}
+}
+
+// A private block that is EXACTLY one of the connected routes is left to the
+// connected route. Two routes for one prefix with different nexthops is an
+// `ip route add` that fails — which, in applyExternalUp, is a dial that
+// refuses rather than a table with one route missing.
+func TestADialDoesNotFightItsOwnConnectedRouteOverTheSamePrefix(t *testing.T) {
+	withFakeBinaries(t)
+	isolateState(t)
+	r := upHost()
+	r.answers["ip -o -4 route show table main"] = "default via 172.18.0.1 dev eth0 \n" +
+		"192.168.0.0/16 dev podman1 proto kernel scope link src 192.168.0.1 \n"
+	plan := planUpOn(t, r, mustProfile(t))
+	if containsString(plan.PrivateExclusions, "192.168.0.0/16") {
+		t.Fatalf("the dial would install 192.168.0.0/16 twice: %v", plan.tableArgs("replace"))
+	}
+	seen := 0
+	for _, args := range plan.tableArgs("replace") {
+		if len(args) > 2 && args[2] == "192.168.0.0/16" {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("192.168.0.0/16 appears %d times in the table build: %v", seen, plan.tableArgs("replace"))
+	}
+}
+
 // Discovery, not literals. vpn-hub-entrypoint.sh's header records what naming
 // a bridge cost: a hardcoded br-98e3dc4f7e7d silently became a different
 // bridge and put wg-quick into a 619-restart crash loop that leaked 3,714
@@ -656,6 +772,13 @@ func TestTheRecordRoundTripsWhatTheDialInstalled(t *testing.T) {
 	}
 	if strings.Join(flatten(loaded.tableArgs("del")), "|") != strings.Join(flatten(plan.tableArgs("del")), "|") {
 		t.Fatalf("the teardown would remove different routes than the dial installed:\n got %v\nwant %v", loaded.tableArgs("del"), plan.tableArgs("del"))
+	}
+	// Named explicitly as well as covered by the comparison above: the private
+	// exclusions are not the same set on every host (the block containing the
+	// tunnel's own address is left out), so re-deriving them at teardown time
+	// from a different profile would compute routes that were never installed.
+	if len(loaded.PrivateExclusions) == 0 || strings.Join(loaded.PrivateExclusions, " ") != strings.Join(plan.PrivateExclusions, " ") {
+		t.Fatalf("the private exclusions did not survive the record: got %v, want %v", loaded.PrivateExclusions, plan.PrivateExclusions)
 	}
 	if err := clearExternalTunnelState(); err != nil {
 		t.Fatalf("clear: %v", err)

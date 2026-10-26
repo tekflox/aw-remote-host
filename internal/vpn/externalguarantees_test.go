@@ -31,8 +31,13 @@ func TestAnUnresolvableControlPlaneIsNotSilent(t *testing.T) {
 	if plan.Refusal != "" {
 		t.Fatalf("an unresolvable control plane must WARN, not refuse — refusing would turn a transient DNS blip into 'the VPN cannot be switched on': %s", plan.Refusal)
 	}
-	if len(plan.Exclusions) != 0 {
-		t.Fatalf("expected no exclusions from an unresolvable control plane: %v", plan.Exclusions)
+	// The list is NOT empty — the unconditional private half is always there —
+	// and that is exactly why the bool below carries the answer. What must be
+	// absent is a /32 pin, which is the only shape a control plane takes.
+	for _, ex := range plan.Exclusions {
+		if strings.HasSuffix(ex, "/32") {
+			t.Fatalf("an unresolvable control plane produced a pin anyway: %v", plan.Exclusions)
+		}
 	}
 	if plan.KillSwitch {
 		t.Fatal("kill_switch=true while nothing was pinned outside the tunnel — this is the exact false reassurance the field exists to remove")
@@ -168,6 +173,57 @@ func TestStatusMeasuresTheKillSwitchRatherThanTrustingTheRecord(t *testing.T) {
 	present.answers["ip route show table 200"] = "default dev wg0 \n198.51.100.7/32 via 172.18.0.1 dev eth0 onlink \n"
 	if got := statusOn(t, present); !got.KillSwitch {
 		t.Fatal("kill_switch=false while the pin IS in the table")
+	}
+}
+
+// THE SAME FALSE REASSURANCE, ARRIVING THROUGH A LONGER LIST. Until
+// 2026-10-26 the exclusion list WAS the control plane, so "the record lists
+// exclusions, and they are installed" meant "a kill switch is in force". The
+// list now also carries unconditional private space, which is a constant and
+// cannot fail to resolve — so a route whose control plane never resolved
+// records exclusions that are all present, and a status counting the whole
+// list would report a kill switch that was never pinned.
+func TestPrivateExclusionsAreNotMistakenForAKillSwitch(t *testing.T) {
+	isolateState(t)
+	withFakeBinaries(t)
+
+	// A route whose control plane did NOT resolve: the private half only.
+	if err := saveExternalRouteState(ExternalRoutePlan{
+		Container: "aw-remote-host-workspace", ContainerID: "abc123",
+		SourceIP: "10.89.0.4", Table: 200, Priority: 5399, Runtime: "podman",
+		Exclusions:     []string{"172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"},
+		KillSwitchPins: nil,
+	}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	host := liveHost()
+	host.answers["ip route show table 200"] = "default dev wg0 \n" +
+		"172.16.0.0/12 via 172.18.0.1 dev eth0 onlink \n" +
+		"192.168.0.0/16 via 172.18.0.1 dev eth0 onlink \n" +
+		"169.254.0.0/16 via 172.18.0.1 dev eth0 onlink \n"
+	got := statusOn(t, host)
+	if got.KillSwitch {
+		t.Fatal("kill_switch=true on a route that pinned no control plane — the private half is not a management path")
+	}
+	if !containsString(got.Warnings, KillSwitchMissingWarning) {
+		t.Fatalf("a missing kill switch produced no warning: %v", got.Warnings)
+	}
+
+	// The same machine, and a route that DID pin one, recorded as such.
+	if err := saveExternalRouteState(ExternalRoutePlan{
+		Container: "aw-remote-host-workspace", ContainerID: "abc123",
+		SourceIP: "10.89.0.4", Table: 200, Priority: 5399, Runtime: "podman",
+		Exclusions:     []string{"198.51.100.7/32", "172.16.0.0/12"},
+		KillSwitchPins: []string{"198.51.100.7/32"},
+	}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	pinned := liveHost()
+	pinned.answers["ip route show table 200"] = "default dev wg0 \n" +
+		"198.51.100.7/32 via 172.18.0.1 dev eth0 onlink \n" +
+		"172.16.0.0/12 via 172.18.0.1 dev eth0 onlink \n"
+	if got := statusOn(t, pinned); !got.KillSwitch {
+		t.Fatal("kill_switch=false while the recorded pin IS in the table")
 	}
 }
 
