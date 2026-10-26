@@ -84,6 +84,25 @@ func containerEgressUnroutedWarning(ip string) string {
 // needs told.
 const DNSNotTunnelledWarning = "DNS IS NOT FULLY TUNNELLED. Traffic goes through the VPN, but names looked up through this machine's local container resolver are still resolved outside it, so DNS queries can still reveal which sites are being visited. Only lookups sent directly to an external resolver travel inside the tunnel."
 
+// DNSTunnelledNetworkWideWarning is shown whenever DNS tunnelling SUCCEEDS,
+// precisely because succeeding is not scoped to the one container that asked
+// for it.
+//
+// `podman network update --dns-add`/`--dns-drop` has no per-container form —
+// moving the upstream moves it for every container on the network — and
+// aardvark-dns does not fail over to the next configured upstream on a
+// negative answer, only on a timeout (its forward_to_servers takes the first
+// response that is not a transport error and stops, NXDOMAIN included). So
+// there is no ordering of [profile resolver, network's previous resolver]
+// that keeps this container's DNS inside the tunnel AND lets every other
+// container keep resolving names the profile's resolver has never heard of:
+// whichever address is listed first answers every query, successful or not,
+// and the search stops there. A genuinely per-container fix exists in podman
+// (ctr_dns_server) but only `podman run`/`podman create --dns` can set it —
+// not `podman network connect` or `podman network update` — so it cannot be
+// applied live to a container this route did not create.
+const DNSTunnelledNetworkWideWarning = "DNS tunnelling for this connection changed name resolution for EVERY container on this podman network, not just this one — podman's `network update --dns-add` has no per-container form, and aardvark-dns does not fall back to the network's previous resolver on a negative answer, only on a timeout. If that resolver cannot resolve names that only exist on a different network sharing this host (other containers, internal services), those lookups will fail with NXDOMAIN — a pure name-resolution failure, not a connectivity one — for as long as this connection stays up. Disconnecting restores the network's previous resolver."
+
 // ExternalGuarantees is the honest summary carried by every surface that
 // reports on an external tunnel — the two apply verbs and the live status —
 // so a caller reads the same three fields whichever one it reached.
@@ -135,6 +154,8 @@ func newExternalGuarantees(inForce, killSwitch, dnsTunneled bool) ExternalGuaran
 	}
 	if !g.DNSTunneled {
 		g.Warnings = append(g.Warnings, DNSNotTunnelledWarning)
+	} else {
+		g.Warnings = append(g.Warnings, DNSTunnelledNetworkWideWarning)
 	}
 	return g
 }

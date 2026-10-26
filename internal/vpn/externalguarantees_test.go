@@ -75,6 +75,33 @@ func TestAResolvableControlPlaneReportsTheKillSwitchPresent(t *testing.T) {
 	}
 }
 
+// DNS successfully tunnelled is not silence. The change that closed the leak
+// also moved every other container's resolver on this network, and that is
+// exactly as true the moment it succeeds as the moment it fails — so success
+// gets its own standing warning rather than the three fields collapsing to
+// "nothing to report" the instant DNSTunneled flips true.
+func TestDNSTunnelledSuccessfullyStillCarriesAStandingWarning(t *testing.T) {
+	got := newExternalGuarantees(true, true, true)
+	if !got.DNSTunneled {
+		t.Fatal("dns_tunneled must be true for this case")
+	}
+	if !containsString(got.Warnings, DNSTunnelledNetworkWideWarning) {
+		t.Fatalf("a successful DNS tunnel reported no network-wide warning: %v", got.Warnings)
+	}
+	if containsString(got.Warnings, DNSNotTunnelledWarning) {
+		t.Fatalf("a successful DNS tunnel must not also carry the NOT-tunnelled warning: %v", got.Warnings)
+	}
+	// And the inverse still holds — this must not have quietly swallowed the
+	// existing failure-path warning while adding the new one.
+	failed := newExternalGuarantees(true, true, false)
+	if !containsString(failed.Warnings, DNSNotTunnelledWarning) {
+		t.Fatalf("a failed DNS tunnel lost its warning: %v", failed.Warnings)
+	}
+	if containsString(failed.Warnings, DNSTunnelledNetworkWideWarning) {
+		t.Fatalf("a failed DNS tunnel must not claim the network-wide success warning: %v", failed.Warnings)
+	}
+}
+
 // warnings is `[]` and never null, on every path — including the refusals,
 // which return before the guarantees are ever computed. A caller that has to
 // handle both null and [] is a caller that will handle one of them wrong.

@@ -501,6 +501,38 @@ func TestApplyTunnelDNSInstallsBothRulesBeforeMovingTheUpstream(t *testing.T) {
 	}
 }
 
+// A successful apply is the case ExternalRoute (:796) turns into
+// newExternalGuarantees(true, plan.KillSwitch, dnsTunneled) — this is that
+// same composition, built from a REAL applyTunnelDNS result rather than a
+// hand-set bool, so the standing warning is proven against the path that
+// actually produces dnsTunneled=true and not just against the guarantees
+// function in isolation (that half is externalguarantees_test.go's job).
+//
+// No ordering of [profile resolver, network's prior resolver] fixes this by
+// itself: aardvark-dns's forward_to_servers takes the first upstream that
+// answers at all — NXDOMAIN included — and only moves on when one times out,
+// so whichever address is listed first wins every query. That is why the
+// warning has to say the tradeoff is standing for as long as the tunnel is,
+// not merely narrate the one apply that caused it.
+func TestASuccessfulDNSTunnelCarriesTheNetworkWideWarning(t *testing.T) {
+	withFakePodmanPath(t, testPodmanPath, nil)
+	plan := planDNSOn(t, podmanHost(), []string{testDNS})
+	r := readyHost(testDNS)
+
+	dnsTunneled := applyTunnelDNS(context.Background(), r, *plan, nil)
+	if !dnsTunneled {
+		t.Fatalf("apply reported DNS not tunnelled on a host where every proof holds: %v", r.calls)
+	}
+
+	guarantees := newExternalGuarantees(true, plan.KillSwitch, dnsTunneled)
+	if !containsString(guarantees.Warnings, DNSTunnelledNetworkWideWarning) {
+		t.Fatalf("a real successful DNS tunnel produced no network-wide warning: %v", guarantees.Warnings)
+	}
+	if containsString(guarantees.Warnings, DNSNotTunnelledWarning) {
+		t.Fatalf("a real successful DNS tunnel must not also claim the NOT-tunnelled warning: %v", guarantees.Warnings)
+	}
+}
+
 // THE CASE THE ONLY REAL PROFILE ON THIS DEPLOYMENT HITS — and the test that
 // commit 7210497's refusal used to own.
 //

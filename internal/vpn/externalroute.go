@@ -799,6 +799,7 @@ func ExternalRoute(ctx context.Context, spec ExternalRouteSpec, progress Progres
 		if dnsTunneled {
 			progress.emit("info", "DNS: aardvark's upstream for network %s is now %s, reached through %s — the leak documented in planExternalExclusions is closed for every container on that network while this tunnel is up",
 				plan.DNSNetwork, strings.Join(plan.DNSServers, ", "), plan.TunnelDev)
+			progress.emit("warning", "%s", DNSTunnelledNetworkWideWarning)
 		} else {
 			progress.emit("warning", "%s", DNSNotTunnelledWarning)
 		}
