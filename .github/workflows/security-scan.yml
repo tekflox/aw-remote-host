@@ -1,0 +1,127 @@
+name: Security scan
+
+# Thin caller. The Semgrep + Trivy + Gitleaks scan itself lives in
+# fredericowu/aw-shared-workflows — read that file's header for the
+# report-only posture, the runner threat model, and why the cron cannot be an
+# input.
+#
+# NEW TO THIS REPO. The scan was rolled out standalone to 61 `aw-app-*` repos
+# in September 2026; aw-remote-host never got a copy despite being
+# first-party application code that aw-stack runs in production
+# (`ghcr.io/tekflox/aw-remote-host`). It arrives here from the shared workflow
+# directly rather than as a 62nd copy — by the time that fleet was converged
+# it had already drifted into five distinct variants.
+#
+# Report-only by design: every scan step is `continue-on-error` and the
+# gitleaks run swallows its own exit 1, so a finding never fails this
+# workflow. It is a reporting pipeline, not a gate.
+#
+# This repo has no PR-first review loop (`ci.yml` and `release.yml` are its
+# only other workflows), so this file landed by DIRECT PUSH to `main`, which
+# is the same path the original 61-repo rollout used.
+#
+# ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
+# `@v1.6.0` is immutable and never retagged; the shared repo's tag ruleset
+# enforces that for everyone including the owner. The cautionary precedent is
+# `app-release.yml`, referenced via a moving `@master` from ~45 app repos,
+# where one fail-loud edit turned the whole marketplace red at once.
+#
+# ── THE TRIGGERS ARE OURS, AND THEY HAVE TO BE ────────────────────────────
+# GitHub Actions does not execute `on.schedule` from a called workflow —
+# triggers always belong to the caller. A cron in the shared file would never
+# fire, so there is no input for it and this block is not duplication.
+#
+# The slot is STAGGERED on purpose: 60+ repos run this scan and the
+# `[self-hosted, aw-baremetal]` pool this repo uses is 4 shared runners, so a
+# shared slot means jobs queueing behind each other. `17 0 * * 6` was verified
+# unused across every cron in every workflow of every repo in this estate on
+# 2026-11-05 (hour 0 UTC was entirely free; 8 repos already collide on
+# "45 2 * * 3" from a rollout that copy-pasted one slot).
+#
+# `workflow_dispatch: {}` is what makes this verifiable on demand —
+# `gh workflow run "Security scan" --repo tekflox/aw-remote-host`.
+#
+# ── NEVER ADD A pull_request TRIGGER TO THIS FILE — AND THIS REPO IS PUBLIC ─
+# `runs_on` is left at its default, `[self-hosted, aw-baremetal]`, and that is
+# safe ONLY because `schedule` and `workflow_dispatch` can run nothing but
+# trusted default-branch code.
+#
+# THE STAKES ARE HIGHER HERE THAN ON THE OTHER CALLERS: this repo is PUBLIC,
+# so anyone can open a pull request from a fork. A `pull_request` trigger on
+# this file would hand that fork's code to a bare-metal runner — arbitrary
+# code execution on the host that runs the whole workspace. That is exactly
+# the trade the shared `ai-review-reusable.yml` refuses by hardcoding
+# `ubuntu-latest`, and the shared scan workflow declares only `workflow_call`
+# so it cannot be reached any other way. If PR-time scanning is ever genuinely
+# wanted here, it MUST pass `runs_on: '"ubuntu-latest"'` in the same change.
+#
+# ── runs_on: LEFT AT SELF-HOSTED, DO NOT "HARMONIZE" IT ───────────────────
+# This repo also has `ubuntu-24.04` workflows (`ci.yml`'s and `release.yml`'s
+# GitHub-hosted jobs), so the two runner families coexist here on purpose.
+# This scan stays on self-hosted like the other 61 copies: it is a long,
+# weekly, trusted-code job, and the shared pool is what the fleet's stagger
+# was designed around. Do not unify the two for tidiness.
+#
+# `tekflox/aw-remote-host` has no repo-level runner of its own (verified: 0)
+# and reaches the `aw-baremetal` label through the tekflox ORG runner group
+# `aw-private` — the 4 shared `aw-baremetal-tekflox*` runners this repo's
+# `ci.yml` and `release.yml` self-hosted jobs already run on green. That path
+# exists only for `tekflox/*` repos: an org runner group cannot be shared
+# outside its org, so a personal-account caller with no dedicated runner would
+# QUEUE FOREVER rather than fail. Not this repo's problem, but it is why the
+# input exists.
+#
+# ── sarif_upload: LEFT AT ITS DEFAULT (true) — THIS IS THE PUBLIC CASE ────
+# No `with:` block at all, deliberately. This repo is PUBLIC, so code scanning
+# is available to it and the SARIF upload genuinely works — unlike the four
+# private callers in this same rollout, which must pass
+# `sarif_upload: false` because GitHub refuses the upload without Advanced
+# Security. Verified live on 2026-11-05: the code-scanning API answers
+# `404 no analysis found` here (an empty history, i.e. reachable), NOT the
+# private repos' `403 Code scanning is not enabled` / "Advanced Security must
+# be enabled".
+#
+# So this is the one canary where findings land in the Security > Code
+# scanning tab under the three categories (semgrep / trivy / gitleaks), the
+# same as the 61-copy fleet. Confirm with:
+#
+#     gh api repos/tekflox/aw-remote-host/code-scanning/analyses \
+#       --jq '[.[].category] | unique'
+#
+# AND IF THE UPLOAD EVER BREAKS, THIS WORKFLOW GOES RED, ON PURPOSE. The
+# shared workflow puts no `continue-on-error` on its upload steps: on a repo
+# where feeding the Security tab is the whole point, an upload that silently
+# stops working is a reporting pipeline that looks healthy and reports
+# nothing. Do not "fix" a red upload by making it best-effort — fix the
+# upload, or set `sarif_upload: false` and say why.
+
+on:
+  schedule:
+    # Staggered, verified-unused slot — see "THE TRIGGERS ARE OURS" above.
+    - cron: "17 0 * * 6"
+  workflow_dispatch: {}
+
+jobs:
+  security-scan:
+    uses: fredericowu/aw-shared-workflows/.github/workflows/security-scan-reusable.yml@v1.6.0
+    # Declared here as well as in the called workflow: the effective
+    # GITHUB_TOKEN permissions are the INTERSECTION of the two, and it cuts
+    # BOTH ways — a scope either side omits is an explicit `none`, never an
+    # inherit. The shared workflow's parity test compares the two lists in
+    # both directions, so an extra scope here is a failure rather than
+    # harmless slack.
+    #
+    # `security-events: write` is the one that actually gets exercised on this
+    # repo, since it is the only caller in this rollout with the SARIF upload
+    # switched on. Missing it on EITHER side 403s every upload, which reads
+    # exactly like the no-Advanced-Security failure the other four callers
+    # have and sends you to flip the wrong switch.
+    permissions:
+      contents: read
+      security-events: write
+    # No `secrets:` block — the scan needs nothing but the automatic
+    # GITHUB_TOKEN.
+    #
+    # No `with:` block either: `sarif_upload` stays true (this repo is public,
+    # so the upload works) and `runs_on` stays self-hosted. See the two notes
+    # above before adding either.
