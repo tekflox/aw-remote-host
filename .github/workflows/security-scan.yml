@@ -35,8 +35,17 @@ name: Security scan
 # `[self-hosted, aw-baremetal]` pool this repo uses is 4 shared runners, so a
 # shared slot means jobs queueing behind each other. `17 0 * * 6` was verified
 # unused across every cron in every workflow of every repo in this estate on
-# 2026-11-05 (hour 0 UTC was entirely free; 8 repos already collide on
-# "45 2 * * 3" from a rollout that copy-pasted one slot).
+# 2026-11-05, BEFORE this rollout: hour 0 UTC held no cron at all across
+# the 61 standalone copies, while 8 repos already collided on
+# "45 2 * * 3" from a rollout that copy-pasted one slot.
+#
+# DO NOT READ THAT AS "hour 0 is free" AND PICK ANOTHER MINUTE IN IT. This
+# rollout itself claims five hour-0 slots — "11 0 * * 1" (aw-stack),
+# "23 0 * * 2" (aw-backend), "37 0 * * 4" (aw-console), "49 0 * * 5"
+# (aw-tekflox), "17 0 * * 6" (aw-remote-host) — so the hour is no longer
+# empty and the audit above is a snapshot, not a standing fact. Re-run it
+# before choosing a slot:
+#     grep -h 'cron:' repos/*/.github/workflows/security-scan.yml | sort | uniq -c
 #
 # `workflow_dispatch: {}` is what makes this verifiable on demand —
 # `gh workflow run "Security scan" --repo tekflox/aw-remote-host`.
