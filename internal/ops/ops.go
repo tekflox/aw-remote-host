@@ -81,6 +81,10 @@ func (execRunner) Run(ctx context.Context, name string, args ...string) (string,
 	// time any Run() call constructs its exec.Cmd, the process's own PATH
 	// already has the vendored dir on it and this plain lookup just works.
 	cmd := exec.CommandContext(ctx, name, args...)
+	// A killed podman client can leave a grandchild holding the output pipe
+	// open; without WaitDelay CombinedOutput would then block past the
+	// deadline and the timeout would not actually free the caller.
+	cmd.WaitDelay = 5 * time.Second
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -174,6 +178,13 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 			return nil, err
 		}
 		defer release()
+		// The lock above is held until this verb returns, so a step that never
+		// returns would strand every later click behind it. Cancelling ctx
+		// kills the in-flight podman client (exec.CommandContext), which both
+		// ends the verb and releases the lock.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, lifecycleVerbTimeout)
+		defer cancel()
 	}
 
 	switch verb {
@@ -604,7 +615,7 @@ func (h *Handler) Reinstall(ctx context.Context, opts BootstrapOpts, emit Emit) 
 	// update that only looked like it installed something.
 	h.reconcileRecordedImage(ctx, opts, emit)
 	emit("info", "reinstall", "removing workspace container for a fresh recreate")
-	_, _ = h.runner().Run(ctx, "podman", "rm", "-f", WorkspaceContainer)
+	_, _ = h.runBounded(ctx, podmanStepTimeout, "podman", "rm", "-f", WorkspaceContainer)
 	return h.runModules(ctx, opts, false, emit)
 }
 
@@ -1139,8 +1150,7 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	// part of the already-authorized workspace update. Continuing after a
 	// failed removal would let bootstrap accept the old healthy container and
 	// record the new image as installed although it never ran.
-	if out, err := h.runner().Run(ctx, "podman", "rm", "-f", "--ignore", "--depend", WorkspaceContainer); err != nil {
-		removeErr := commandError("remove workspace container before update", err, out)
+	if removeErr := h.removeWorkspaceContainer(ctx, emit); removeErr != nil {
 		emit("error", "update", removeErr.Error())
 		return nil, removeErr
 	}
