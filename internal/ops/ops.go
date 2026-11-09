@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -139,7 +140,7 @@ type Handler struct {
 }
 
 // Dispatch executes one verb ("stop"|"restart"|"reinstall"|"bootstrap"|"update"|
-// "self-update"|"uninstall"|"health"|"exec_start"|"exec_status"|"exec_wait"|
+// "update_preflight"|"self-update"|"uninstall"|"health"|"exec_start"|"exec_status"|"exec_wait"|
 // "exec_kill"|"list_processes"|"workspace_logs"|"agent_sessions"|"fs_stat"|"fs_list"|"fs_mkdir"|"fs_delete"|
 // "fs_read_chunk"|"fs_write_chunk"|"firewall_apply"|"firewall_status"|
 // "vpn_status"|"vpn_bootstrap"|"vpn_advertise_exit"|"vpn_use_exit"|
@@ -200,6 +201,8 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 		return h.Bootstrap(ctx, h.Opts, args, emit)
 	case "update":
 		return h.Update(ctx, h.Opts, args, emit)
+	case "update_preflight":
+		return h.UpdatePreflight(ctx, args)
 	case "self-update":
 		return h.SelfUpdate(ctx, args, emit)
 	case "health":
@@ -269,13 +272,14 @@ func (h *Handler) Dispatch(ctx context.Context, verb string, args map[string]any
 // have podman in the first place. workspaceRuntimeSupported is the
 // build-tagged switch — see proc_unix.go / proc_windows.go.
 var workspaceLifecycleVerbs = map[string]bool{
-	"stop":           true,
-	"restart":        true,
-	"uninstall":      true,
-	"reinstall":      true,
-	"bootstrap":      true,
-	"update":         true,
-	"workspace_logs": true,
+	"stop":             true,
+	"restart":          true,
+	"uninstall":        true,
+	"reinstall":        true,
+	"bootstrap":        true,
+	"update":           true,
+	"update_preflight": true,
+	"workspace_logs":   true,
 }
 
 // workspaceRecreateVerbs is the subset of the above that pulls/syncs
@@ -689,25 +693,62 @@ func gitIn(hostDir string, args ...string) []string {
 // Best-effort, like its sibling: a host with no git, or no checkout, is not
 // blocked. Failing closed there would strand updates on every host that
 // never had a repo to begin with. force=true overrides.
-func (h *Handler) guardHostUncommittedEdits(ctx context.Context, hostDir string, force bool, emit Emit) error {
-	out, err := h.runner().Run(ctx, "git", gitIn(hostDir, "status", "--porcelain")...)
-	if err != nil {
-		return nil // not a checkout, or git can't run — nothing provable here
-	}
-	var dirty []string
-	for _, line := range strings.Split(out, "\n") {
+// dirtyEntry is one TRACKED, modified path from `git status --porcelain` —
+// the same filter guardHostUncommittedEdits has always applied, now also
+// consumed by UpdatePreflight's structured preview. See
+// parseHostDirtyEntries for why both read it from one place.
+type dirtyEntry struct {
+	Status string
+	Path   string
+}
+
+// parseHostDirtyEntries parses `git status --porcelain` output into TRACKED
+// modifications only — "??" (untracked) and "!!" (ignored) are excluded, see
+// guardHostUncommittedEdits's docstring for why. Factored out so the guard
+// (which blocks) and UpdatePreflight (which only previews) can never
+// disagree about what counts as dirty — a preview that shows 0 files while
+// the guard still refuses, or the reverse, is worse than either alone.
+func parseHostDirtyEntries(porcelain string) []dirtyEntry {
+	var entries []dirtyEntry
+	for _, line := range strings.Split(porcelain, "\n") {
 		if len(line) < 3 {
 			continue
 		}
-		// Porcelain v1: first two columns are the index/worktree status.
-		// "??" is untracked and "!!" ignored — neither counts, see above.
 		if strings.HasPrefix(line, "??") || strings.HasPrefix(line, "!!") {
 			continue
 		}
-		dirty = append(dirty, strings.TrimSpace(line))
+		entries = append(entries, dirtyEntry{
+			Status: strings.TrimSpace(line[:2]),
+			Path:   strings.TrimSpace(line[2:]),
+		})
 	}
-	if len(dirty) == 0 {
+	return entries
+}
+
+// hostDirtyEntries runs `git status --porcelain` against hostDir and parses
+// it through parseHostDirtyEntries. A nil, nil result (not an error) means
+// "not a checkout, or git can't run" — the same best-effort stance
+// guardHostUncommittedEdits and guardHostNotAheadOfImage already take: a
+// host with no git must never be blocked, only left unguarded.
+func (h *Handler) hostDirtyEntries(ctx context.Context, hostDir string) ([]dirtyEntry, error) {
+	out, err := h.runner().Run(ctx, "git", gitIn(hostDir, "status", "--porcelain")...)
+	if err != nil {
+		return nil, err
+	}
+	return parseHostDirtyEntries(out), nil
+}
+
+func (h *Handler) guardHostUncommittedEdits(ctx context.Context, hostDir string, force bool, emit Emit) error {
+	entries, err := h.hostDirtyEntries(ctx, hostDir)
+	if err != nil {
+		return nil // not a checkout, or git can't run — nothing provable here
+	}
+	if len(entries) == 0 {
 		return nil
+	}
+	dirty := make([]string, len(entries))
+	for i, e := range entries {
+		dirty[i] = strings.TrimSpace(e.Status + " " + e.Path)
 	}
 	shown := dirty
 	if len(shown) > 10 {
@@ -862,6 +903,86 @@ func (h *Handler) guardHostNotAheadOfImage(ctx context.Context, hostDir, image s
 		"refusing to sync: host HEAD %s is ahead of image HEAD %s — syncing would silently revert committed host work. Re-run with force=true to override.",
 		hostHead, imageHead))
 	return fmt.Errorf("host git HEAD %s is ahead of image HEAD %s: refusing sync without force", hostHead, imageHead)
+}
+
+// UpdatePreflight is the read-only counterpart of Update's two guards —
+// called BEFORE a force-update confirmation modal is shown, so the UI can
+// display the exact dirty-file list instead of parsing the guard's own
+// error string (which truncates at 10 entries by design, see
+// guardHostUncommittedEdits, and is not a contract).
+//
+// Deliberately NOT in workspaceRecreateVerbs: it never writes anything and
+// must not wait on, or hold, the per-machine lifecycle flock — a preview
+// that is briefly stale because a real Update ran concurrently is
+// acceptable (Update re-checks the authoritative state itself, under the
+// lock, before touching anything); a preview that blocks on that lock while
+// a real update is mid-pull would defeat the point of a cheap preflight.
+func (h *Handler) UpdatePreflight(ctx context.Context, args map[string]any) (map[string]any, error) {
+	hostDir, err := workspaceHostDir()
+	if err != nil {
+		return nil, err
+	}
+	version, _ := args["version"].(string)
+	version = strings.TrimSpace(version)
+	image := workspaceImageForVersion(version)
+
+	result := map[string]any{
+		"git_checkout": false,
+		"ahead":        "unknown",
+	}
+
+	headOut, headErr := h.runner().Run(ctx, "git", gitIn(hostDir, "rev-parse", "HEAD")...)
+	hostHead := strings.TrimSpace(headOut)
+	if headErr != nil || hostHead == "" {
+		return result, nil // not a checkout, or git can't run — nothing to preview
+	}
+	result["git_checkout"] = true
+	result["head"] = hostHead
+
+	entries, dirtyErr := h.hostDirtyEntries(ctx, hostDir)
+	if dirtyErr == nil {
+		const cap_ = 1000
+		dirty := make([]map[string]string, 0, len(entries))
+		for i, e := range entries {
+			if i >= cap_ {
+				break
+			}
+			dirty = append(dirty, map[string]string{"status": e.Status, "path": e.Path})
+		}
+		result["dirty"] = dirty
+		result["dirty_count"] = len(entries)
+		result["truncated"] = len(entries) > cap_
+		if len(entries) > 0 {
+			if out, err := h.runner().Run(ctx, "git", gitIn(hostDir, "diff", "HEAD", "--shortstat")...); err == nil {
+				result["shortstat"] = strings.TrimSpace(out)
+			}
+		}
+	}
+
+	// Same ahead-of-image semantics as guardHostNotAheadOfImage (tag
+	// resolution, then merge-base --is-ancestor), deliberately duplicated
+	// rather than shared: the guard's version also EMITS and ERRORS, neither
+	// of which this read-only preview should do.
+	imageHead := h.imageWorkspaceVersion(ctx, image)
+	if imageHead != "" {
+		if out, err := h.runner().Run(ctx, "git", gitIn(hostDir, "rev-parse", imageHead+"^{commit}")...); err == nil {
+			if resolved := strings.TrimSpace(out); resolved != "" {
+				imageHead = resolved
+			}
+		}
+		switch {
+		case imageHead == hostHead:
+			result["ahead"] = "no"
+		default:
+			if _, err := h.runner().Run(ctx, "git", gitIn(hostDir, "merge-base", "--is-ancestor", imageHead, hostHead)...); err == nil {
+				result["ahead"] = "yes"
+			} else {
+				result["ahead"] = "unknown"
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // pruneUnusedImages reclaims disk from accumulated old podman images before
@@ -1055,6 +1176,30 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 		return nil, err
 	}
 
+	// force=true just got past the guard above specifically BECAUSE there is
+	// uncommitted work it is about to discard. Back it up before anything
+	// else happens — syncWorkspaceSource below is what destroys it, and a
+	// backup that runs after that point backs up nothing. FAIL-CLOSED: the
+	// confirmation modal upstream promises a recoverable backup before the
+	// user checks the box, so a backup that cannot be written must stop the
+	// update rather than warn and proceed — see backupDirtyHostState.
+	var discardedFiles []string
+	var backupDir string
+	if force {
+		if dirtyEntries, dirtyErr := h.hostDirtyEntries(ctx, hostDir); dirtyErr == nil && len(dirtyEntries) > 0 {
+			dir, err := h.backupDirtyHostState(ctx, hostDir, version, dirtyEntries, emit)
+			if err != nil {
+				emit("error", "update", "refusing to discard uncommitted work: backup failed: "+err.Error())
+				return nil, fmt.Errorf("backup of uncommitted host edits failed, refusing to discard them: %w", err)
+			}
+			backupDir = dir
+			discardedFiles = make([]string, len(dirtyEntries))
+			for i, e := range dirtyEntries {
+				discardedFiles[i] = e.Path
+			}
+		}
+	}
+
 	staging := filepath.Join(hostDir, fmt.Sprintf(".aw-workspace-update-%d", time.Now().UnixNano()))
 	if err := os.RemoveAll(staging); err != nil {
 		return nil, fmt.Errorf("remove stale staging dir: %w", err)
@@ -1129,19 +1274,7 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	// syncWorkspaceSource never touches those, but a separate `chown -R
 	// hostDir` used to sweep them anyway on every update, stomping their
 	// ownership every single redeploy (core:workspace-redeploy-chowns-app-data-dirs).
-	if len(written) > 0 {
-		chownArgs := append([]string{"unshare", "chown", "-R", WorkspaceUID + ":" + WorkspaceGID}, written...)
-		chownLabel := "podman unshare chown"
-		if os.Geteuid() == 0 {
-			chownArgs = append([]string{"-R", WorkspaceUID + ":" + WorkspaceGID}, written...)
-			chownLabel = "chown"
-			if out, err := h.runner().Run(ctx, "chown", chownArgs...); err != nil {
-				emit("warning", "update", "could not normalize workspace ownership: "+commandError(chownLabel, err, out).Error())
-			}
-		} else if out, err := h.runner().Run(ctx, "podman", chownArgs...); err != nil {
-			emit("warning", "update", "could not normalize workspace ownership: "+commandError(chownLabel, err, out).Error())
-		}
-	}
+	h.chownToWorkspaceUser(ctx, written, emit)
 
 	h.snapshotWorkspaceLogBeforeRecreate(ctx, emit)
 	emit("info", "update", "recreating workspace container from "+recreateImage)
@@ -1183,7 +1316,173 @@ func (h *Handler) Update(ctx context.Context, opts BootstrapOpts, args map[strin
 	if version != "" {
 		data["version"] = version
 	}
+	if force {
+		data["forced"] = true
+	}
+	if len(discardedFiles) > 0 {
+		data["discarded_files"] = discardedFiles
+		data["backup_dir"] = backupDir
+	}
 	return data, nil
+}
+
+// chownToWorkspaceUser normalizes ownership of freshly-written host paths to
+// the workspace container's own uid/gid. Shared by Update's post-sync chown
+// of `written` and backupDirtyHostState's backup directory, so the rootful
+// vs rootless split below is written once — a host that fixed this for one
+// call site and not the other would still look broken for the other.
+//
+// See Update's own history for why the split exists: this daemon can run
+// either as host root (a plain `chown -R` lands directly) or as an
+// unprivileged `--user` systemd unit on a rootless-podman host (host root
+// can't chown at all there; `podman unshare chown` runs inside this
+// process's own rootless user-namespace mapping instead, landing as the
+// uid/gid the container's `ubuntu` resolves to). Best-effort: a failed
+// chown is a readability problem inside the workspace, not data loss, so it
+// is logged and swallowed rather than failing the caller.
+func (h *Handler) chownToWorkspaceUser(ctx context.Context, paths []string, emit Emit) {
+	if len(paths) == 0 {
+		return
+	}
+	chownArgs := append([]string{"-R", WorkspaceUID + ":" + WorkspaceGID}, paths...)
+	if os.Geteuid() == 0 {
+		if out, err := h.runner().Run(ctx, "chown", chownArgs...); err != nil {
+			emit("warning", "update", "could not normalize workspace ownership: "+commandError("chown", err, out).Error())
+		}
+		return
+	}
+	unshareArgs := append([]string{"unshare", "chown", "-R", WorkspaceUID + ":" + WorkspaceGID}, paths...)
+	if out, err := h.runner().Run(ctx, "podman", unshareArgs...); err != nil {
+		emit("warning", "update", "could not normalize workspace ownership: "+commandError("podman unshare chown", err, out).Error())
+	}
+}
+
+// backupDirtyHostState snapshots every uncommitted tracked change in hostDir
+// BEFORE Update's force path discards it, under
+// hostDir/.aw-workspace/update-backups/<unix-nano>-<version>/ —
+// syncWorkspaceSource already excludes ".aw-workspace" from what it
+// overwrites (see its own exclusion list), so the backup survives the very
+// sync it exists to protect against.
+//
+// Three artifacts, not one, because none of them alone is recoverable:
+//   - status.txt / HEAD.txt: what was dirty, and from which commit, in case
+//     the patch alone is ambiguous about base.
+//   - dirty.patch (git diff HEAD --binary): --binary is not optional — a
+//     plain `git diff` silently drops binary file content, and a deleted
+//     file's removal is only reconstructable from the patch, not the
+//     tarball (there is nothing left on disk to tar).
+//   - files.tar.gz: the surviving (non-deleted) dirty files, verbatim — a
+//     convenience for anyone recovering who would rather copy a file back
+//     than `git apply` a patch.
+//
+// FAIL-CLOSED: returns an error on ANY step that fails, deliberately,
+// including a prune or chown failure elsewhere being merely a warning. The
+// confirmation modal upstream tells the user a backup will be made before
+// they check the box — a backup that silently failed here would make that
+// promise a lie at the exact moment it mattered (disk-full is a real
+// condition on this host's own class of hardware, not a hypothetical).
+func (h *Handler) backupDirtyHostState(ctx context.Context, hostDir, version string, dirty []dirtyEntry, emit Emit) (string, error) {
+	versionLabel := strings.TrimSpace(version)
+	if versionLabel == "" {
+		versionLabel = "unversioned"
+	}
+	root := filepath.Join(hostDir, ".aw-workspace", "update-backups")
+	dir := filepath.Join(root, fmt.Sprintf("%d-%s", time.Now().UnixNano(), versionLabel))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create update backup dir %s: %w", dir, err)
+	}
+
+	statusOut, statusErr := h.runner().Run(ctx, "git", gitIn(hostDir, "status", "--porcelain")...)
+	if statusErr != nil {
+		return "", fmt.Errorf("capture backup status: %w", statusErr)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.txt"), []byte(statusOut), 0o644); err != nil {
+		return "", fmt.Errorf("write backup status.txt: %w", err)
+	}
+
+	headOut, headErr := h.runner().Run(ctx, "git", gitIn(hostDir, "rev-parse", "HEAD")...)
+	if headErr != nil {
+		return "", fmt.Errorf("capture backup HEAD: %w", headErr)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "HEAD.txt"), []byte(headOut), 0o644); err != nil {
+		return "", fmt.Errorf("write backup HEAD.txt: %w", err)
+	}
+
+	patchOut, patchErr := h.runner().Run(ctx, "git", gitIn(hostDir, "diff", "HEAD", "--binary")...)
+	if patchErr != nil {
+		return "", fmt.Errorf("capture backup diff: %w", patchErr)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dirty.patch"), []byte(patchOut), 0o644); err != nil {
+		return "", fmt.Errorf("write backup dirty.patch: %w", err)
+	}
+
+	// Only paths still present on disk go in the tarball — a deleted entry
+	// (status "D") has nothing left to tar; dirty.patch above is what
+	// recovers it.
+	var existing []string
+	for _, e := range dirty {
+		if strings.HasPrefix(e.Status, "D") {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(hostDir, e.Path)); err == nil {
+			existing = append(existing, e.Path)
+		}
+	}
+	if len(existing) > 0 {
+		tarArgs := append([]string{"-czf", filepath.Join(dir, "files.tar.gz"), "-C", hostDir}, existing...)
+		if out, err := h.runner().Run(ctx, "tar", tarArgs...); err != nil {
+			return "", fmt.Errorf("%w", commandError("tar backup files", err, out))
+		}
+	}
+
+	if err := h.pruneOldUpdateBackups(ctx, root, dir); err != nil {
+		emit("warning", "update", "could not prune old update backups: "+err.Error())
+	}
+
+	// hostDir (and everything synced into it) is owned by the workspace
+	// container's own uid — this daemon runs as root (see gitIn's
+	// docstring), so without this the backup would be root-owned and
+	// unreadable from inside the workspace, which is the one place someone
+	// would actually go to recover it.
+	h.chownToWorkspaceUser(ctx, []string{dir}, emit)
+
+	emit("warning", "update", fmt.Sprintf(
+		"backed up %d uncommitted file(s) to %s before discarding them", len(dirty), dir))
+	return dir, nil
+}
+
+// pruneOldUpdateBackups keeps at most the 5 most recent backups under root.
+// Each one is a full patch+tarball of a force-discarded dirty tree, and disk
+// is finite — this exact host class has run close to full before (see
+// pruneUnusedImages above).
+func (h *Handler) pruneOldUpdateBackups(ctx context.Context, root, justWritten string) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return fmt.Errorf("list update backups: %w", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	// Names are "<unix-nano>-<version>"; unix-nano keeps a fixed digit count
+	// for centuries from now, so a lexical sort is also a chronological one.
+	sort.Strings(names)
+	const keep = 5
+	if len(names) <= keep {
+		return nil
+	}
+	for _, name := range names[:len(names)-keep] {
+		full := filepath.Join(root, name)
+		if full == justWritten {
+			continue
+		}
+		if err := os.RemoveAll(full); err != nil {
+			return fmt.Errorf("remove old backup %s: %w", full, err)
+		}
+	}
+	return nil
 }
 
 // recreateVerifyAttempts/recreateVerifyInterval bound how long
