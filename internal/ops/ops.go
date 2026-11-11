@@ -2158,9 +2158,17 @@ func (h *Handler) Health(ctx context.Context) (result map[string]any) {
 		rlog.Printf("ops: health: finished healthy=%v offline=%v", result["healthy"], result["offline"])
 	}()
 
+	// degradations is relayed in BOTH shapes below, not only the online
+	// one: an undersized podman machine is a property of the HOST, not of
+	// whether the workspace container inside it happens to be running —
+	// a BYOD host can be asleep (offline, expected) and still sitting on
+	// a machine that will OOM the moment it wakes up.
+	degradations := degradationsOrEmpty()
+
 	offline := map[string]any{
 		"healthy": false, "uptime_s": nil, "disk": nil,
 		"cpu_pct": nil, "mem": nil, "offline": true,
+		"degradations": degradations,
 	}
 
 	out, err := h.runner().Run(ctx, "podman", "inspect", "--format",
@@ -2197,7 +2205,23 @@ func (h *Handler) Health(ctx context.Context) (result map[string]any) {
 		"mem":               mem,
 		"offline":           false,
 		"workspace_version": workspaceVersion,
+		"degradations":      degradations,
 	}
+}
+
+// degradationsOrEmpty relays bootstrap.ReadDegradations() for the control
+// plane — read-only, no sizing/threshold logic here (that lives in shell
+// only, in bootstrap/lib/podman_machine.sh, so there is exactly one place
+// to keep it correct). "degradations": [] rather than null on any read
+// error, matching this payload's own convention for every other field here
+// (an offline/absent signal, not a crash) and the "warnings": [] contract
+// externalStatusPayload already uses elsewhere in this package.
+func degradationsOrEmpty() []string {
+	d, err := bootstrap.ReadDegradations()
+	if err != nil || d == nil {
+		return []string{}
+	}
+	return d
 }
 
 func (h *Handler) probeHealth(ctx context.Context) (bool, any) {

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tekflox/aw-remote-host/internal/bootstrap"
 	"github.com/tekflox/aw-remote-host/internal/state"
 )
 
@@ -592,6 +593,67 @@ func TestHealthOfflineWhenContainerStopped(t *testing.T) {
 	got := h.Health(context.Background())
 	if got["offline"] != true {
 		t.Errorf("expected offline=true for a stopped container, got %v", got)
+	}
+}
+
+func TestHealthDegradationsEmptyWhenNoMarkers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // windows
+
+	r := newFakeRunner()
+	r.fail(fmt.Errorf("no such container"), "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	h := &Handler{Runner: r}
+
+	got := h.Health(context.Background())
+	d, ok := got["degradations"].([]string)
+	if !ok {
+		t.Fatalf("expected degradations to be []string, got %T (%v)", got["degradations"], got["degradations"])
+	}
+	if len(d) != 0 {
+		t.Errorf("expected no degradations, got %v", d)
+	}
+}
+
+func TestHealthDegradationsRelaysMarkerOnBothOfflineAndOnlinePaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	dir, err := bootstrap.DegradationsDir()
+	if err != nil {
+		t.Fatalf("DegradationsDir: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	want := "podman machine is undersized — resize it"
+	if err := os.WriteFile(filepath.Join(dir, "podman-machine-undersized"), []byte(want), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	// Offline path: the workspace container being asleep/stopped must not
+	// hide a host-level degradation — the whole point of surfacing it is
+	// that a human checks it independently of the workspace itself.
+	rOffline := newFakeRunner()
+	rOffline.fail(fmt.Errorf("no such container"), "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	gotOffline := (&Handler{Runner: rOffline}).Health(context.Background())
+	dOffline, ok := gotOffline["degradations"].([]string)
+	if !ok || len(dOffline) != 1 || dOffline[0] != want {
+		t.Errorf("offline: expected degradations=[%q], got %v", want, gotOffline["degradations"])
+	}
+
+	// Online path: same marker, workspace healthy.
+	rOnline := newFakeRunner()
+	rOnline.on("true\t2020-01-01T00:00:00.000000000Z", "podman", "inspect", "--format",
+		"{{.State.Running}}\t{{.State.StartedAt}}", WorkspaceContainer)
+	rOnline.on("", "curl", "-fsS", "--max-time", probeTimeout, HealthURL)
+	gotOnline := (&Handler{Runner: rOnline}).Health(context.Background())
+	dOnline, ok := gotOnline["degradations"].([]string)
+	if !ok || len(dOnline) != 1 || dOnline[0] != want {
+		t.Errorf("online: expected degradations=[%q], got %v", want, gotOnline["degradations"])
 	}
 }
 

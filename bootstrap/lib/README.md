@@ -58,3 +58,33 @@ Linux keeps installing everything through the distro's package manager
 (`apt-get`/`dnf`/`pacman`) — those already work standalone on a clean
 machine, so there's no vendored-fetch case for Linux yet. `ensure_cmd` is
 still used there for the "already installed" no-op check.
+
+## The `degradations/` marker-dir convention
+
+`podman_machine.sh` is the first consumer of a small convention any future
+`verify.sh` can reuse for a condition that is healthy-but-risky — true
+enough to flag, not safe to fail on (a `verify.sh` failure aborts the
+whole module chain, which is the wrong size of hammer for "this machine is
+running, just undersized").
+
+- One file per condition under `~/.aw-remote-host/degradations/`, named
+  for the condition (e.g. `podman-machine-undersized`). This is a
+  **per-machine**, not per-instance, path (`internal/instance.MachineDir()`
+  on the Go side) — a host serving two linked identities still has exactly
+  one physical podman machine, so the marker is host-level on purpose.
+- File content is the full human-readable message, including any resize
+  command the operator should run — `aw-remote-host status`
+  (`cmd/aw-remote-host/commands.go` `runStatus`) and the ops `Health`
+  payload (`internal/ops/ops.go`, via `internal/bootstrap.ReadDegradations`)
+  both just relay that content verbatim.
+- **SET + CLEAR, same writer.** The check that writes a marker when the
+  condition is bad must also remove it the next time it observes the
+  condition as fixed. A marker that only ever gets written becomes a
+  permanently-amber row nobody trusts — see the workspace-wide
+  degradation-signal convention this one is modeled on.
+- Never let a SET/CLEAR check fail the script it lives in — wrap it so
+  every command tolerates failure (`|| true`-style) and the check itself
+  can never take verify.sh's exit code with it. See
+  `bootstrap/podman/verify.sh`'s `check_podman_machine_sizing` for the
+  pattern (a function invoked as `check_podman_machine_sizing || true`, so
+  `set -e` is ignored for its entire body per POSIX).
