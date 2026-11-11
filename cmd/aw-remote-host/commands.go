@@ -1045,8 +1045,26 @@ func runStatus(args []string) error {
 			rlog.Printf("%s: not healthy\n%s\n", mod.Name, out)
 		}
 	}
+	// Degradations: a module can be "healthy" (verify.sh exits 0) and still
+	// be running in a state that will eventually cause real trouble — e.g.
+	// an undersized podman machine. Those aren't verify.sh failures (a
+	// hard failure here would abort the whole module chain on every
+	// existing undersized host — see bootstrap/podman/verify.sh), they're
+	// markers verify.sh itself writes/removes. `status` is where a human
+	// actually looks, so surface them here rather than leaving them only
+	// in bootstrap's own stderr.
+	degradations, degErr := bootstrap.ReadDegradations()
+	if degErr != nil {
+		rlog.Printf("degradations: could not read: %v\n", degErr)
+	}
+	for _, d := range degradations {
+		rlog.Printf("DEGRADED: %s\n", d)
+	}
 	if !allOK {
 		return fmt.Errorf("one or more modules are not healthy")
+	}
+	if len(degradations) > 0 {
+		return fmt.Errorf("host is degraded (see DEGRADED lines above)")
 	}
 	return nil
 }

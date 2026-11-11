@@ -64,3 +64,22 @@ that script's `$PATH` when present — see `podmanVendoredBinDir()` in
 `internal/bootstrap/runner.go`. This is a no-op whenever podman is already
 on `$PATH` normally (brew install, or already vendored in a prior run), so
 the happy path is unaffected.
+
+### Podman machine sizing
+
+A fresh `podman machine init` (the "no running container backend found"
+branch above) is sized from this host's physical RAM/CPU
+(`bootstrap/lib/podman_machine.sh`'s `podman_machine_recommended_size`)
+instead of podman's own 2GiB/2cpu default, which OOM-kills a real
+workspace (postgres + redis + the workspace + several Tier-2 app
+containers) under real load.
+
+An **already-running** machine that is undersized is not auto-resized —
+`podman machine set` needs stop+start, which would kill every running
+container including the workspace itself, so that's an outage, not a
+setting. `verify.sh` diagnoses it instead: it writes
+`~/.aw-remote-host/degradations/podman-machine-undersized` (removed again
+once the machine is resized) with the exact `podman machine stop && podman
+machine set --memory N --cpus M && podman machine start` to run, surfaced
+by `aw-remote-host status` and the ops `Health` payload. See
+`bootstrap/lib/README.md`'s "degradations/ marker-dir convention" section.

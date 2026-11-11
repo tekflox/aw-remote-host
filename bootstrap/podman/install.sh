@@ -104,7 +104,19 @@ if [ "$(uname -s)" = "Darwin" ]; then
   fi
 
   echo "podman: no running container backend found — starting a podman machine"
-  podman machine init 2>/dev/null || true
+  # shellcheck source=../lib/podman_machine.sh
+  source "$SCRIPT_DIR/../lib/podman_machine.sh"
+  host_mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || true)"
+  host_ncpu="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  if [ -n "$host_mem_bytes" ] && [ -n "$host_ncpu" ]; then
+    host_mem_mb=$(( host_mem_bytes / 1024 / 1024 ))
+    read -r machine_mem_mb machine_cpus < <(podman_machine_recommended_size "$host_mem_mb" "$host_ncpu")
+    echo "podman: host has ${host_mem_mb}MB RAM / ${host_ncpu} cpus — sizing machine at --memory ${machine_mem_mb} --cpus ${machine_cpus}"
+    podman machine init --memory "$machine_mem_mb" --cpus "$machine_cpus" 2>/dev/null || true
+  else
+    echo "podman: could not read host RAM/CPU via sysctl — initializing a podman machine with its own defaults" >&2
+    podman machine init 2>/dev/null || true
+  fi
   podman machine start
   echo "podman: podman machine started"
   exit 0

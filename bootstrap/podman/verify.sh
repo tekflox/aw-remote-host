@@ -25,6 +25,62 @@ if [ "$(uname -s)" = "Darwin" ]; then
   fi
 
   echo "podman: healthy via $runtime_found ($(podman --version))"
+
+  # Undersized-machine diagnosis — podman-machine runtime ONLY (colima and
+  # Docker Desktop size themselves; telling a human their colima/Docker
+  # Desktop VM is undersized is a different, larger surface than this card
+  # scopes). Wrapped in its own function called with `|| true`: per POSIX,
+  # a function invoked as the right-hand side of `||` runs with `set -e`
+  # ignored for its whole body, so nothing in here can abort verify.sh and
+  # take the module chain down with it — the one regression this must not
+  # cause on every existing undersized host.
+  if [ "$runtime_found" = "podman machine" ]; then
+    check_podman_machine_sizing() {
+      local marker_dir marker machine_name host_mem_bytes host_ncpu host_mem_mb cur_mem_mb cur_cpus script_dir
+
+      marker_dir="$HOME/.aw-remote-host/degradations"
+      marker="$marker_dir/podman-machine-undersized"
+
+      script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      # shellcheck source=../lib/podman_machine.sh
+      source "$script_dir/../lib/podman_machine.sh" || return 0
+
+      # The RUNNING machine's real name — never assume
+      # "podman-machine-default"; a renamed or secondary machine must be
+      # inspected by its own name or this silently inspects the wrong VM.
+      machine_name="$(podman machine list --format '{{.Name}}	{{.Running}}' 2>/dev/null | awk -F'\t' '$2=="true"{print $1; exit}')"
+      host_mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || true)"
+      host_ncpu="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+      if [ -z "$machine_name" ] || [ -z "$host_mem_bytes" ] || [ -z "$host_ncpu" ]; then
+        return 0
+      fi
+      host_mem_mb=$(( host_mem_bytes / 1024 / 1024 ))
+
+      # .Resources.Memory/.Resources.CPUs are plain MiB/count integers (no
+      # unit suffix to parse) — confirmed against podman v6.0.2's
+      # pkg/machine/vmconfigs.ResourceConfig (Memory strongunits.MiB,
+      # CPUs uint64, no custom MarshalJSON). Deliberately NOT using
+      # `podman machine list`'s own Memory column for this: that one IS a
+      # human-formatted string ("7.5GiB") on entities.ListReporter — the
+      # exact SI/IEC class of bug this repo already shipped once
+      # (internal/ops/ops.go's parseBytes).
+      cur_mem_mb="$(podman machine inspect "$machine_name" --format '{{.Resources.Memory}}' 2>/dev/null || true)"
+      cur_cpus="$(podman machine inspect "$machine_name" --format '{{.Resources.CPUs}}' 2>/dev/null || true)"
+      case "$cur_mem_mb" in '' | *[!0-9]*) return 0 ;; esac
+      case "$cur_cpus" in '' | *[!0-9]*) return 0 ;; esac
+
+      if podman_machine_undersized "$cur_mem_mb" "$cur_cpus" "$host_mem_mb" "$host_ncpu"; then
+        mkdir -p "$marker_dir" 2>/dev/null || return 0
+        podman_machine_size_message "$cur_mem_mb" "$cur_cpus" "$host_mem_mb" "$host_ncpu" > "$marker" 2>/dev/null || return 0
+        cat "$marker" >&2
+      else
+        rm -f "$marker" 2>/dev/null || true
+      fi
+      return 0
+    }
+    check_podman_machine_sizing || true
+  fi
+
   exit 0
 fi
 
