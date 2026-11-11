@@ -534,6 +534,10 @@ type fakeTunnelProxy struct {
 	gotWSHeaders   map[string]http.Header
 	// Response headers ServeHTTP hands back to the head callback, if set.
 	respHeaders http.Header
+	// onClose callbacks handed to OpenWS, keyed by id — tests fire these
+	// directly to simulate the local server closing the WS after a
+	// successful open.
+	onClose map[string]func(id string, code int, reason string)
 }
 
 func newFakeTunnelProxy() *fakeTunnelProxy {
@@ -541,6 +545,7 @@ func newFakeTunnelProxy() *fakeTunnelProxy {
 		openErr:        map[string]error{},
 		gotHTTPHeaders: map[string]http.Header{},
 		gotWSHeaders:   map[string]http.Header{},
+		onClose:        map[string]func(id string, code int, reason string){},
 	}
 }
 
@@ -558,7 +563,8 @@ func (f *fakeTunnelProxy) ServeHTTP(ctx context.Context, id, method, path string
 }
 
 func (f *fakeTunnelProxy) OpenWS(ctx context.Context, id, path string, headers http.Header,
-	onOpen func(), sendMsg func(id string, data []byte, isText bool)) error {
+	onOpen func(), sendMsg func(id string, data []byte, isText bool),
+	onClose func(id string, code int, reason string)) error {
 	f.mu.Lock()
 	f.gotWSHeaders[id] = headers
 	f.mu.Unlock()
@@ -570,11 +576,23 @@ func (f *fakeTunnelProxy) OpenWS(ctx context.Context, id, path string, headers h
 	}
 	f.mu.Lock()
 	f.opened = append(f.opened, id)
+	f.onClose[id] = onClose
 	f.mu.Unlock()
 	if onOpen != nil {
 		onOpen()
 	}
 	return nil
+}
+
+// fireOnClose simulates the local server closing the WS for id after a
+// successful OpenWS — the exact gap this fix closes.
+func (f *fakeTunnelProxy) fireOnClose(id string, code int, reason string) {
+	f.mu.Lock()
+	onClose := f.onClose[id]
+	f.mu.Unlock()
+	if onClose != nil {
+		onClose(id, code, reason)
+	}
 }
 
 func (f *fakeTunnelProxy) WSMessage(id string, data []byte, isText bool) error { return nil }
@@ -675,6 +693,73 @@ func TestRunSendsWSCloseWithReasonOnFailedDial(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected a ws_close-with-reason frame for s1, got %+v", srv.receivedFrames)
+	}
+}
+
+// TestRunSendsWSCloseWithCodeAfterSuccessfulOpen is the fix under test: when
+// the local app server closes its WS AFTER a successful open (e.g.
+// remote-screen's 4502 on a failed remote dial, or IdentityGuard's 4401),
+// handleWSOpen's onClose wiring must produce a ws_close frame carrying that
+// code+reason — the direction tunnelproxy.go's OpenWS used to swallow
+// silently, leaving the browser WS open forever.
+func TestRunSendsWSCloseWithCodeAfterSuccessfulOpen(t *testing.T) {
+	srv := newFakeLinkServer()
+	srv.acceptTokens["awbs_test"] = "awlk_minted"
+	srv.framesToSend = []map[string]any{
+		{"op": "ws_open", "id": "s1", "path": "/api/apps/remote-screen/ws", "headers": map[string]any{}},
+	}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	c := New(ts.URL, "awbs_test")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	proxy := newFakeTunnelProxy()
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, credPath, RunCallbacks{
+			OnTunnelProxy: func() TunnelProxy { return proxy },
+		})
+	}()
+
+	// Wait for s1 to open, then simulate the local app server closing the WS
+	// with a real code — the close-AFTER-successful-open direction.
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		proxy.mu.Lock()
+		_, opened := proxy.onClose["s1"]
+		proxy.mu.Unlock()
+		if opened {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for s1 to open")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	proxy.fireOnClose("s1", 4502, "remote dial failed")
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	found := false
+	for _, f := range srv.receivedFrames {
+		if f["op"] == "ws_close" && f["id"] == "s1" {
+			code, _ := f["code"].(float64)
+			reason, _ := f["reason"].(string)
+			if int(code) != 4502 || reason != "remote dial failed" {
+				t.Errorf("ws_close = %+v, want code=4502 reason=%q", f, "remote dial failed")
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a ws_close frame for s1 after the simulated local close, got %+v", srv.receivedFrames)
 	}
 }
 
