@@ -11,6 +11,7 @@ package tunnelproxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -381,7 +382,7 @@ func normalizePath(path string) string {
 // no promise about when a newly spawned goroutine gets scheduled relative to
 // its parent, so an ack written from there could arrive after a message it
 // was supposed to precede.
-func (h *Handler) OpenWS(ctx context.Context, id, path string, headers http.Header, onOpen func(), sendMsg func(id string, data []byte, isText bool)) error {
+func (h *Handler) OpenWS(ctx context.Context, id, path string, headers http.Header, onOpen func(), sendMsg func(id string, data []byte, isText bool), onClose func(id string, code int, reason string)) error {
 	target := strings.TrimRight(h.target(), "/") + normalizePath(path)
 	wsURL := strings.Replace(target, "http://", "ws://", 1)
 	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
@@ -433,6 +434,25 @@ func (h *Handler) OpenWS(ctx context.Context, id, path string, headers http.Head
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
+				code := websocket.CloseAbnormalClosure
+				reason := err.Error()
+				var closeErr *websocket.CloseError
+				if errors.As(err, &closeErr) {
+					code = closeErr.Code
+					reason = closeErr.Text
+				}
+				h.mu.Lock()
+				// Only report if this session is still the live one — a
+				// CloseWS/CloseAllWS racing the read loop must not
+				// resurrect it (same guard tcpproxy's onEOF uses).
+				current, still := h.wsConns[id]
+				if still && current == conn {
+					delete(h.wsConns, id)
+				}
+				h.mu.Unlock()
+				if still && onClose != nil {
+					onClose(id, code, reason)
+				}
 				return
 			}
 			sendMsg(id, data, msgType == websocket.TextMessage)

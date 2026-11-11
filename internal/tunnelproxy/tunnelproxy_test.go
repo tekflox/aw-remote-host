@@ -372,6 +372,7 @@ func TestOpenWSCallsOnOpenBeforeFirstMessage(t *testing.T) {
 			mu.Unlock()
 			close(done)
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("OpenWS: %v", err)
@@ -400,6 +401,7 @@ func TestOpenWSDoesNotCallOnOpenOnFailedDial(t *testing.T) {
 	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil,
 		func() { called = true },
 		func(id string, data []byte, isText bool) {},
+		nil,
 	)
 	if err == nil {
 		t.Fatal("expected a dial error")
@@ -442,7 +444,7 @@ func TestOpenWSRetriesATransientDialFailure(t *testing.T) {
 		received = append(received, string(data))
 		mu.Unlock()
 		close(done)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("OpenWS: %v — the retry should have recovered the dial", err)
 	}
@@ -464,6 +466,154 @@ func TestOpenWSRetriesATransientDialFailure(t *testing.T) {
 	defer mu.Unlock()
 	if len(received) != 1 || received[0] != "echo:ping" {
 		t.Fatalf("received = %v, want [echo:ping]", received)
+	}
+}
+
+// TestOpenWSFiresOnCloseExactlyOnceWithCodeAndReason mirrors tcpproxy's
+// onEOF contract (TestRemoteCloseFiresEOFOnce): when the local server closes
+// the WS with a real close code AFTER a successful open, onClose fires
+// exactly once with that code+reason, and the session is forgotten. This is
+// the close-after-open direction OpenWS used to swallow silently.
+func TestOpenWSFiresOnCloseExactlyOnceWithCodeAndReason(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(4502, "remote dial failed"),
+			time.Now().Add(time.Second))
+	}))
+	defer srv.Close()
+
+	h := &Handler{Target: srv.URL}
+	type closeEvent struct {
+		code   int
+		reason string
+	}
+	events := make(chan closeEvent, 4)
+	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil, nil,
+		func(id string, data []byte, isText bool) {},
+		func(id string, code int, reason string) {
+			events <- closeEvent{code, reason}
+		})
+	if err != nil {
+		t.Fatalf("OpenWS: %v", err)
+	}
+
+	var got closeEvent
+	select {
+	case got = <-events:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for onClose")
+	}
+	if got.code != 4502 || got.reason != "remote dial failed" {
+		t.Fatalf("onClose(code=%d, reason=%q), want (4502, %q)", got.code, got.reason, "remote dial failed")
+	}
+
+	select {
+	case ev := <-events:
+		t.Fatalf("onClose fired a second time: %+v", ev)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	h.mu.Lock()
+	_, stillOpen := h.wsConns["sess-1"]
+	h.mu.Unlock()
+	if stillOpen {
+		t.Fatal("session should be forgotten after onClose")
+	}
+}
+
+// TestCloseWSSuppressesOnClose mirrors tcpproxy's "only report if this
+// session is still the live one" guard: a control-plane-initiated CloseWS
+// must never also fire onClose — that direction is already handled by the
+// control plane itself, and echoing it back would be noise (and could
+// resurrect a session CloseWS already forgot).
+func TestCloseWSSuppressesOnClose(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Hold the connection open; only the test's CloseWS call ends it.
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	h := &Handler{Target: srv.URL}
+	onCloseFired := make(chan struct{}, 1)
+	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil, nil,
+		func(id string, data []byte, isText bool) {},
+		func(id string, code int, reason string) {
+			onCloseFired <- struct{}{}
+		})
+	if err != nil {
+		t.Fatalf("OpenWS: %v", err)
+	}
+
+	if err := h.CloseWS("sess-1"); err != nil {
+		t.Fatalf("CloseWS: %v", err)
+	}
+
+	select {
+	case <-onCloseFired:
+		t.Fatal("onClose must not fire for a CloseWS-initiated close")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestOpenWSAbruptDropFiresOnCloseWith1006 — a non-close-frame read error
+// (the local server's process dying, the socket dropping with no WS close
+// handshake) must still surface as exactly one onClose, mapped to 1006
+// (CloseAbnormalClosure) since there is no real close code to report.
+func TestOpenWSAbruptDropFiresOnCloseWith1006(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		// Abrupt drop: close the raw TCP connection with no WS close frame —
+		// the signature of a crashed local server, as opposed to a clean
+		// close handshake.
+		_ = conn.UnderlyingConn().Close()
+	}))
+	defer srv.Close()
+
+	h := &Handler{Target: srv.URL}
+	type closeEvent struct {
+		code   int
+		reason string
+	}
+	events := make(chan closeEvent, 1)
+	err := h.OpenWS(context.Background(), "sess-1", "/ws", nil, nil,
+		func(id string, data []byte, isText bool) {},
+		func(id string, code int, reason string) {
+			events <- closeEvent{code, reason}
+		})
+	if err != nil {
+		t.Fatalf("OpenWS: %v", err)
+	}
+
+	select {
+	case got := <-events:
+		if got.code != websocket.CloseAbnormalClosure {
+			t.Fatalf("onClose code = %d, want %d (CloseAbnormalClosure)", got.code, websocket.CloseAbnormalClosure)
+		}
+		if got.reason == "" {
+			t.Fatal("onClose reason must not be empty")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for onClose")
 	}
 }
 
@@ -624,7 +774,7 @@ func TestOpenWSBridgesMessagesBothWays(t *testing.T) {
 		received = append(received, string(data))
 		mu.Unlock()
 		close(done)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("OpenWS: %v", err)
 	}
@@ -686,7 +836,7 @@ func TestOpenWSStripsReservedHandshakeHeaders(t *testing.T) {
 	done := make(chan struct{})
 	err := h.OpenWS(context.Background(), "sess-x", "/ws", reserved, nil, func(id string, data []byte, isText bool) {
 		close(done)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("OpenWS with reserved headers failed (regression): %v", err)
 	}
@@ -831,7 +981,7 @@ func TestOpenWSStripsReservedHeaderWithMultipleValues(t *testing.T) {
 		"Sec-Websocket-Extensions": []string{"permessage-deflate", "client_max_window_bits"},
 		"Connection":               []string{"Upgrade", "keep-alive"},
 		"Cookie":                   []string{"a=1", "b=2"},
-	}, nil, func(id string, data []byte, isText bool) {})
+	}, nil, func(id string, data []byte, isText bool) {}, nil)
 	if err != nil {
 		t.Fatalf("OpenWS failed with multi-valued reserved headers (regression): %v", err)
 	}

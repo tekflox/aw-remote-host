@@ -570,7 +570,7 @@ type TunnelProxy interface {
 		chunk func(id string, data []byte),
 		end func(id string),
 	)
-	OpenWS(ctx context.Context, id, path string, headers http.Header, onOpen func(), sendMsg func(id string, data []byte, isText bool)) error
+	OpenWS(ctx context.Context, id, path string, headers http.Header, onOpen func(), sendMsg func(id string, data []byte, isText bool), onClose func(id string, code int, reason string)) error
 	WSMessage(id string, data []byte, isText bool) error
 	CloseWS(id string) error
 	CloseAllWS()
@@ -1123,6 +1123,9 @@ func handleWSOpen(ctx context.Context, fw *frameWriter, msg map[string]any, prox
 				_ = fw.WriteJSON(map[string]any{
 					"op": "ws_msg", "id": id, "data": base64.StdEncoding.EncodeToString(data), "dir": dir,
 				})
+			},
+			func(id string, code int, reason string) {
+				_ = fw.WriteJSON(map[string]any{"op": "ws_close", "id": id, "code": code, "reason": reason})
 			})
 		if err != nil {
 			_ = fw.WriteJSON(map[string]any{"op": "ws_close", "id": id, "reason": err.Error()})
